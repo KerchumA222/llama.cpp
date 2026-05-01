@@ -27,6 +27,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/sclp_bridge.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -2383,6 +2384,23 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // SCLP: decode compressed BF16 blob on-the-fly into a temp BF16 buffer,
+    // then dispatch through the standard BF16 matmul path.
+    if (src0->type == GGML_TYPE_SCLP) {
+        cudaStream_t stream = ctx.stream();
+        const int64_t num_weights = ggml_nelements(src0);
+        ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
+        llama_sclp_dispatch(src0->data, decoded.get(), (uint32_t)num_weights, stream);
+
+        // Reinterpret the decoded uint16_t buffer as BF16.
+        // SCLP type_size == 2 == BF16 type_size, so strides (nb[]) are unchanged.
+        ggml_tensor src0_bf16 = *src0;
+        src0_bf16.type = GGML_TYPE_BF16;
+        src0_bf16.data = decoded.get();
+        ggml_cuda_mul_mat(ctx, &src0_bf16, src1, dst);
+        return;
+    }
+
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -4964,6 +4982,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_SCLP:
                         return true;
                     default:
                         return false;
