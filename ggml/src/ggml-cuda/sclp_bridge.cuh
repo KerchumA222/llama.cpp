@@ -107,6 +107,13 @@ __global__ void sclp_fixup_sidecar_kernel(
 // dot product.  Eliminates the intermediate BF16 weight buffer entirely.
 // x must be BF16 [K], y is written as F32 [N].
 // Does NOT apply sidecar fixup — see sclp_fused_gemv_kernel docs.
+//
+// Optimization: vectorized loads — each thread loads 8 sm bytes (uint64_t)
+// and 4 packed bytes (uint32_t) per iteration, processing 8 weights at once.
+// This reduces load instructions 8× vs the scalar byte-load baseline.
+// __launch_bounds__(512, 4): max 512 threads/block, 4 blocks/CU target
+// gfx1100: 48 CUs × 4 blocks = 192 blocks, each 512 threads = 16 warps → good occupancy
+__launch_bounds__(512, 4)
 __global__ void sclp_fused_gemv_kernel(
     const uint8_t*        __restrict__ blob,
     const __hip_bfloat16* __restrict__ x,
@@ -137,10 +144,56 @@ __global__ void sclp_fused_gemv_kernel(
 
     if (row >= N) return;
 
-    float acc = 0.0f;
+    // Two accumulators for ILP — lane processes two interleaved chunks.
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     const uint64_t row_base = (uint64_t)row * K;
 
-    for (uint32_t k = lane; k < K; k += 32) {
+    // --- Vectorized loop: process 16 weights per iteration (2×8), dual accumulator ---
+    // Stride = 32*16 weights per round so each lane handles two independent 8-weight chunks
+    const uint32_t K16 = (K / 16) * 16;
+
+    for (uint32_t k16 = lane * 16; k16 < K16; k16 += 32 * 16) {
+        // Chunk A: weights [k16 .. k16+7]
+        {
+            uint64_t w_base = row_base + k16;
+            uint32_t p4; __builtin_memcpy(&p4, packed + (w_base >> 1), sizeof(uint32_t));
+            uint64_t sm8; __builtin_memcpy(&sm8, sm + w_base, sizeof(uint64_t));
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                uint8_t pb    = (uint8_t)(p4  >> ((j >> 1) * 8));
+                uint8_t p_idx = (j & 1) ? (pb & 0x0F) : (pb >> 4);
+                uint8_t sm_val = (uint8_t)(sm8 >> (j * 8));
+                uint16_t bits = ((uint16_t)(sm_val >> 7) << 15)
+                              | ((uint16_t)s_palette[p_idx] << 7)
+                              | (sm_val & 0x7F);
+                acc0 += __bfloat162float(*(__hip_bfloat16*)&bits)
+                      * __bfloat162float(x[k16 + j]);
+            }
+        }
+        // Chunk B: weights [k16+8 .. k16+15]
+        {
+            uint64_t w_base = row_base + k16 + 8;
+            uint32_t p4; __builtin_memcpy(&p4, packed + (w_base >> 1), sizeof(uint32_t));
+            uint64_t sm8; __builtin_memcpy(&sm8, sm + w_base, sizeof(uint64_t));
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                uint8_t pb    = (uint8_t)(p4  >> ((j >> 1) * 8));
+                uint8_t p_idx = (j & 1) ? (pb & 0x0F) : (pb >> 4);
+                uint8_t sm_val = (uint8_t)(sm8 >> (j * 8));
+                uint16_t bits = ((uint16_t)(sm_val >> 7) << 15)
+                              | ((uint16_t)s_palette[p_idx] << 7)
+                              | (sm_val & 0x7F);
+                acc1 += __bfloat162float(*(__hip_bfloat16*)&bits)
+                      * __bfloat162float(x[k16 + 8 + j]);
+            }
+        }
+    }
+
+    float acc = acc0 + acc1;
+
+    // --- Scalar tail: handle remaining weights (k in [K16, K)) ---
+    for (uint32_t k = K16 + lane; k < K; k += 32) {
         uint64_t w_idx = row_base + k;
 
         uint8_t packed_byte = packed[w_idx >> 1];
@@ -195,8 +248,8 @@ inline void llama_sclp_fused_gemv(
     f32_to_bf16_kernel<<<cvt_grid, cvt_block, 0, stream>>>(
         src_f32, (__hip_bfloat16*)tmp_bf16, K);
 
-    // Fused decode-GEMV: 8 warps per block → 8 output rows per block.
-    constexpr int WARPS_PER_BLOCK = 8;
+    // Fused decode-GEMV: 16 warps per block → 16 output rows per block.
+    constexpr int WARPS_PER_BLOCK = 16;
     dim3 gemv_block(WARPS_PER_BLOCK * 32);
     dim3 gemv_grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
     sclp_fused_gemv_kernel<<<gemv_grid, gemv_block, 0, stream>>>(
