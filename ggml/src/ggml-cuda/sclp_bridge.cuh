@@ -7,22 +7,26 @@
 // Wire format (SCLP blob stored in VRAM):
 //   [uint32 num_weights][uint8 palette_size][palette (palette_size bytes)]
 //   [packed_indices (ceil(num_weights/2) bytes)][sm_stream (num_weights bytes)]
+//   [uint32 sidecar_count]
+//   [uint32 × sidecar_count sidecar_indices]
+//   [uint16 × sidecar_count sidecar_values]
 //   [zero padding to fill num_weights*2 bytes total]
 //
-// The kernel reads the header entirely on-device so no D2H memcpy is needed.
-// This makes it compatible with HIP stream capture (graph mode).
+// Weights whose exponent falls outside the top-16 palette are stored verbatim in
+// the sidecar section and restored exactly by sclp_fixup_sidecar_kernel.
+//
+// Both kernels read all header/count fields on-device — no D2H memcpy needed.
+// Safe during HIP stream capture (GGML_HIP_GRAPHS=ON).
 
 __global__ void sclp_decode_blob_kernel(
     const uint8_t* __restrict__ blob,
     uint16_t*      __restrict__ output,
     uint32_t                    num_weights
 ) {
-    // Block 0 thread 0 loads palette_size; all threads in the block share it.
     __shared__ uint8_t palette_size_s;
     __shared__ uint8_t s_palette[16];
 
     if (threadIdx.x == 0) {
-        // palette_size is byte 4 of the blob (after the uint32 num_weights)
         palette_size_s = blob[4];
     }
     __syncthreads();
@@ -32,7 +36,6 @@ __global__ void sclp_decode_blob_kernel(
     }
     __syncthreads();
 
-    // Pointers into the blob — identical for every thread in this block
     const uint8_t* packed = blob + 5 + palette_size_s;
     const uint8_t* sm     = packed + ((num_weights + 1) / 2);
 
@@ -54,8 +57,53 @@ __global__ void sclp_decode_blob_kernel(
     }
 }
 
+// Restore outlier weights written verbatim in the sidecar section.
+// Must run after sclp_decode_blob_kernel on the same output buffer.
+// Uses a grid-stride loop so a fixed small grid handles any sidecar count.
+__global__ void sclp_fixup_sidecar_kernel(
+    const uint8_t* __restrict__ blob,
+    uint16_t*      __restrict__ output,
+    uint32_t                    num_weights
+) {
+    __shared__ uint8_t  palette_size_s;
+    __shared__ uint32_t sidecar_count_s;
+
+    if (threadIdx.x == 0) {
+        palette_size_s = blob[4];
+    }
+    __syncthreads();
+
+    const uint8_t* packed       = blob + 5 + palette_size_s;
+    const uint8_t* sm           = packed + ((num_weights + 1) / 2);
+    const uint8_t* sidecar_base = sm + num_weights;
+
+    if (threadIdx.x == 0) {
+        uint32_t sc;
+        __builtin_memcpy(&sc, sidecar_base, sizeof(uint32_t));
+        sidecar_count_s = sc;
+    }
+    __syncthreads();
+
+    if (sidecar_count_s == 0) return;
+
+    // Sidecar layout: [uint32 × count indices][uint16 × count values]
+    const uint8_t* idx_base = sidecar_base + 4;
+    const uint8_t* val_base = sidecar_base + 4 + (uint64_t)sidecar_count_s * sizeof(uint32_t);
+
+    uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < sidecar_count_s;
+         i += stride) {
+        uint32_t idx;
+        uint16_t val;
+        __builtin_memcpy(&idx, idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint32_t));
+        __builtin_memcpy(&val, val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint16_t));
+        output[idx] = val;
+    }
+}
+
 // Decode an SCLP blob (device pointer) into a flat BF16 uint16_t buffer.
-// num_weights must equal ggml_nelements(src0) — the caller owns this.
+// num_weights must equal ggml_nelements(src0).
 // No host-side device reads; safe during HIP stream capture.
 inline void llama_sclp_dispatch(
     const void* sclp_data,
@@ -64,8 +112,14 @@ inline void llama_sclp_dispatch(
     hipStream_t stream
 ) {
     const uint8_t* data = (const uint8_t*)sclp_data;
-    uint32_t threads_needed = (num_weights + 1) / 2;
     dim3 block(256);
-    dim3 grid((threads_needed + 255) / 256);
-    sclp_decode_blob_kernel<<<grid, block, 0, stream>>>(data, output, num_weights);
+
+    // Main decode: one thread per pair of weights
+    uint32_t pairs = (num_weights + 1) / 2;
+    dim3 decode_grid((pairs + 255) / 256);
+    sclp_decode_blob_kernel<<<decode_grid, block, 0, stream>>>(data, output, num_weights);
+
+    // Sidecar fixup: fixed 4-block grid with stride loop handles any sidecar count.
+    // Threads where i >= sidecar_count return after a single shared-memory read.
+    sclp_fixup_sidecar_kernel<<<4, block, 0, stream>>>(data, output, num_weights);
 }
