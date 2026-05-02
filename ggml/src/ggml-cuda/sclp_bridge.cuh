@@ -1,5 +1,6 @@
 #pragma once
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 #include <cstdint>
 
 // SCLP decode bridge for llama.cpp HIP backend.
@@ -100,6 +101,108 @@ __global__ void sclp_fixup_sidecar_kernel(
         __builtin_memcpy(&val, val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint16_t));
         output[idx] = val;
     }
+}
+
+// Fused decode-GEMV: decode SCLP weights on-the-fly while accumulating the
+// dot product.  Eliminates the intermediate BF16 weight buffer entirely.
+// x must be BF16 [K], y is written as F32 [N].
+// Does NOT apply sidecar fixup — see sclp_fused_gemv_kernel docs.
+__global__ void sclp_fused_gemv_kernel(
+    const uint8_t*        __restrict__ blob,
+    const __hip_bfloat16* __restrict__ x,
+    float*                __restrict__ y,
+    uint32_t N,
+    uint32_t K
+) {
+    __shared__ uint8_t s_palette_size;
+    __shared__ uint8_t s_palette[16];
+
+    if (threadIdx.x == 0) {
+        s_palette_size = blob[4];
+    }
+    __syncthreads();
+
+    if (threadIdx.x < (uint32_t)s_palette_size) {
+        s_palette[threadIdx.x] = blob[5 + threadIdx.x];
+    }
+    __syncthreads();
+
+    const uint8_t* packed = blob + 5 + s_palette_size;
+    const uint8_t* sm     = packed + ((uint64_t)(N * K + 1) / 2);
+
+    const int warps_per_block = blockDim.x / 32;
+    const int warp_id  = threadIdx.x / 32;
+    const int lane     = threadIdx.x & 31;
+    const uint32_t row = (uint32_t)blockIdx.x * warps_per_block + warp_id;
+
+    if (row >= N) return;
+
+    float acc = 0.0f;
+    const uint64_t row_base = (uint64_t)row * K;
+
+    for (uint32_t k = lane; k < K; k += 32) {
+        uint64_t w_idx = row_base + k;
+
+        uint8_t packed_byte = packed[w_idx >> 1];
+        uint8_t p_idx  = (w_idx & 1) ? (packed_byte & 0x0F) : (packed_byte >> 4);
+        uint8_t sm_val = sm[w_idx];
+
+        uint16_t bits = ((uint16_t)(sm_val >> 7) << 15)
+                      | ((uint16_t)s_palette[p_idx] << 7)
+                      | (sm_val & 0x7F);
+
+        acc += __bfloat162float(*(__hip_bfloat16*)&bits)
+             * __bfloat162float(x[k]);
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down(acc, offset);
+    }
+
+    if (lane == 0) {
+        y[row] = acc;
+    }
+}
+
+// Helper: convert F32 activations to BF16 in-place into a pool buffer.
+__global__ void f32_to_bf16_kernel(
+    const float*    __restrict__ src,
+    __hip_bfloat16* __restrict__ dst,
+    uint32_t n
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __float2bfloat16(src[i]);
+    }
+}
+
+// Launch fused GEMV for the M=1 inference case.
+// src_f32: F32 activation vector [K] (ggml standard for activations)
+// blob:    SCLP weight blob [N×K] device pointer
+// dst_f32: F32 output [N]
+inline void llama_sclp_fused_gemv(
+    const void*   blob_ptr,
+    const float*  src_f32,
+    float*        dst_f32,
+    uint32_t      N,
+    uint32_t      K,
+    void*         tmp_bf16,    // caller-allocated [K] __hip_bfloat16 scratch
+    hipStream_t   stream
+) {
+    // Convert F32 activations → BF16 (the fused kernel expects BF16 input).
+    dim3 cvt_block(256);
+    dim3 cvt_grid((K + 255) / 256);
+    f32_to_bf16_kernel<<<cvt_grid, cvt_block, 0, stream>>>(
+        src_f32, (__hip_bfloat16*)tmp_bf16, K);
+
+    // Fused decode-GEMV: 8 warps per block → 8 output rows per block.
+    constexpr int WARPS_PER_BLOCK = 8;
+    dim3 gemv_block(WARPS_PER_BLOCK * 32);
+    dim3 gemv_grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+    sclp_fused_gemv_kernel<<<gemv_grid, gemv_block, 0, stream>>>(
+        (const uint8_t*)blob_ptr,
+        (const __hip_bfloat16*)tmp_bf16,
+        dst_f32, N, K);
 }
 
 // Decode an SCLP blob (device pointer) into a flat BF16 uint16_t buffer.

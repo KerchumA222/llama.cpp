@@ -2386,16 +2386,36 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // SCLP: decode compressed BF16 blob on-the-fly into a temp BF16 buffer,
-    // then dispatch through the standard BF16 matmul path.
+    // SCLP: fused decode-GEMV for M=1 (single-token inference), two-pass otherwise.
     if (src0->type == GGML_TYPE_SCLP) {
         cudaStream_t stream = ctx.stream();
+
+        // src0 shape: [K, N] (ne[0]=K, ne[1]=N) — weight matrix
+        // src1 shape: [K, M] — activations
+        const int64_t K = src0->ne[0];
+        const int64_t N = src0->ne[1];
+        const int64_t M = src1->ne[1];  // batch / sequence dimension
+
+        if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            // Fused path: decode weights on-the-fly, no intermediate weight buffer.
+            // Scratch buffer for BF16-converted activations (K elements).
+            ggml_cuda_pool_alloc<__hip_bfloat16> x_bf16(ctx.pool(), (size_t)K);
+            llama_sclp_fused_gemv(
+                src0->data,
+                (const float*)src1->data,
+                (float*)dst->data,
+                (uint32_t)N,
+                (uint32_t)K,
+                x_bf16.get(),
+                stream);
+            return;
+        }
+
+        // Two-pass fallback for M>1: decode full weight matrix then use standard GEMM.
         const int64_t num_weights = ggml_nelements(src0);
         ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
         llama_sclp_dispatch(src0->data, decoded.get(), (uint32_t)num_weights, stream);
 
-        // Reinterpret the decoded uint16_t buffer as BF16.
-        // SCLP type_size == 2 == BF16 type_size, so strides (nb[]) are unchanged.
         ggml_tensor src0_bf16 = *src0;
         src0_bf16.type = GGML_TYPE_BF16;
         src0_bf16.data = decoded.get();
