@@ -318,7 +318,11 @@ class GGUFReader:
     def _build_tensors(self, start_offs: int, fields: list[ReaderField]) -> None:
         tensors = []
         tensor_names = set() # keep track of name to prevent duplicated tensors
-        for field in fields:
+
+        # Pre-collect tensor offsets to compute actual on-disk sizes (handles compact blobs).
+        tensor_offsets = [int(f.parts[5][0]) for f in fields]
+
+        for i, field in enumerate(fields):
             _name_len, name_data, _n_dims, dims, raw_dtype, offset_tensor = field.parts
             # check if there's any tensor having same name already in the list
             tensor_name = str(bytes(name_data), encoding = 'utf-8')
@@ -331,6 +335,13 @@ class GGUFReader:
             block_size, type_size = GGML_QUANT_SIZES[ggml_type]
             n_bytes = n_elems * type_size // block_size
             data_offs = int(start_offs + offset_tensor[0])
+
+            # Compute actual disk size from consecutive offsets (handles compact variable-size blobs).
+            if i + 1 < len(fields):
+                disk_size = tensor_offsets[i + 1] - tensor_offsets[i]
+            else:
+                disk_size = n_bytes
+
             item_type: npt.DTypeLike
             if ggml_type == GGMLQuantizationType.F16:
                 item_count = n_elems
@@ -353,6 +364,11 @@ class GGUFReader:
             elif ggml_type == GGMLQuantizationType.I64:
                 item_count = n_elems
                 item_type = np.int64
+            elif disk_size != n_bytes:
+                # Variable-size blob (e.g. compact SCLP): use actual on-disk bytes, flat array.
+                item_count = disk_size
+                item_type = np.uint8
+                np_dims = (disk_size,)
             else:
                 item_count = n_bytes
                 item_type = np.uint8

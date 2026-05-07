@@ -1381,14 +1381,28 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
         if (cur->data == nullptr) {
             cur->data = (uint8_t *)mapping->addr() + w.offs;
         } else {
-            memcpy(cur->data, (uint8_t *)mapping->addr() + w.offs, ggml_nbytes(cur));
+            // Use actual disk size — may be smaller than ggml_nbytes for compact SCLP blobs.
+            // The remainder of the GPU allocation stays zero-initialised; the on-device kernel
+            // only reads bytes up to the sidecar end, never the trailing padding.
+            const size_t copy_bytes = std::min(w.disk_size, ggml_nbytes(cur));
+            memcpy(cur->data, (uint8_t *)mapping->addr() + w.offs, copy_bytes);
+            if (copy_bytes < ggml_nbytes(cur)) {
+                memset((uint8_t *)cur->data + copy_bytes, 0, ggml_nbytes(cur) - copy_bytes);
+            }
         }
     } else {
         GGML_ASSERT(cur->data != nullptr);
         GGML_ASSERT(w.idx < files.size());
         const auto & file = files.at(w.idx);
         file->seek(w.offs, SEEK_SET);
-        file->read_raw(cur->data, ggml_nbytes(cur));
+        // Use actual disk size — may be smaller than ggml_nbytes for SCLP (compact blobs).
+        // The remainder of the allocation stays zero-initialised; the on-device kernel
+        // only reads bytes up to the sidecar end, never the trailing padding.
+        const size_t read_bytes = std::min(w.disk_size, ggml_nbytes(cur));
+        file->read_raw(cur->data, read_bytes);
+        if (read_bytes < ggml_nbytes(cur)) {
+            memset((uint8_t *)cur->data + read_bytes, 0, ggml_nbytes(cur) - read_bytes);
+        }
     }
 
     if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
@@ -1525,6 +1539,7 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+        const size_t disk_size = weight->disk_size;
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1545,21 +1560,32 @@ bool llama_model_loader::load_all_data(
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
                 if (lmlocks) {
                     const auto & lmlock = lmlocks->at(weight->idx);
-                    lmlock->grow_to(weight->offs + n_size);
+                    lmlock->grow_to(weight->offs + disk_size);
                 }
 
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
-                mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                mmap_used.second = std::max(mmap_used.second, weight->offs + disk_size);
             } else {
-                ggml_backend_tensor_set(cur, data, 0, n_size);
+                if (disk_size < n_size) {
+                    // Compact blob: copy only actual bytes, zero-pad the rest in the GPU buffer.
+                    std::vector<uint8_t> tmp(n_size, 0);
+                    memcpy(tmp.data(), data, disk_size);
+                    ggml_backend_tensor_set(cur, tmp.data(), 0, n_size);
+                } else {
+                    ggml_backend_tensor_set(cur, data, 0, n_size);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
+                const size_t read_bytes = std::min(disk_size, n_size);
+                file->read_raw(cur->data, read_bytes);
+                if (read_bytes < n_size) {
+                    memset((uint8_t *)cur->data + read_bytes, 0, n_size - read_bytes);
+                }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
