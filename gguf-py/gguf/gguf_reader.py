@@ -364,8 +364,8 @@ class GGUFReader:
             elif ggml_type == GGMLQuantizationType.I64:
                 item_count = n_elems
                 item_type = np.int64
-            elif disk_size != n_bytes:
-                # Variable-size blob (e.g. compact SCLP): use actual on-disk bytes, flat array.
+            elif ggml_type == GGMLQuantizationType.SCLP and disk_size != n_bytes:
+                # Compact SCLP blob: use actual on-disk bytes as a flat uint8 array.
                 item_count = disk_size
                 item_type = np.uint8
                 np_dims = (disk_size,)

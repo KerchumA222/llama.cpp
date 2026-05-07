@@ -1281,9 +1281,12 @@ void gguf_set_tensor_type(struct gguf_context * ctx, const char * name, enum ggm
         tensor->nb[i] = tensor->nb[i - 1]*tensor->ne[i - 1];
     }
 
-    // update offsets
+    // Changing the type invalidates any disk_size that was inferred from the original file.
+    // Clear it for this tensor and all subsequent ones before recalculating offsets.
+    ctx->info[tensor_id].disk_size = 0;
     const int64_t n_tensors = gguf_get_n_tensors(ctx);
     for (int64_t i = tensor_id + 1; i < n_tensors; ++i) {
+        ctx->info[i].disk_size = 0;
         ctx->info[i].offset = ctx->info[i - 1].offset + GGML_PAD(gguf_ti_nbytes(ctx->info[i - 1]), ctx->alignment);
     }
 }
