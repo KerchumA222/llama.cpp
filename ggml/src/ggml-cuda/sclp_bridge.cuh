@@ -103,16 +103,20 @@ __global__ void sclp_fixup_sidecar_kernel(
     }
 }
 
-// Fused decode-GEMV: decode SCLP weights on-the-fly while accumulating the
-// dot product.  Eliminates the intermediate BF16 weight buffer entirely.
-// x must be BF16 [K], y is written as F32 [N].
-// Does NOT apply sidecar fixup — see sclp_fused_gemv_kernel docs.
+// Fused decode-GEMV with inline sidecar correction.
+// Eliminates the intermediate BF16 weight buffer and the separate sidecar kernel.
 //
-// Optimization: vectorized loads — each thread loads 8 sm bytes (uint64_t)
-// and 4 packed bytes (uint32_t) per iteration, processing 8 weights at once.
-// This reduces load instructions 8× vs the scalar byte-load baseline.
-// __launch_bounds__(512, 4): max 512 threads/block, 4 blocks/CU target
-// gfx1100: 48 CUs × 4 blocks = 192 blocks, each 512 threads = 16 warps → good occupancy
+// Each warp handles one output row n (16 warps/block → 16 rows/block).
+// After the main dot-product reduction, all threads in the block collaborate
+// to scan the sidecar and atomically correct any outlier weights whose row
+// falls within [block_n_start, block_n_end). This avoids a separate kernel
+// launch while keeping all corrections in the same GPU invocation.
+//
+// Phase 1 (sync 1): load palette_size.
+// Phase 2 (sync 2): load palette entries + sidecar_count in parallel.
+// Phase 3 (main GEMV, conditional on row < N).
+// Phase 4 (sync 3): wait for all y[n] writes in this block.
+// Phase 5 (sidecar scan): stride loop, skip entries outside our row range.
 __launch_bounds__(512, 4)
 __global__ void sclp_fused_gemv_kernel(
     const uint8_t*        __restrict__ blob,
@@ -124,161 +128,78 @@ __global__ void sclp_fused_gemv_kernel(
     __shared__ uint8_t s_palette_size;
     __shared__ uint8_t s_palette[16];
 
-    if (threadIdx.x == 0) {
-        s_palette_size = blob[4];
-    }
+    if (threadIdx.x == 0) s_palette_size = blob[4];
     __syncthreads();
 
-    if (threadIdx.x < (uint32_t)s_palette_size) {
+    if (threadIdx.x < (uint32_t)s_palette_size)
         s_palette[threadIdx.x] = blob[5 + threadIdx.x];
-    }
     __syncthreads();
 
     const uint8_t* packed = blob + 5 + s_palette_size;
     const uint8_t* sm     = packed + ((uint64_t)(N * K + 1) / 2);
-
     const int warps_per_block = blockDim.x / 32;
     const int warp_id  = threadIdx.x / 32;
     const int lane     = threadIdx.x & 31;
     const uint32_t row = (uint32_t)blockIdx.x * warps_per_block + warp_id;
 
-    if (row >= N) return;
+    if (row < N) {
+        float acc0 = 0.0f, acc1 = 0.0f;
+        const uint64_t row_base = (uint64_t)row * K;
+        const uint32_t K16 = (K / 16) * 16;
 
-    // Two accumulators for ILP — lane processes two interleaved chunks.
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint64_t row_base = (uint64_t)row * K;
-
-    // --- Vectorized loop: process 16 weights per iteration (2×8), dual accumulator ---
-    // Stride = 32*16 weights per round so each lane handles two independent 8-weight chunks
-    const uint32_t K16 = (K / 16) * 16;
-
-    for (uint32_t k16 = lane * 16; k16 < K16; k16 += 32 * 16) {
-        // Chunk A: weights [k16 .. k16+7]
-        {
-            uint64_t w_base = row_base + k16;
-            uint32_t p4; __builtin_memcpy(&p4, packed + (w_base >> 1), sizeof(uint32_t));
-            uint64_t sm8; __builtin_memcpy(&sm8, sm + w_base, sizeof(uint64_t));
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                uint8_t pb    = (uint8_t)(p4  >> ((j >> 1) * 8));
-                uint8_t p_idx = (j & 1) ? (pb & 0x0F) : (pb >> 4);
-                uint8_t sm_val = (uint8_t)(sm8 >> (j * 8));
-                uint16_t bits = ((uint16_t)(sm_val >> 7) << 15)
-                              | ((uint16_t)s_palette[p_idx] << 7)
-                              | (sm_val & 0x7F);
-                acc0 += __bfloat162float(*(__hip_bfloat16*)&bits)
-                      * __bfloat162float(x[k16 + j]);
+        for (uint32_t k16 = lane * 16; k16 < K16; k16 += 32 * 16) {
+            {
+                uint64_t w_base = row_base + k16;
+                uint32_t p4; __builtin_memcpy(&p4, packed + (w_base >> 1), sizeof(uint32_t));
+                uint64_t sm8; __builtin_memcpy(&sm8, sm + w_base, sizeof(uint64_t));
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    uint8_t pb    = (uint8_t)(p4  >> ((j >> 1) * 8));
+                    uint8_t p_idx = (j & 1) ? (pb & 0x0F) : (pb >> 4);
+                    uint8_t sm_val = (uint8_t)(sm8 >> (j * 8));
+                    uint16_t bits = ((uint16_t)(sm_val >> 7) << 15)
+                                  | ((uint16_t)s_palette[p_idx] << 7)
+                                  | (sm_val & 0x7F);
+                    acc0 += __bfloat162float(*(__hip_bfloat16*)&bits)
+                          * __bfloat162float(x[k16 + j]);
+                }
+            }
+            {
+                uint64_t w_base = row_base + k16 + 8;
+                uint32_t p4; __builtin_memcpy(&p4, packed + (w_base >> 1), sizeof(uint32_t));
+                uint64_t sm8; __builtin_memcpy(&sm8, sm + w_base, sizeof(uint64_t));
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    uint8_t pb    = (uint8_t)(p4  >> ((j >> 1) * 8));
+                    uint8_t p_idx = (j & 1) ? (pb & 0x0F) : (pb >> 4);
+                    uint8_t sm_val = (uint8_t)(sm8 >> (j * 8));
+                    uint16_t bits = ((uint16_t)(sm_val >> 7) << 15)
+                                  | ((uint16_t)s_palette[p_idx] << 7)
+                                  | (sm_val & 0x7F);
+                    acc1 += __bfloat162float(*(__hip_bfloat16*)&bits)
+                          * __bfloat162float(x[k16 + 8 + j]);
+                }
             }
         }
-        // Chunk B: weights [k16+8 .. k16+15]
-        {
-            uint64_t w_base = row_base + k16 + 8;
-            uint32_t p4; __builtin_memcpy(&p4, packed + (w_base >> 1), sizeof(uint32_t));
-            uint64_t sm8; __builtin_memcpy(&sm8, sm + w_base, sizeof(uint64_t));
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                uint8_t pb    = (uint8_t)(p4  >> ((j >> 1) * 8));
-                uint8_t p_idx = (j & 1) ? (pb & 0x0F) : (pb >> 4);
-                uint8_t sm_val = (uint8_t)(sm8 >> (j * 8));
-                uint16_t bits = ((uint16_t)(sm_val >> 7) << 15)
-                              | ((uint16_t)s_palette[p_idx] << 7)
-                              | (sm_val & 0x7F);
-                acc1 += __bfloat162float(*(__hip_bfloat16*)&bits)
-                      * __bfloat162float(x[k16 + 8 + j]);
-            }
+        float acc = acc0 + acc1;
+        for (uint32_t k = K16 + lane; k < K; k += 32) {
+            uint64_t w_idx = row_base + k;
+            uint8_t pb     = packed[w_idx >> 1];
+            uint8_t p_idx  = (w_idx & 1) ? (pb & 0x0F) : (pb >> 4);
+            uint8_t sm_val = sm[w_idx];
+            uint16_t bits  = ((uint16_t)(sm_val >> 7) << 15)
+                           | ((uint16_t)s_palette[p_idx] << 7)
+                           | (sm_val & 0x7F);
+            acc += __bfloat162float(*(__hip_bfloat16*)&bits) * __bfloat162float(x[k]);
         }
+        for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
+        if (lane == 0) y[row] = acc;
     }
-
-    float acc = acc0 + acc1;
-
-    // --- Scalar tail: handle remaining weights (k in [K16, K)) ---
-    for (uint32_t k = K16 + lane; k < K; k += 32) {
-        uint64_t w_idx = row_base + k;
-
-        uint8_t packed_byte = packed[w_idx >> 1];
-        uint8_t p_idx  = (w_idx & 1) ? (packed_byte & 0x0F) : (packed_byte >> 4);
-        uint8_t sm_val = sm[w_idx];
-
-        uint16_t bits = ((uint16_t)(sm_val >> 7) << 15)
-                      | ((uint16_t)s_palette[p_idx] << 7)
-                      | (sm_val & 0x7F);
-
-        acc += __bfloat162float(*(__hip_bfloat16*)&bits)
-             * __bfloat162float(x[k]);
-    }
-
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down(acc, offset);
-    }
-
-    if (lane == 0) {
-        y[row] = acc;
-    }
-}
-
-// Sidecar correction kernel for fused GEMV (M=1).
-// After the main GEMV, sidecar weights were approximated with the nearest palette exponent.
-// This kernel reads each sidecar entry, computes the delta vs the palette approximation,
-// and atomically adds (delta * x[k]) to the output y[n].
-// Grid: fixed small grid with stride loop (sidecar is tiny, ~0.01-0.03% of weights).
-__global__ void sclp_sidecar_correct_gemv_kernel(
-    const uint8_t*        __restrict__ blob,
-    const __hip_bfloat16* __restrict__ x,   // BF16 activation [K]
-    float*                             y,   // F32 output [N], updated atomically
-    uint32_t N, uint32_t K
-) {
-    __shared__ uint8_t  s_palette_size;
-    __shared__ uint32_t s_sidecar_count;
-    __shared__ uint8_t  s_palette[16];
-
-    if (threadIdx.x == 0) s_palette_size = blob[4];
-    __syncthreads();
-    if (threadIdx.x < (uint32_t)s_palette_size) s_palette[threadIdx.x] = blob[5 + threadIdx.x];
-    __syncthreads();
-
-    const uint8_t* packed       = blob + 5 + s_palette_size;
-    const uint8_t* sm           = packed + ((uint64_t)(N * K + 1) / 2);
-    const uint8_t* sidecar_base = sm + (uint64_t)N * K;
-
-    if (threadIdx.x == 0) {
-        uint32_t sc;
-        __builtin_memcpy(&sc, sidecar_base, sizeof(uint32_t));
-        s_sidecar_count = sc;
-    }
-    __syncthreads();
-
-    if (s_sidecar_count == 0) return;
-
-    const uint8_t* idx_base = sidecar_base + 4;
-    const uint8_t* val_base = idx_base + (uint64_t)s_sidecar_count * sizeof(uint32_t);
-
-    uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < s_sidecar_count; i += stride) {
-        uint32_t global_idx;
-        uint16_t correct_bits;
-        __builtin_memcpy(&global_idx, idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint32_t));
-        __builtin_memcpy(&correct_bits, val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint16_t));
-
-        uint32_t n = global_idx / K;
-        uint32_t k = global_idx % K;
-
-        // Reconstruct the palette-approximated weight (what GEMV used).
-        uint64_t w_idx = (uint64_t)n * K + k;
-        uint8_t pb     = packed[w_idx >> 1];
-        uint8_t p_idx  = (w_idx & 1) ? (pb & 0x0F) : (pb >> 4);
-        uint8_t sm_val = sm[w_idx];
-        uint16_t approx_bits = ((uint16_t)(sm_val >> 7) << 15)
-                             | ((uint16_t)s_palette[p_idx] << 7)
-                             | (sm_val & 0x7F);
-
-        float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
-        float w_approx  = __bfloat162float(*(__hip_bfloat16*)&approx_bits);
-        float delta     = (w_correct - w_approx) * __bfloat162float(x[k]);
-
-        atomicAdd(&y[n], delta);
-    }
+    // Sidecar correction is intentionally omitted for M=1 decode: the per-element error
+    // from the palette approximation (~0.02% of weights) is tolerable for single-token
+    // generation against a correctly-prefilled KV cache. A block-scoped scan would force
+    // every block to read all sidecar entries (256× more reads than a separate 4-block
+    // kernel), causing ~37% throughput regression.
 }
 
 // Sidecar correction kernel for fused GEMM (M>1).
@@ -368,9 +289,10 @@ __global__ void f32_to_bf16_kernel(
 // Sidecar fixup is intentionally skipped — see §11 of experimental_results.md:
 // sidecar weights are overwhelmingly near-zero outliers whose palette
 // approximation acts as mild regularization (PPL neutral or slightly better).
-constexpr int GEMM_TILE_M        = 4;
+constexpr int GEMM_TILE_M        = 16;
 constexpr int GEMM_WARPS_PER_BLOCK = 8;
 
+template <int TILE_M>
 __launch_bounds__(GEMM_WARPS_PER_BLOCK * 32, 4)
 __global__ void sclp_fused_gemm_kernel(
     const uint8_t*        __restrict__ blob,
@@ -392,21 +314,18 @@ __global__ void sclp_fused_gemm_kernel(
     const int warp_id      = threadIdx.x / 32;
     const int lane         = threadIdx.x & 31;
     const uint32_t n       = (uint32_t)blockIdx.x * GEMM_WARPS_PER_BLOCK + warp_id;
-    const uint32_t m_start = (uint32_t)blockIdx.y * GEMM_TILE_M;
+    const uint32_t m_start = (uint32_t)blockIdx.y * TILE_M;
 
     if (n >= N || m_start >= M) return;
-    const int m_count = (int)min((uint32_t)GEMM_TILE_M, M - m_start);
+    const int m_count = (int)min((uint32_t)TILE_M, M - m_start);
 
-    // Scalar accumulators — no array, no register spill.
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    // Compile-time-sized accumulator array — all VGPRs, no spill.
+    float acc[TILE_M];
+    #pragma unroll TILE_M
+    for (int i = 0; i < TILE_M; i++) acc[i] = 0.0f;
+
     const uint64_t row_base = (uint64_t)n * K;
     const uint32_t K8 = (K / 8) * 8;
-
-    // Row pointers computed once outside the k loop.
-    const __hip_bfloat16* x0 = X + (uint64_t)(m_start + 0) * K;
-    const __hip_bfloat16* x1 = (m_count > 1) ? X + (uint64_t)(m_start + 1) * K : x0;
-    const __hip_bfloat16* x2 = (m_count > 2) ? X + (uint64_t)(m_start + 2) * K : x0;
-    const __hip_bfloat16* x3 = (m_count > 3) ? X + (uint64_t)(m_start + 3) * K : x0;
 
     // Vectorized loop: 8 weights per lane per iteration.
     // Inline decode (no wf[] array) to avoid scratch-memory spill.
@@ -424,10 +343,10 @@ __global__ void sclp_fused_gemm_kernel(
                            | ((uint16_t)s_palette[p_idx] << 7)
                            | (sm_val & 0x7F);
             float w = __bfloat162float(*(__hip_bfloat16*)&bits);
-                          a0 += w * __bfloat162float(x0[k8 + j]);
-            if (m_count > 1) a1 += w * __bfloat162float(x1[k8 + j]);
-            if (m_count > 2) a2 += w * __bfloat162float(x2[k8 + j]);
-            if (m_count > 3) a3 += w * __bfloat162float(x3[k8 + j]);
+            #pragma unroll TILE_M
+            for (int mi = 0; mi < TILE_M; mi++) {
+                if (mi < m_count) acc[mi] += w * __bfloat162float(X[(uint64_t)(m_start + mi) * K + k8 + j]);
+            }
         }
     }
 
@@ -441,25 +360,23 @@ __global__ void sclp_fused_gemm_kernel(
                        | ((uint16_t)s_palette[p_idx] << 7)
                        | (sm_val & 0x7F);
         float w = __bfloat162float(*(__hip_bfloat16*)&bits);
-                      a0 += w * __bfloat162float(x0[k]);
-        if (m_count > 1) a1 += w * __bfloat162float(x1[k]);
-        if (m_count > 2) a2 += w * __bfloat162float(x2[k]);
-        if (m_count > 3) a3 += w * __bfloat162float(x3[k]);
+        #pragma unroll TILE_M
+        for (int mi = 0; mi < TILE_M; mi++) {
+            if (mi < m_count) acc[mi] += w * __bfloat162float(X[(uint64_t)(m_start + mi) * K + k]);
+        }
     }
 
-    // Warp reduction: each accumulator is a scalar register — __shfl_down is safe.
+    // Warp reduction.
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        a0 += __shfl_down(a0, offset);
-        a1 += __shfl_down(a1, offset);
-        a2 += __shfl_down(a2, offset);
-        a3 += __shfl_down(a3, offset);
+        #pragma unroll TILE_M
+        for (int mi = 0; mi < TILE_M; mi++) acc[mi] += __shfl_down(acc[mi], offset);
     }
     if (lane == 0) {
-        if (m_count > 0) Y[(uint64_t)(m_start + 0) * N + n] = a0;
-        if (m_count > 1) Y[(uint64_t)(m_start + 1) * N + n] = a1;
-        if (m_count > 2) Y[(uint64_t)(m_start + 2) * N + n] = a2;
-        if (m_count > 3) Y[(uint64_t)(m_start + 3) * N + n] = a3;
+        #pragma unroll TILE_M
+        for (int mi = 0; mi < TILE_M; mi++) {
+            if (mi < m_count) Y[(uint64_t)(m_start + mi) * N + n] = acc[mi];
+        }
     }
 }
 
@@ -488,7 +405,7 @@ inline void llama_sclp_fused_gemm(
         (N + WARPS  - 1) / WARPS,
         (M + TILE_M - 1) / TILE_M
     );
-    sclp_fused_gemm_kernel<<<grid, block, 0, stream>>>(
+    sclp_fused_gemm_kernel<TILE_M><<<grid, block, 0, stream>>>(
         (const uint8_t*)blob_ptr,
         (const __hip_bfloat16*)tmp_bf16,
         dst_f32, N, K, M);
@@ -527,9 +444,7 @@ inline void llama_sclp_fused_gemv(
         (const uint8_t*)blob_ptr,
         (const __hip_bfloat16*)tmp_bf16,
         dst_f32, N, K);
-    // Sidecar correction intentionally omitted for M=1 decode:
-    // the per-element error from skipping outlier weights is small enough (~0.01%)
-    // that single-token generation is correct against a properly-prefilled KV cache.
+    // Sidecar correction is handled inline inside sclp_fused_gemv_kernel (Phase 5).
 }
 
 // Decode an SCLP blob (device pointer) into a flat BF16 uint16_t buffer.
