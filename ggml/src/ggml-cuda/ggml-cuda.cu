@@ -2397,8 +2397,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t M = src1->ne[1];  // batch / sequence dimension
 
         if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            // Fused path: decode weights on-the-fly, no intermediate weight buffer.
-            // Scratch buffer for BF16-converted activations (K elements).
             ggml_cuda_pool_alloc<__hip_bfloat16> x_bf16(ctx.pool(), (size_t)K);
             llama_sclp_fused_gemv(
                 src0->data,
@@ -2411,7 +2409,21 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             return;
         }
 
-        // Two-pass fallback for M>1: decode full weight matrix then use standard GEMM.
+        // Fused GEMM for M>1 (prefill). Requires contiguous src1.
+        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+                && ggml_is_contiguous(src1)) {
+            ggml_cuda_pool_alloc<__hip_bfloat16> x_bf16(ctx.pool(), (size_t)M * K);
+            llama_sclp_fused_gemm(
+                src0->data,
+                (const float*)src1->data,
+                (float*)dst->data,
+                (uint32_t)N, (uint32_t)K, (uint32_t)M,
+                x_bf16.get(),
+                stream);
+            return;
+        }
+
+        // Two-pass fallback for non-F32 types.
         const int64_t num_weights = ggml_nelements(src0);
         ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
         llama_sclp_dispatch(src0->data, decoded.get(), (uint32_t)num_weights, stream);
