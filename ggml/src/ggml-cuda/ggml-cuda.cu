@@ -2409,9 +2409,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             return;
         }
 
-        // Fused GEMM for M>1 (prefill). Requires contiguous src1.
+        // Fused GEMM for small-M prefill (M <= 2×TILE_M = 8).
+        // For large M the kernel re-decodes weights ceil(M/TILE_M) times,
+        // exceeding two-pass memory cost — fall through to two-pass below.
         if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-                && ggml_is_contiguous(src1)) {
+                && ggml_is_contiguous(src1) && M <= 2 * GEMM_TILE_M) {
             ggml_cuda_pool_alloc<__hip_bfloat16> x_bf16(ctx.pool(), (size_t)M * K);
             llama_sclp_fused_gemm(
                 src0->data,
