@@ -447,6 +447,171 @@ inline void llama_sclp_fused_gemv(
     // Sidecar correction is handled inline inside sclp_fused_gemv_kernel (Phase 5).
 }
 
+// Fused decode-WMMA kernel for M > 1 prefill using RDNA3 wave32 WMMA instructions.
+// Eliminates the intermediate BF16 weight buffer entirely — weights are decoded
+// from the SCLP blob on-the-fly and fed directly into the WMMA A fragment.
+//
+// RDNA3 WMMA fragment layout (DATA_LAYOUT_I_MAJOR_MIRRORED, wave32):
+//   A/B: 16 BF16 per thread, all from row (threadIdx.x % 16), columns 0..15.
+//        Both lanes t and t+16 hold the same row (mirrored).
+//   C/D:  8 F32 per thread. Thread t holds D[t%16][2*l + t/16] for l=0..7.
+//         → lanes 0..15 get even columns, lanes 16..31 get odd columns.
+//
+// Block: 4 warps (2 N-tiles × 2 M-tiles of 16×16 each → 32N × 32M per block).
+// LDS: 16×33 BF16 transposed X tile (512 B, +1 column for bank-conflict avoidance).
+// Grid: (ceil(N/32), ceil(M/32)).
+//
+// Sidecar correction is intentionally omitted — see GEMV comment for rationale.
+// The separate sclp_sidecar_correct_gemm_kernel handles it after this kernel returns.
+constexpr int WMMA_WARPS_N = 2;
+constexpr int WMMA_WARPS_M = 2;
+
+__launch_bounds__((WMMA_WARPS_N * WMMA_WARPS_M) * 32, 4)
+__global__ void sclp_fused_wmma_kernel(
+    const uint8_t*        __restrict__ blob,
+    const __hip_bfloat16* __restrict__ X,   // [M × K] activations, row-major
+    float*                __restrict__ Y,   // [M × N] output, row-major
+    uint32_t N, uint32_t K, uint32_t M
+) {
+    constexpr int WMMA_TILE = 16;
+    constexpr int BLOCK_N   = WMMA_WARPS_N * WMMA_TILE;  // 32
+    constexpr int BLOCK_M   = WMMA_WARPS_M * WMMA_TILE;  // 32
+
+    __shared__ uint8_t s_palette_size;
+    __shared__ uint8_t s_palette[16];
+    // Transposed activation tile: s_XT[k_local][m_local] = X[block_m+m_local][k16+k_local]
+    // +1 column padding avoids LDS bank conflicts on the 32-bank RDNA3 layout.
+    __shared__ __hip_bfloat16 s_XT[WMMA_TILE][BLOCK_M + 1];
+
+    if (threadIdx.x == 0) s_palette_size = blob[4];
+    __syncthreads();
+    if (threadIdx.x < (uint32_t)s_palette_size) s_palette[threadIdx.x] = blob[5 + threadIdx.x];
+    __syncthreads();
+
+    const uint8_t* packed = blob + 5 + s_palette_size;
+    const uint8_t* sm     = packed + ((uint64_t)(N * K + 1) / 2);
+
+    const int warp_id  = threadIdx.x / 32;
+    const int lane     = threadIdx.x & 31;
+    const int frag_row = lane % WMMA_TILE;   // row index within WMMA fragment (0..15)
+
+    // 2×2 warp tile: warp_n selects N-tile, warp_m selects M-tile.
+    const int warp_n = warp_id % WMMA_WARPS_N;
+    const int warp_m = warp_id / WMMA_WARPS_N;
+
+    const uint32_t n_base   = ((uint32_t)blockIdx.x * WMMA_WARPS_N + warp_n) * WMMA_TILE;
+    const uint32_t block_m  = (uint32_t)blockIdx.y * BLOCK_M;
+    const uint32_t m_base   = block_m + warp_m * WMMA_TILE;  // global M base for this warp
+
+    // WMMA fragment types for RDNA3 bf16 input, f32 accumulator.
+    using bf16x16_t = __attribute__((ext_vector_type(16))) __bf16;
+    using floatx8_t = __attribute__((ext_vector_type(8)))  float;
+
+    floatx8_t acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    for (uint32_t k16 = 0; k16 < K; k16 += WMMA_TILE) {
+        // ── Load X tile cooperatively into LDS ───────────────────────────────
+        // Threads are mapped as: k_local = li % WMMA_TILE, m_local = li / WMMA_TILE
+        // so each group of WMMA_TILE=16 consecutive threads loads one X row (coalesced).
+        for (int li = threadIdx.x; li < WMMA_TILE * BLOCK_M; li += blockDim.x) {
+            const int k_local = li % WMMA_TILE;
+            const int m_local = li / WMMA_TILE;
+            const uint32_t mg = block_m + m_local;
+            const uint32_t kg = k16    + k_local;
+            s_XT[k_local][m_local] = (mg < M && kg < K)
+                ? X[(uint64_t)mg * K + kg] : (__hip_bfloat16)0.f;
+        }
+        __syncthreads();
+
+        // ── Decode A fragment from SCLP ──────────────────────────────────────
+        // Thread frag_row holds row (n_base+frag_row) of the weight matrix,
+        // columns k16..k16+15 — 16 consecutive SCLP-decoded BF16 values.
+        bf16x16_t a_frag;
+        const uint32_t n_row = n_base + frag_row;
+        #pragma unroll
+        for (int j = 0; j < WMMA_TILE; j++) {
+            const uint32_t kg = k16 + j;
+            if (n_row < N && kg < K) {
+                uint64_t w_idx = (uint64_t)n_row * K + kg;
+                uint8_t pb     = packed[w_idx >> 1];
+                uint8_t p_idx  = (w_idx & 1) ? (pb & 0x0F) : (pb >> 4);
+                uint8_t sm_val = sm[w_idx];
+                uint16_t bits  = ((uint16_t)(sm_val >> 7) << 15)
+                               | ((uint16_t)s_palette[p_idx] << 7)
+                               | (sm_val & 0x7F);
+                a_frag[j] = *(const __bf16*)&bits;
+            } else {
+                a_frag[j] = (__bf16)0.f;
+            }
+        }
+
+        // ── Load B fragment from LDS ──────────────────────────────────────────
+        // Thread frag_row holds row frag_row of the B tile:
+        //   B[frag_row][j] = s_XT[frag_row][m_warp_local+j] = X[m_base+j][k16+frag_row]
+        bf16x16_t b_frag;
+        const int m_warp_local = warp_m * WMMA_TILE;
+        #pragma unroll
+        for (int j = 0; j < WMMA_TILE; j++) {
+            b_frag[j] = s_XT[frag_row][m_warp_local + j];
+        }
+
+        // D[n_rel][m_rel] = sum_k A[n_rel][k] * B[k][m_rel]
+        //                 = sum_k W[n_base+n_rel][k16+k] * X[m_base+m_rel][k16+k]
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a_frag, b_frag, acc);
+
+        __syncthreads();
+    }
+
+    // ── Write output to Y[M×N] ───────────────────────────────────────────────
+    // RDNA3 C layout: thread t holds D[t%16][2*l + t/16] for l=0..7.
+    // D[n_rel][m_rel] → Y[(m_base+m_rel)*N + (n_base+n_rel)]
+    const uint32_t n_out  = n_base + frag_row;
+    if (n_out < N) {
+        const int col_lo = lane / WMMA_TILE;  // 0 for lanes 0..15, 1 for lanes 16..31
+        #pragma unroll
+        for (int l = 0; l < 8; l++) {
+            const uint32_t m_out = m_base + 2 * l + col_lo;
+            if (m_out < M) {
+                Y[(uint64_t)m_out * N + n_out] = acc[l];
+            }
+        }
+    }
+}
+
+// Launch fused WMMA GEMM for medium-to-large M (M > WMMA_THRESHOLD).
+// Uses RDNA3 wave32 WMMA instructions to avoid an intermediate BF16 buffer.
+// Sidecar correction is applied afterward via sclp_sidecar_correct_gemm_kernel.
+inline void llama_sclp_fused_wmma(
+    const void*   blob_ptr,
+    const float*  src_f32,
+    float*        dst_f32,
+    uint32_t N, uint32_t K, uint32_t M,
+    void*         tmp_bf16,
+    hipStream_t   stream
+) {
+    constexpr int TILE = 16;
+    constexpr int BN   = WMMA_WARPS_N * TILE;  // 32
+    constexpr int BM   = WMMA_WARPS_M * TILE;  // 32
+
+    // Convert F32 → BF16 activations.
+    uint32_t mk = M * K;
+    f32_to_bf16_kernel<<<(mk + 255) / 256, 256, 0, stream>>>(
+        src_f32, (__hip_bfloat16*)tmp_bf16, mk);
+
+    dim3 block(WMMA_WARPS_N * WMMA_WARPS_M * 32);
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    sclp_fused_wmma_kernel<<<grid, block, 0, stream>>>(
+        (const uint8_t*)blob_ptr,
+        (const __hip_bfloat16*)tmp_bf16,
+        dst_f32, N, K, M);
+
+    // Sidecar correction (same kernel used by scalar fused GEMM path).
+    sclp_sidecar_correct_gemm_kernel<<<4, 256, 0, stream>>>(
+        (const uint8_t*)blob_ptr,
+        (const __hip_bfloat16*)tmp_bf16,
+        dst_f32, N, K, M);
+}
+
 // Decode an SCLP blob (device pointer) into a flat BF16 uint16_t buffer.
 // num_weights must equal ggml_nelements(src0).
 // No host-side device reads; safe during HIP stream capture.
