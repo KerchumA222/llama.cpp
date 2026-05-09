@@ -19,6 +19,9 @@
 // Both kernels read all header/count fields on-device — no D2H memcpy needed.
 // Safe during HIP stream capture (GGML_HIP_GRAPHS=ON).
 
+// Each thread decodes 8 weights (4 packed bytes + 8 SM bytes → 8 uint16_t outputs).
+// 128-bit loads (uint32_t packed, uint64_t SM) align naturally to 128-byte cache lines
+// at 32-thread warp granularity — improves throughput for large two-pass decode.
 __global__ void sclp_decode_blob_kernel(
     const uint8_t* __restrict__ blob,
     uint16_t*      __restrict__ output,
@@ -40,21 +43,43 @@ __global__ void sclp_decode_blob_kernel(
     const uint8_t* packed = blob + 5 + palette_size_s;
     const uint8_t* sm     = packed + ((num_weights + 1) / 2);
 
-    uint32_t pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t base_idx = pair_idx << 1;
+    // Each thread handles 4 pairs = 8 weights
+    const uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t base_idx   = thread_idx * 8;
 
     if (base_idx >= num_weights) return;
 
-    uint8_t packed_byte = packed[pair_idx];
-    uint8_t exp0 = s_palette[packed_byte >> 4];
-    uint8_t exp1 = s_palette[packed_byte & 0x0F];
+    // Load 4 packed bytes as a single uint32_t (covers 8 weights)
+    uint32_t p4;
+    __builtin_memcpy(&p4, packed + thread_idx * 4, sizeof(uint32_t));
 
-    uint8_t sm0 = sm[base_idx];
-    output[base_idx] = ((uint16_t)(sm0 >> 7) << 15) | ((uint16_t)exp0 << 7) | (sm0 & 0x7F);
+    // Load 8 SM bytes as a single uint64_t
+    uint64_t sm8 = 0;
+    uint32_t sm_bytes = min(8u, num_weights - base_idx);
+    __builtin_memcpy(&sm8, sm + base_idx, sm_bytes);  // safe: trailing bytes unused
 
-    if (base_idx + 1 < num_weights) {
-        uint8_t sm1 = sm[base_idx + 1];
-        output[base_idx + 1] = ((uint16_t)(sm1 >> 7) << 15) | ((uint16_t)exp1 << 7) | (sm1 & 0x7F);
+    // Decode 8 weights; use a uint4 for the output store when all 8 are present
+    uint16_t out[8];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        uint8_t pb   = (p4 >> (i * 8)) & 0xFF;
+        uint8_t exp0 = s_palette[pb >> 4];
+        uint8_t exp1 = s_palette[pb & 0x0F];
+        uint8_t sm0  = (sm8 >> ((i * 2)     * 8)) & 0xFF;
+        uint8_t sm1  = (sm8 >> ((i * 2 + 1) * 8)) & 0xFF;
+        out[i * 2]     = ((uint16_t)(sm0 >> 7) << 15) | ((uint16_t)exp0 << 7) | (sm0 & 0x7F);
+        out[i * 2 + 1] = ((uint16_t)(sm1 >> 7) << 15) | ((uint16_t)exp1 << 7) | (sm1 & 0x7F);
+    }
+
+    // Write outputs; use 128-bit store when all 8 fit
+    uint32_t remaining = num_weights - base_idx;
+    if (remaining >= 8) {
+        uint4 v;
+        __builtin_memcpy(&v, out, sizeof(uint4));
+        *reinterpret_cast<uint4*>(output + base_idx) = v;
+    } else {
+        for (uint32_t i = 0; i < remaining; ++i)
+            output[base_idx + i] = out[i];
     }
 }
 
@@ -117,11 +142,13 @@ __global__ void sclp_fixup_sidecar_kernel(
 // Phase 3 (main GEMV, conditional on row < N).
 // Phase 4 (sync 3): wait for all y[n] writes in this block.
 // Phase 5 (sidecar scan): stride loop, skip entries outside our row range.
-__launch_bounds__(512, 4)
+// Accepts F32 activations directly — no separate f32_to_bf16_kernel needed.
+// Saves one kernel launch + one BF16 scratch buffer per layer (224 launches/token).
+__launch_bounds__(1024, 2)
 __global__ void sclp_fused_gemv_kernel(
-    const uint8_t*        __restrict__ blob,
-    const __hip_bfloat16* __restrict__ x,
-    float*                __restrict__ y,
+    const uint8_t* __restrict__ blob,
+    const float*   __restrict__ x,   // F32 activations [K]
+    float*         __restrict__ y,
     uint32_t N,
     uint32_t K
 ) {
@@ -154,14 +181,13 @@ __global__ void sclp_fused_gemv_kernel(
                 uint64_t sm8; __builtin_memcpy(&sm8, sm + w_base, sizeof(uint64_t));
                 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    uint8_t pb    = (uint8_t)(p4  >> ((j >> 1) * 8));
-                    uint8_t p_idx = (j & 1) ? (pb & 0x0F) : (pb >> 4);
+                    uint8_t pb     = (uint8_t)(p4  >> ((j >> 1) * 8));
+                    uint8_t p_idx  = (j & 1) ? (pb & 0x0F) : (pb >> 4);
                     uint8_t sm_val = (uint8_t)(sm8 >> (j * 8));
-                    uint16_t bits = ((uint16_t)(sm_val >> 7) << 15)
-                                  | ((uint16_t)s_palette[p_idx] << 7)
-                                  | (sm_val & 0x7F);
-                    acc0 += __bfloat162float(*(__hip_bfloat16*)&bits)
-                          * __bfloat162float(x[k16 + j]);
+                    uint16_t bits  = ((uint16_t)(sm_val >> 7) << 15)
+                                   | ((uint16_t)s_palette[p_idx] << 7)
+                                   | (sm_val & 0x7F);
+                    acc0 += __bfloat162float(*(__hip_bfloat16*)&bits) * x[k16 + j];
                 }
             }
             {
@@ -170,14 +196,13 @@ __global__ void sclp_fused_gemv_kernel(
                 uint64_t sm8; __builtin_memcpy(&sm8, sm + w_base, sizeof(uint64_t));
                 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    uint8_t pb    = (uint8_t)(p4  >> ((j >> 1) * 8));
-                    uint8_t p_idx = (j & 1) ? (pb & 0x0F) : (pb >> 4);
+                    uint8_t pb     = (uint8_t)(p4  >> ((j >> 1) * 8));
+                    uint8_t p_idx  = (j & 1) ? (pb & 0x0F) : (pb >> 4);
                     uint8_t sm_val = (uint8_t)(sm8 >> (j * 8));
-                    uint16_t bits = ((uint16_t)(sm_val >> 7) << 15)
-                                  | ((uint16_t)s_palette[p_idx] << 7)
-                                  | (sm_val & 0x7F);
-                    acc1 += __bfloat162float(*(__hip_bfloat16*)&bits)
-                          * __bfloat162float(x[k16 + 8 + j]);
+                    uint16_t bits  = ((uint16_t)(sm_val >> 7) << 15)
+                                   | ((uint16_t)s_palette[p_idx] << 7)
+                                   | (sm_val & 0x7F);
+                    acc1 += __bfloat162float(*(__hip_bfloat16*)&bits) * x[k16 + 8 + j];
                 }
             }
         }
@@ -190,7 +215,7 @@ __global__ void sclp_fused_gemv_kernel(
             uint16_t bits  = ((uint16_t)(sm_val >> 7) << 15)
                            | ((uint16_t)s_palette[p_idx] << 7)
                            | (sm_val & 0x7F);
-            acc += __bfloat162float(*(__hip_bfloat16*)&bits) * __bfloat162float(x[k]);
+            acc += __bfloat162float(*(__hip_bfloat16*)&bits) * x[k];
         }
         for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
         if (lane == 0) y[row] = acc;
@@ -418,33 +443,22 @@ inline void llama_sclp_fused_gemm(
 }
 
 // Launch fused GEMV for the M=1 inference case.
-// src_f32: F32 activation vector [K] (ggml standard for activations)
-// blob:    SCLP weight blob [N×K] device pointer
-// dst_f32: F32 output [N]
+// Accepts F32 activations directly — no separate conversion kernel or scratch buffer.
 inline void llama_sclp_fused_gemv(
     const void*   blob_ptr,
     const float*  src_f32,
     float*        dst_f32,
     uint32_t      N,
     uint32_t      K,
-    void*         tmp_bf16,    // caller-allocated [K] __hip_bfloat16 scratch
     hipStream_t   stream
 ) {
-    // Convert F32 activations → BF16 (the fused kernel expects BF16 input).
-    dim3 cvt_block(256);
-    dim3 cvt_grid((K + 255) / 256);
-    f32_to_bf16_kernel<<<cvt_grid, cvt_block, 0, stream>>>(
-        src_f32, (__hip_bfloat16*)tmp_bf16, K);
-
-    // Fused decode-GEMV: 16 warps per block → 16 output rows per block.
-    constexpr int WARPS_PER_BLOCK = 16;
+    constexpr int WARPS_PER_BLOCK = 32;
     dim3 gemv_block(WARPS_PER_BLOCK * 32);
     dim3 gemv_grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
     sclp_fused_gemv_kernel<<<gemv_grid, gemv_block, 0, stream>>>(
         (const uint8_t*)blob_ptr,
-        (const __hip_bfloat16*)tmp_bf16,
+        src_f32,
         dst_f32, N, K);
-    // Sidecar correction is handled inline inside sclp_fused_gemv_kernel (Phase 5).
 }
 
 // Fused decode-WMMA kernel for M > 1 prefill using RDNA3 wave32 WMMA instructions.
@@ -624,9 +638,9 @@ inline void llama_sclp_dispatch(
     const uint8_t* data = (const uint8_t*)sclp_data;
     dim3 block(256);
 
-    // Main decode: one thread per pair of weights
-    uint32_t pairs = (num_weights + 1) / 2;
-    dim3 decode_grid((pairs + 255) / 256);
+    // Main decode: one thread per 8 weights (4 pairs)
+    uint32_t groups = (num_weights + 7) / 8;
+    dim3 decode_grid((groups + 255) / 256);
     sclp_decode_blob_kernel<<<decode_grid, block, 0, stream>>>(data, output, num_weights);
 
     // Sidecar fixup: fixed 4-block grid with stride loop handles any sidecar count.

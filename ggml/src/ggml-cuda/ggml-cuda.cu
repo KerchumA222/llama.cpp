@@ -2397,14 +2397,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t M = src1->ne[1];  // batch / sequence dimension
 
         if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            ggml_cuda_pool_alloc<__hip_bfloat16> x_bf16(ctx.pool(), (size_t)K);
             llama_sclp_fused_gemv(
                 src0->data,
                 (const float*)src1->data,
                 (float*)dst->data,
                 (uint32_t)N,
                 (uint32_t)K,
-                x_bf16.get(),
                 stream);
             return;
         }
