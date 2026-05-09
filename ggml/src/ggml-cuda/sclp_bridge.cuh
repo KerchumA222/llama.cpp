@@ -19,9 +19,11 @@
 // Both kernels read all header/count fields on-device — no D2H memcpy needed.
 // Safe during HIP stream capture (GGML_HIP_GRAPHS=ON).
 
-// Each thread decodes 8 weights from 4 packed bytes + 4 SM bytes → 8 uint16_t outputs.
-// SM stream is nibble-packed: sign(1) | mantissa_top3(3) per nibble (high = even weight).
-// Both streams are 4 bytes per 8 weights → 8 bits/weight total (50% of BF16).
+// Each thread decodes 8 weights from 8 ws bytes → 8 uint16_t outputs.
+// ws_stream: one byte per weight — idx(7:4) | smn(3:0)
+//   idx = palette index (4 bits), smn = sign(3) | mantissa_top3(2:0)
+// Single uint64_t load covers 8 consecutive weights, improving cache locality
+// vs separate packed+SM arrays that were ceil(N*K/2) bytes apart.
 __global__ void sclp_decode_blob_kernel(
     const uint8_t* __restrict__ blob,
     uint16_t*      __restrict__ output,
@@ -40,39 +42,28 @@ __global__ void sclp_decode_blob_kernel(
     }
     __syncthreads();
 
-    const uint8_t* packed = blob + 5 + palette_size_s;
-    const uint8_t* sm     = packed + ((num_weights + 1) / 2);
+    const uint8_t* ws = blob + 5 + palette_size_s;  // ws_stream: N bytes
 
-    // Each thread handles 4 pairs = 8 weights
+    // Each thread handles 8 weights via a single uint64_t load
     const uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t base_idx   = thread_idx * 8;
 
     if (base_idx >= num_weights) return;
 
-    // Load 4 packed bytes (uint32_t) and 4 SM bytes (uint32_t) for 8 weights
-    uint32_t p4;
-    __builtin_memcpy(&p4, packed + thread_idx * 4, sizeof(uint32_t));
-    uint32_t sm4 = 0;
-    uint32_t sm_bytes = min(4u, (num_weights - base_idx + 1) / 2);
-    __builtin_memcpy(&sm4, sm + thread_idx * 4, sm_bytes);
+    uint64_t ws8 = 0;
+    uint32_t remaining = num_weights - base_idx;
+    __builtin_memcpy(&ws8, ws + base_idx, min(8u, remaining));
 
-    // Decode 8 weights; use a uint4 for the output store when all 8 are present
     uint16_t out[8];
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        uint8_t pb    = (p4  >> (i * 8)) & 0xFF;
-        uint8_t sm_b  = (sm4 >> (i * 8)) & 0xFF;
-        uint8_t exp0  = s_palette[pb >> 4];
-        uint8_t exp1  = s_palette[pb & 0x0F];
-        uint8_t smn0  = sm_b >> 4;         // high nibble = even weight
-        uint8_t smn1  = sm_b & 0x0F;       // low  nibble = odd weight
-        // smn = sign(3) | mantissa_top3(2:0) → BF16: sign(15) | exp(14:7) | mant_top3(6:4) | 0000
-        out[i * 2]     = ((uint16_t)(smn0 >> 3) << 15) | ((uint16_t)exp0 << 7) | ((uint16_t)(smn0 & 0x7) << 4);
-        out[i * 2 + 1] = ((uint16_t)(smn1 >> 3) << 15) | ((uint16_t)exp1 << 7) | ((uint16_t)(smn1 & 0x7) << 4);
+    for (int i = 0; i < 8; ++i) {
+        uint8_t b   = (uint8_t)(ws8 >> (i * 8));
+        uint8_t exp = s_palette[b >> 4];
+        uint8_t smn = b & 0x0F;
+        out[i] = ((uint16_t)(smn >> 3) << 15) | ((uint16_t)exp << 7) | ((uint16_t)(smn & 0x7) << 4);
     }
 
     // Write outputs; use 128-bit store when all 8 fit
-    uint32_t remaining = num_weights - base_idx;
     if (remaining >= 8) {
         uint4 v;
         __builtin_memcpy(&v, out, sizeof(uint4));
@@ -99,9 +90,8 @@ __global__ void sclp_fixup_sidecar_kernel(
     }
     __syncthreads();
 
-    const uint8_t* packed       = blob + 5 + palette_size_s;
-    const uint8_t* sm           = packed + ((num_weights + 1) / 2);
-    const uint8_t* sidecar_base = sm + ((num_weights + 1) / 2);  // SM is nibble-packed: ceil(N/2) bytes
+    const uint8_t* ws           = blob + 5 + palette_size_s;
+    const uint8_t* sidecar_base = ws + num_weights;  // ws_stream is N bytes (1 per weight)
 
     if (threadIdx.x == 0) {
         uint32_t sc;
@@ -162,8 +152,7 @@ __global__ void sclp_fused_gemv_kernel(
         s_palette[threadIdx.x] = blob[5 + threadIdx.x];
     __syncthreads();
 
-    const uint8_t* packed = blob + 5 + s_palette_size;
-    const uint8_t* sm     = packed + ((uint64_t)(N * K + 1) / 2);  // SM nibble-packed: ceil(N*K/2) bytes
+    const uint8_t* ws = blob + 5 + s_palette_size;  // ws_stream: N*K bytes, 1 per weight
     const int warps_per_block = blockDim.x / 32;
     const int warp_id  = threadIdx.x / 32;
     const int lane     = threadIdx.x & 31;
@@ -176,34 +165,26 @@ __global__ void sclp_fused_gemv_kernel(
 
         for (uint32_t k16 = lane * 16; k16 < K16; k16 += 32 * 16) {
             {
-                // 8 weights at row_base+k16: 4 packed bytes + 4 SM bytes
-                uint64_t w_base = row_base + k16;
-                uint32_t p4; __builtin_memcpy(&p4, packed + (w_base >> 1), sizeof(uint32_t));
-                uint32_t sm4; __builtin_memcpy(&sm4, sm + (w_base >> 1), sizeof(uint32_t));
+                // 8 weights at row_base+k16: one uint64_t covers all 8 ws bytes
+                uint64_t ws8; __builtin_memcpy(&ws8, ws + row_base + k16, sizeof(uint64_t));
                 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    uint8_t pb    = (uint8_t)(p4  >> ((j >> 1) * 8));
-                    uint8_t sm_b  = (uint8_t)(sm4 >> ((j >> 1) * 8));
-                    uint8_t p_idx = (j & 1) ? (pb & 0x0F) : (pb >> 4);
-                    uint8_t smn   = (j & 1) ? (sm_b & 0x0F) : (sm_b >> 4);
+                    uint8_t b     = (uint8_t)(ws8 >> (j * 8));
+                    uint8_t smn   = b & 0x0F;
                     uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                                  | ((uint16_t)s_palette[p_idx] << 7)
+                                  | ((uint16_t)s_palette[b >> 4] << 7)
                                   | ((uint16_t)(smn & 0x7) << 4);
                     acc0 += __bfloat162float(*(__hip_bfloat16*)&bits) * x[k16 + j];
                 }
             }
             {
-                uint64_t w_base = row_base + k16 + 8;
-                uint32_t p4; __builtin_memcpy(&p4, packed + (w_base >> 1), sizeof(uint32_t));
-                uint32_t sm4; __builtin_memcpy(&sm4, sm + (w_base >> 1), sizeof(uint32_t));
+                uint64_t ws8; __builtin_memcpy(&ws8, ws + row_base + k16 + 8, sizeof(uint64_t));
                 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    uint8_t pb    = (uint8_t)(p4  >> ((j >> 1) * 8));
-                    uint8_t sm_b  = (uint8_t)(sm4 >> ((j >> 1) * 8));
-                    uint8_t p_idx = (j & 1) ? (pb & 0x0F) : (pb >> 4);
-                    uint8_t smn   = (j & 1) ? (sm_b & 0x0F) : (sm_b >> 4);
+                    uint8_t b     = (uint8_t)(ws8 >> (j * 8));
+                    uint8_t smn   = b & 0x0F;
                     uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                                  | ((uint16_t)s_palette[p_idx] << 7)
+                                  | ((uint16_t)s_palette[b >> 4] << 7)
                                   | ((uint16_t)(smn & 0x7) << 4);
                     acc1 += __bfloat162float(*(__hip_bfloat16*)&bits) * x[k16 + 8 + j];
                 }
@@ -211,13 +192,10 @@ __global__ void sclp_fused_gemv_kernel(
         }
         float acc = acc0 + acc1;
         for (uint32_t k = K16 + lane; k < K; k += 32) {
-            uint64_t w_idx = row_base + k;
-            uint8_t pb    = packed[w_idx >> 1];
-            uint8_t sm_b  = sm[w_idx >> 1];
-            uint8_t p_idx = (w_idx & 1) ? (pb  & 0x0F) : (pb  >> 4);
-            uint8_t smn   = (w_idx & 1) ? (sm_b & 0x0F) : (sm_b >> 4);
+            uint8_t b     = ws[row_base + k];
+            uint8_t smn   = b & 0x0F;
             uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                          | ((uint16_t)s_palette[p_idx] << 7)
+                          | ((uint16_t)s_palette[b >> 4] << 7)
                           | ((uint16_t)(smn & 0x7) << 4);
             acc += __bfloat162float(*(__hip_bfloat16*)&bits) * x[k];
         }
@@ -248,9 +226,8 @@ __global__ void sclp_sidecar_correct_gemm_kernel(
     if (threadIdx.x < (uint32_t)s_palette_size) s_palette[threadIdx.x] = blob[5 + threadIdx.x];
     __syncthreads();
 
-    const uint8_t* packed       = blob + 5 + s_palette_size;
-    const uint8_t* sm           = packed + ((uint64_t)(N * K + 1) / 2);
-    const uint8_t* sidecar_base = sm + ((uint64_t)(N * K + 1) / 2);  // SM nibble-packed
+    const uint8_t* ws           = blob + 5 + s_palette_size;
+    const uint8_t* sidecar_base = ws + (uint64_t)N * K;  // ws_stream is N*K bytes
 
     if (threadIdx.x == 0) {
         uint32_t sc;
@@ -275,13 +252,10 @@ __global__ void sclp_sidecar_correct_gemm_kernel(
         uint32_t n = global_idx / K;
         uint32_t k = global_idx % K;
 
-        uint64_t w_idx = (uint64_t)n * K + k;
-        uint8_t pb    = packed[w_idx >> 1];
-        uint8_t sm_b  = sm[w_idx >> 1];
-        uint8_t p_idx = (w_idx & 1) ? (pb  & 0x0F) : (pb  >> 4);
-        uint8_t smn   = (w_idx & 1) ? (sm_b & 0x0F) : (sm_b >> 4);
+        uint8_t b     = ws[(uint64_t)n * K + k];
+        uint8_t smn   = b & 0x0F;
         uint16_t approx_bits = ((uint16_t)(smn >> 3) << 15)
-                             | ((uint16_t)s_palette[p_idx] << 7)
+                             | ((uint16_t)s_palette[b >> 4] << 7)
                              | ((uint16_t)(smn & 0x7) << 4);
 
         float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
@@ -338,8 +312,7 @@ __global__ void sclp_fused_gemm_kernel(
     if (threadIdx.x < (uint32_t)s_palette_size) s_palette[threadIdx.x] = blob[5 + threadIdx.x];
     __syncthreads();
 
-    const uint8_t* packed = blob + 5 + s_palette_size;
-    const uint8_t* sm     = packed + ((uint64_t)(N * K + 1) / 2);  // SM nibble-packed: ceil(N*K/2) bytes
+    const uint8_t* ws = blob + 5 + s_palette_size;  // ws_stream: N*K bytes, 1 per weight
 
     const int warp_id      = threadIdx.x / 32;
     const int lane         = threadIdx.x & 31;
@@ -358,20 +331,16 @@ __global__ void sclp_fused_gemm_kernel(
     const uint32_t K8 = (K / 8) * 8;
 
     // Vectorized loop: 8 weights per lane per iteration.
-    // SM is nibble-packed: load 4 SM bytes covering 8 weights (same as 4 packed bytes).
+    // Single uint64_t covers 8 ws bytes (idx+smn co-located per byte).
     for (uint32_t k8 = (uint32_t)lane * 8; k8 < K8; k8 += 32 * 8) {
-        uint64_t w_base = row_base + k8;
-        uint32_t p4; __builtin_memcpy(&p4, packed + (w_base >> 1), sizeof(uint32_t));
-        uint32_t sm4; __builtin_memcpy(&sm4, sm    + (w_base >> 1), sizeof(uint32_t));
+        uint64_t ws8; __builtin_memcpy(&ws8, ws + row_base + k8, sizeof(uint64_t));
 
         #pragma unroll
         for (int j = 0; j < 8; j++) {
-            uint8_t pb    = (uint8_t)(p4  >> ((j >> 1) * 8));
-            uint8_t sm_b  = (uint8_t)(sm4 >> ((j >> 1) * 8));
-            uint8_t p_idx = (j & 1) ? (pb  & 0x0F) : (pb  >> 4);
-            uint8_t smn   = (j & 1) ? (sm_b & 0x0F) : (sm_b >> 4);
+            uint8_t b     = (uint8_t)(ws8 >> (j * 8));
+            uint8_t smn   = b & 0x0F;
             uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                          | ((uint16_t)s_palette[p_idx] << 7)
+                          | ((uint16_t)s_palette[b >> 4] << 7)
                           | ((uint16_t)(smn & 0x7) << 4);
             float w = __bfloat162float(*(__hip_bfloat16*)&bits);
             #pragma unroll TILE_M
@@ -383,13 +352,10 @@ __global__ void sclp_fused_gemm_kernel(
 
     // Scalar tail for K not divisible by 8.
     for (uint32_t k = K8 + (uint32_t)lane; k < K; k += 32) {
-        uint64_t w_idx = row_base + k;
-        uint8_t pb    = packed[w_idx >> 1];
-        uint8_t sm_b  = sm[w_idx >> 1];
-        uint8_t p_idx = (w_idx & 1) ? (pb  & 0x0F) : (pb  >> 4);
-        uint8_t smn   = (w_idx & 1) ? (sm_b & 0x0F) : (sm_b >> 4);
+        uint8_t b     = ws[row_base + k];
+        uint8_t smn   = b & 0x0F;
         uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                      | ((uint16_t)s_palette[p_idx] << 7)
+                      | ((uint16_t)s_palette[b >> 4] << 7)
                       | ((uint16_t)(smn & 0x7) << 4);
         float w = __bfloat162float(*(__hip_bfloat16*)&bits);
         #pragma unroll TILE_M
@@ -645,7 +611,7 @@ inline void llama_sclp_dispatch(
     const uint8_t* data = (const uint8_t*)sclp_data;
     dim3 block(256);
 
-    // Main decode: one thread per 8 weights (4 pairs)
+    // Main decode: one thread per 8 weights (single uint64_t load from ws_stream)
     uint32_t groups = (num_weights + 7) / 8;
     dim3 decode_grid((groups + 255) / 256);
     sclp_decode_blob_kernel<<<decode_grid, block, 0, stream>>>(data, output, num_weights);
