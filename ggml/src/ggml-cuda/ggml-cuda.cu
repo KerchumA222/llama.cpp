@@ -799,6 +799,12 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     size_t size = ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
+    if (tensor->type == GGML_TYPE_SCLP) {
+        // SCLP type_size=1 means ggml_nbytes = N bytes, but the blob includes a small header
+        // and sidecar section (~0.03% of weights x 6 bytes). Reserve 1% + 4 KB overhead.
+        return size + size / 100 + 4096;
+    }
+
     if (ggml_is_quantized(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
@@ -2431,6 +2437,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_tensor src0_bf16 = *src0;
         src0_bf16.type = GGML_TYPE_BF16;
         src0_bf16.data = decoded.get();
+        // SCLP type_size=1 means nb[0]=1; BF16 needs nb[0]=2. Recompute strides.
+        src0_bf16.nb[0] = sizeof(ggml_bf16_t);
+        for (int i = 1; i < GGML_MAX_DIMS; i++) {
+            src0_bf16.nb[i] = src0_bf16.nb[i-1] * src0_bf16.ne[i-1];
+        }
         ggml_cuda_mul_mat(ctx, &src0_bf16, src1, dst);
         return;
     }
@@ -2523,6 +2534,28 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+
+    // SCLP MoE: fused decode+GEMV for M=1 (token generation).
+    if (src0->type == GGML_TYPE_SCLP) {
+        // src0: [K, N, n_experts],  src1: [K, n_active, n_batches],
+        // ids:  [n_active, n_batches],  dst: [N, n_active, n_batches]
+        const int64_t K         = src0->ne[0];
+        const int64_t N         = src0->ne[1];
+        const int64_t n_active  = src1->ne[1];
+        const int64_t n_batches = src1->ne[2];
+
+        // Use fused MoE GEMV — avoids allocating a full-model decode buffer.
+        GGML_ASSERT(ids != nullptr && "SCLP MUL_MAT_ID requires routing ids");
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        llama_sclp_fused_moe_gemv(
+            src0->data,
+            (const float*)src1->data,
+            (const int32_t*)ids->data,
+            (float*)dst->data,
+            (uint32_t)N, (uint32_t)K, (uint32_t)n_active, (uint32_t)n_batches,
+            ctx.stream());
+        return;
+    }
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);

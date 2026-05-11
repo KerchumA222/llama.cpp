@@ -434,6 +434,111 @@ inline void llama_sclp_fused_gemv(
         dst_f32, N, K);
 }
 
+// Fused decode-GEMV for MoE MUL_MAT_ID with SCLP expert weights.
+// src0 blob: [K, N, n_experts] stacked experts encoded as one SCLP blob.
+// src1: F32 [K, n_active] routed activations (one column per active expert).
+// ids:  int32 [n_active] expert routing indices (which expert weight to use).
+// dst:  F32 [N, n_active] output.
+// Sidecar correction is omitted (same rationale as sclp_fused_gemv_kernel).
+__launch_bounds__(1024, 2)
+__global__ void sclp_fused_moe_gemv_kernel(
+    const uint8_t* __restrict__ blob,
+    const float*   __restrict__ src1,   // [K × n_active × n_batches]
+    const int32_t* __restrict__ ids,    // [n_active × n_batches]
+    float*         __restrict__ dst,    // [N × n_active × n_batches]
+    uint32_t N, uint32_t K, uint32_t n_active
+) {
+    __shared__ uint8_t s_palette_size;
+    __shared__ uint8_t s_palette[16];
+
+    if (threadIdx.x == 0) s_palette_size = blob[4];
+    __syncthreads();
+    if (threadIdx.x < (uint32_t)s_palette_size) s_palette[threadIdx.x] = blob[5 + threadIdx.x];
+    __syncthreads();
+
+    const uint8_t* ws = blob + 5 + s_palette_size;
+
+    const int warps_per_block = blockDim.x / 32;
+    const int warp_id = threadIdx.x / 32;
+    const int lane    = threadIdx.x & 31;
+
+    // blockIdx.x = row group, blockIdx.y = flat index (i_active + i_batch * n_active)
+    const uint32_t row    = (uint32_t)blockIdx.x * warps_per_block + warp_id;
+    const uint32_t flat   = blockIdx.y;  // flat (i_active, i_batch) index
+
+    if (row >= N) return;
+
+    const int32_t e = ids[flat];
+    // ws index for weight (k, row, e): k + row*K + e*N*K
+    const uint64_t ws_base = (uint64_t)e * N * K + (uint64_t)row * K;
+    const float* x = src1 + (uint64_t)flat * K;
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    const uint32_t K16 = (K / 16) * 16;
+
+    for (uint32_t k16 = lane * 16; k16 < K16; k16 += 32 * 16) {
+        {
+            uint64_t ws8; __builtin_memcpy(&ws8, ws + ws_base + k16, sizeof(uint64_t));
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                uint8_t b     = (uint8_t)(ws8 >> (j * 8));
+                uint8_t smn   = b & 0x0F;
+                uint16_t bits = ((uint16_t)(smn >> 3) << 15)
+                              | ((uint16_t)s_palette[b >> 4] << 7)
+                              | ((uint16_t)(smn & 0x7) << 4);
+                acc0 += __bfloat162float(*(__hip_bfloat16*)&bits) * x[k16 + j];
+            }
+        }
+        {
+            uint64_t ws8; __builtin_memcpy(&ws8, ws + ws_base + k16 + 8, sizeof(uint64_t));
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                uint8_t b     = (uint8_t)(ws8 >> (j * 8));
+                uint8_t smn   = b & 0x0F;
+                uint16_t bits = ((uint16_t)(smn >> 3) << 15)
+                              | ((uint16_t)s_palette[b >> 4] << 7)
+                              | ((uint16_t)(smn & 0x7) << 4);
+                acc1 += __bfloat162float(*(__hip_bfloat16*)&bits) * x[k16 + 8 + j];
+            }
+        }
+    }
+    float acc = acc0 + acc1;
+    for (uint32_t k = K16 + lane; k < K; k += 32) {
+        uint8_t b     = ws[ws_base + k];
+        uint8_t smn   = b & 0x0F;
+        uint16_t bits = ((uint16_t)(smn >> 3) << 15)
+                      | ((uint16_t)s_palette[b >> 4] << 7)
+                      | ((uint16_t)(smn & 0x7) << 4);
+        acc += __bfloat162float(*(__hip_bfloat16*)&bits) * x[k];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
+    if (lane == 0) dst[row + (uint64_t)flat * N] = acc;
+}
+
+// Launch fused MoE GEMV for SCLP expert weights (MUL_MAT_ID, any n_batches).
+// Processes each (row, i_active, i_batch) output element independently.
+// src1: F32 [K × n_active × n_batches], ids: int32 [n_active × n_batches],
+// dst: F32 [N × n_active × n_batches].
+inline void llama_sclp_fused_moe_gemv(
+    const void*    blob_ptr,
+    const float*   src1,       // F32 [K × n_active × n_batches]
+    const int32_t* ids,        // int32 [n_active × n_batches]
+    float*         dst,        // F32 [N × n_active × n_batches]
+    uint32_t       N,          // output rows per expert
+    uint32_t       K,          // input dim
+    uint32_t       n_active,   // active experts per token
+    uint32_t       n_batches,  // number of token batches
+    hipStream_t    stream
+) {
+    constexpr int WARPS_PER_BLOCK = 32;
+    dim3 block(WARPS_PER_BLOCK * 32);
+    // blockIdx.y = i_active + i_batch * n_active  (flat expert-batch index)
+    dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, n_active * n_batches);
+    sclp_fused_moe_gemv_kernel<<<grid, block, 0, stream>>>(
+        (const uint8_t*)blob_ptr,
+        src1, ids, dst, N, K, n_active);
+}
+
 // Fused decode-WMMA kernel for M > 1 prefill using RDNA3 wave32 WMMA instructions.
 // Eliminates the intermediate BF16 weight buffer entirely — weights are decoded
 // from the SCLP blob on-the-fly and fed directly into the WMMA A fragment.

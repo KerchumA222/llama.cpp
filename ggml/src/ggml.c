@@ -677,7 +677,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     [GGML_TYPE_SCLP] = {
         .type_name                = "sclp",
         .blck_size                = 1,
-        .type_size                = 2,
+        .type_size                = 1,
         .is_quantized             = true,
     },
     [GGML_TYPE_Q4_0] = {

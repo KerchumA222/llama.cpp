@@ -331,7 +331,7 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
     }
 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
-    GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+    GGML_ASSERT(offset + size <= ggml_backend_buffer_get_alloc_size(buf, tensor) && "tensor write out of bounds");
 
     buf->iface.set_tensor(buf, tensor, data, offset, size);
 }
@@ -2319,6 +2319,17 @@ static size_t ggml_backend_cpu_buffer_type_get_alignment(ggml_backend_buffer_typ
     GGML_UNUSED(buft);
 }
 
+static size_t ggml_backend_cpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+    // SCLP type_size=1 means ggml_nbytes=N, but the blob has a small header+sidecar.
+    // Reserve 1% + 4 KB so the full blob fits in host memory for CPU decode.
+    if (tensor->type == GGML_TYPE_SCLP) {
+        size_t n = ggml_nbytes(tensor);
+        return n + n / 100 + 4096;
+    }
+    return ggml_nbytes(tensor);
+    GGML_UNUSED(buft);
+}
+
 static bool ggml_backend_cpu_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
     return true;
 
@@ -2332,7 +2343,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
             /* .alloc_buffer     = */ ggml_backend_cpu_buffer_type_alloc_buffer,
             /* .get_alignment    = */ ggml_backend_cpu_buffer_type_get_alignment,
             /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
-            /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
+            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type_get_alloc_size,
             /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),

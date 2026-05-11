@@ -1567,7 +1567,11 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + disk_size);
             } else {
-                if (disk_size < n_size) {
+                if (cur->type == GGML_TYPE_SCLP) {
+                    // SCLP blob (type_size=1): disk_size exceeds ggml_nbytes by blob header+sidecar.
+                    // get_alloc_size reserves sufficient extra space for the full blob.
+                    ggml_backend_tensor_set(cur, data, 0, disk_size);
+                } else if (disk_size < n_size) {
                     // Compact blob: copy only actual bytes, zero-pad the rest in the GPU buffer.
                     std::vector<uint8_t> tmp(n_size, 0);
                     memcpy(tmp.data(), data, disk_size);
@@ -1581,7 +1585,8 @@ bool llama_model_loader::load_all_data(
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
-                const size_t read_bytes = std::min(disk_size, n_size);
+                // SCLP on CPU: disk_size > n_size (blob has header+sidecar); alloc_size reserves enough.
+                const size_t read_bytes = (cur->type == GGML_TYPE_SCLP) ? disk_size : std::min(disk_size, n_size);
                 file->read_raw(cur->data, read_bytes);
                 if (read_bytes < n_size) {
                     memset((uint8_t *)cur->data + read_bytes, 0, n_size - read_bytes);
