@@ -331,6 +331,12 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
     }
 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+    if (offset + size > ggml_backend_buffer_get_alloc_size(buf, tensor)) {
+        fprintf(stderr, "%s: tensor %s: type=%s ne=%ldx%ldx%ldx%ld offset=%zu size=%zu nbytes=%zu alloc_size=%zu\n",
+            __func__, tensor->name, ggml_type_name(tensor->type),
+            (long)tensor->ne[0], (long)tensor->ne[1], (long)tensor->ne[2], (long)tensor->ne[3],
+            offset, size, ggml_nbytes(tensor), ggml_backend_buffer_get_alloc_size(buf, tensor));
+    }
     GGML_ASSERT(offset + size <= ggml_backend_buffer_get_alloc_size(buf, tensor) && "tensor write out of bounds");
 
     buf->iface.set_tensor(buf, tensor, data, offset, size);
@@ -2321,10 +2327,10 @@ static size_t ggml_backend_cpu_buffer_type_get_alignment(ggml_backend_buffer_typ
 
 static size_t ggml_backend_cpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     // SCLP type_size=1 means ggml_nbytes=N, but the blob has a small header+sidecar.
-    // Reserve 1% + 4 KB so the full blob fits in host memory for CPU decode.
+    // Reserve 5% + 64 KB so the full blob fits in host memory for CPU decode.
     if (tensor->type == GGML_TYPE_SCLP) {
         size_t n = ggml_nbytes(tensor);
-        return n + n / 100 + 4096;
+        return n + n / 20 + 65536;
     }
     return ggml_nbytes(tensor);
     GGML_UNUSED(buft);

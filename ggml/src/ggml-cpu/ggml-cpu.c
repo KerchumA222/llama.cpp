@@ -1287,23 +1287,19 @@ void ggml_compute_forward_mul_mat(
     if (src0->type == GGML_TYPE_SCLP) {
         if (params->ith != 0) return;
 
+        struct ggml_tensor * src0_nc = (struct ggml_tensor *)(uintptr_t)src0;
+        if (src0_nc->extra == NULL) {
+            int64_t nw = ggml_nelements(src0);
+            uint16_t * bf16 = (uint16_t *)malloc((size_t)nw * sizeof(uint16_t));
+            GGML_ASSERT(bf16 != NULL && "sclp cpu decode: out of memory");
+            sclp_decode_to_bf16_cpu((const uint8_t *)src0->data, bf16, nw);
+            src0_nc->extra = bf16;
+        }
+
+        const uint16_t * bf16 = (const uint16_t *)src0_nc->extra;
         const int64_t K  = src0->ne[0];   // inner dim
         const int64_t N  = src0->ne[1];   // output rows
         const int64_t n_batch = ggml_nrows(dst->src[1]);  // total tokens * batch dims
-
-        static int sclp_mm_count = 0;
-        static double t_last = 0.0;
-        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-        double t_now = ts.tv_sec + ts.tv_nsec * 1e-9;
-        fprintf(stderr, "[SCLP-mm] call#%d K=%ld N=%ld nb=%ld dt=%.3fs\n",
-            sclp_mm_count++, (long)K, (long)N, (long)n_batch,
-            sclp_mm_count > 1 ? t_now - t_last : 0.0);
-        t_last = t_now;
-
-        int64_t nw = ggml_nelements(src0);
-        uint16_t * bf16 = (uint16_t *)malloc((size_t)nw * sizeof(uint16_t));
-        GGML_ASSERT(bf16 != NULL && "sclp cpu decode: out of memory");
-        sclp_decode_to_bf16_cpu((const uint8_t *)src0->data, bf16, nw);
 
         // Direct BF16 GEMM: dst[n, b] = sum_k W[k, n] * src1[k, b]
         // src0 layout: [K, N, ...], src1 layout: [K, n_batch], dst: [N, n_batch]
@@ -1332,7 +1328,6 @@ void ggml_compute_forward_mul_mat(
                 }
             }
         }
-        free(bf16);
         return;
     }
 
@@ -1642,15 +1637,19 @@ static void ggml_compute_forward_mul_mat_id(
             static double t_moe_last = 0.0;
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
             double t_now = ts.tv_sec + ts.tv_nsec * 1e-9;
-            fprintf(stderr, "[SCLP-MoE] call#%d K=%ld N=%ld n_ids=%ld n_toks=%ld dt=%.3fs\n",
-                moe_call++, (long)K, (long)N, (long)n_ids, (long)n_toks,
+            /*
+            // fprintf(stderr, "[SCLP-MoE] call#%d K=%ld N=%ld n_ids=%ld n_toks=%ld dt=%.3fs\n",
+            //     chunk_idx, (long)K, (long)N, (long)n_ids, (long)n_toks, dt);
                 moe_call > 1 ? t_now - t_moe_last : 0.0);
+            */
+            moe_call++;
             t_moe_last = t_now;
         }
 
         for (int64_t i_tok = 0; i_tok < n_toks; i_tok++) {
-            const float * x = (const float *)((const char *)src1->data + i_tok * src1->nb[2]);
             for (int64_t i_active = 0; i_active < n_ids; i_active++) {
+                const float * x = (const float *)((const char *)src1->data
+                    + i_tok * src1->nb[2] + (i_active % src1->ne[1]) * src1->nb[1]);
                 const int32_t expert = *(const int32_t *)((const char *)ids->data
                     + i_active * ids->nb[0] + i_tok * ids->nb[1]);
                 GGML_ASSERT(expert >= 0 && expert < src0->ne[2]);

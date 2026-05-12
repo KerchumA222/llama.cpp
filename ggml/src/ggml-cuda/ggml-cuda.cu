@@ -801,8 +801,8 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
 
     if (tensor->type == GGML_TYPE_SCLP) {
         // SCLP type_size=1 means ggml_nbytes = N bytes, but the blob includes a small header
-        // and sidecar section (~0.03% of weights x 6 bytes). Reserve 1% + 4 KB overhead.
-        return size + size / 100 + 4096;
+        // and sidecar section (~0.3% of weights x 6 bytes). Reserve 5% + 64 KB overhead.
+        return size + size / 20 + 65536;
     }
 
     if (ggml_is_quantized(tensor->type)) {
@@ -2537,12 +2537,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // SCLP MoE: fused decode+GEMV for M=1 (token generation).
     if (src0->type == GGML_TYPE_SCLP) {
-        // src0: [K, N, n_experts],  src1: [K, n_active, n_batches],
-        // ids:  [n_active, n_batches],  dst: [N, n_active, n_batches]
+        // src0: [K, N, n_experts],  src1: [K, 1, n_tokens] (broadcast across experts),
+        // ids:  [n_expert_used, n_tokens],  dst: [N, n_expert_used, n_tokens]
         const int64_t K         = src0->ne[0];
         const int64_t N         = src0->ne[1];
-        const int64_t n_active  = src1->ne[1];
-        const int64_t n_batches = src1->ne[2];
+        const int64_t n_active  = ids->ne[0];
+        const int64_t n_batches = ids->ne[1];
 
         // Use fused MoE GEMV — avoids allocating a full-model decode buffer.
         GGML_ASSERT(ids != nullptr && "SCLP MUL_MAT_ID requires routing ids");
@@ -2553,6 +2553,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             (const int32_t*)ids->data,
             (float*)dst->data,
             (uint32_t)N, (uint32_t)K, (uint32_t)n_active, (uint32_t)n_batches,
+            (uint32_t)src1->ne[1],
             ctx.stream());
         return;
     }

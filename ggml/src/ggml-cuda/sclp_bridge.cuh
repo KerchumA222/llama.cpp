@@ -446,7 +446,7 @@ __global__ void sclp_fused_moe_gemv_kernel(
     const float*   __restrict__ src1,   // [K × n_active × n_batches]
     const int32_t* __restrict__ ids,    // [n_active × n_batches]
     float*         __restrict__ dst,    // [N × n_active × n_batches]
-    uint32_t N, uint32_t K, uint32_t n_active
+    uint32_t N, uint32_t K, uint32_t n_active, uint32_t src1_ne1
 ) {
     __shared__ uint8_t s_palette_size;
     __shared__ uint8_t s_palette[16];
@@ -468,10 +468,13 @@ __global__ void sclp_fused_moe_gemv_kernel(
 
     if (row >= N) return;
 
+    const uint32_t i_active = flat % n_active;
+    const uint32_t i_batch  = flat / n_active;
+
     const int32_t e = ids[flat];
     // ws index for weight (k, row, e): k + row*K + e*N*K
     const uint64_t ws_base = (uint64_t)e * N * K + (uint64_t)row * K;
-    const float* x = src1 + (uint64_t)flat * K;
+    const float* x = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
 
     float acc0 = 0.0f, acc1 = 0.0f;
     const uint32_t K16 = (K / 16) * 16;
@@ -528,6 +531,7 @@ inline void llama_sclp_fused_moe_gemv(
     uint32_t       K,          // input dim
     uint32_t       n_active,   // active experts per token
     uint32_t       n_batches,  // number of token batches
+    uint32_t       src1_ne1,   // number of columns in src1 per batch (1 or n_active)
     hipStream_t    stream
 ) {
     constexpr int WARPS_PER_BLOCK = 32;
@@ -536,7 +540,7 @@ inline void llama_sclp_fused_moe_gemv(
     dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, n_active * n_batches);
     sclp_fused_moe_gemv_kernel<<<grid, block, 0, stream>>>(
         (const uint8_t*)blob_ptr,
-        src1, ids, dst, N, K, n_active);
+        src1, ids, dst, N, K, n_active, src1_ne1);
 }
 
 // Fused decode-WMMA kernel for M > 1 prefill using RDNA3 wave32 WMMA instructions.
