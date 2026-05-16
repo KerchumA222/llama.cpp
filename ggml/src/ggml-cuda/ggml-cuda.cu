@@ -811,8 +811,9 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     }
     if (tensor->type == GGML_TYPE_SCLP4) {
         // SCLP4 type_size=1,blck_size=2 => ggml_nbytes = N/2 bytes. Blob includes header +
-        // sidecar. Reserve 10% + 64 KB overhead (header is proportionally larger at N/2).
-        return size + size / 10 + 65536;
+        // sidecar. With k-means+sidecar_dist=1, sidecar is ~1.4% of weights x 6 bytes = ~16.8%
+        // of N/2 ws bytes. Reserve 25% + 64 KB to cover this comfortably.
+        return size + size / 4 + 65536;
     }
     if (tensor->type == GGML_TYPE_SCLP6) {
         // SCLP6 type_size=3,blck_size=4 => ggml_nbytes = N*3/4 bytes. Blob includes header.
