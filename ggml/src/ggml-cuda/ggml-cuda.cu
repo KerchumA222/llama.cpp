@@ -2619,8 +2619,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t N = src0->ne[1];
         const int64_t M = src1->ne[1];
 
-        // SCLP4 fused GEMV disabled for debugging - force two-pass decode path
-        /*if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             llama_sclp4_fused_gemv(
                 src0->data,
                 (const float*)src1->data,
@@ -2629,7 +2628,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                 (uint32_t)K,
                 stream);
             return;
-        }*/
+        }
 
         // Two-pass fallback: decode blob → BF16 → recurse.
         const int64_t num_weights = ggml_nelements(src0);
