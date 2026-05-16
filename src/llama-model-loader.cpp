@@ -1388,14 +1388,26 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
         if (cur->data == nullptr) {
             cur->data = (uint8_t *)mapping->addr() + w.offs;
         } else {
-            memcpy(cur->data, (uint8_t *)mapping->addr() + w.offs, ggml_nbytes(cur));
+            // SCLP blobs: disk_size is exact (get_alloc_size reserved enough space).
+            // Other types: cap at ggml_nbytes in case disk_size is larger.
+            const bool is_sclp = cur->type == GGML_TYPE_SCLP || cur->type == GGML_TYPE_SCLP4 || cur->type == GGML_TYPE_SCLP6;
+            const size_t copy_bytes = is_sclp ? w.disk_size : std::min(w.disk_size, ggml_nbytes(cur));
+            memcpy(cur->data, (uint8_t *)mapping->addr() + w.offs, copy_bytes);
+            if (copy_bytes < ggml_nbytes(cur)) {
+                memset((uint8_t *)cur->data + copy_bytes, 0, ggml_nbytes(cur) - copy_bytes);
+            }
         }
     } else {
         GGML_ASSERT(cur->data != nullptr);
         GGML_ASSERT(w.idx < files.size());
         const auto & file = files.at(w.idx);
         file->seek(w.offs, SEEK_SET);
-        file->read_raw(cur->data, ggml_nbytes(cur));
+        const bool is_sclp = cur->type == GGML_TYPE_SCLP || cur->type == GGML_TYPE_SCLP4 || cur->type == GGML_TYPE_SCLP6;
+        const size_t read_bytes = is_sclp ? w.disk_size : std::min(w.disk_size, ggml_nbytes(cur));
+        file->read_raw(cur->data, read_bytes);
+        if (read_bytes < ggml_nbytes(cur)) {
+            memset((uint8_t *)cur->data + read_bytes, 0, ggml_nbytes(cur) - read_bytes);
+        }
     }
 
     if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
@@ -1532,6 +1544,7 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+        const size_t disk_size = weight->disk_size;
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1552,21 +1565,39 @@ bool llama_model_loader::load_all_data(
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
                 if (lmlocks) {
                     const auto & lmlock = lmlocks->at(weight->idx);
-                    lmlock->grow_to(weight->offs + n_size);
+                    lmlock->grow_to(weight->offs + disk_size);
                 }
 
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
-                mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                mmap_used.second = std::max(mmap_used.second, weight->offs + disk_size);
             } else {
-                ggml_backend_tensor_set(cur, data, 0, n_size);
+                if (cur->type == GGML_TYPE_SCLP  ||
+                    cur->type == GGML_TYPE_SCLP4 ||
+                    cur->type == GGML_TYPE_SCLP6) {
+                    // All SCLP types use self-describing blobs; get_alloc_size reserves
+                    // sufficient space for the full blob (ws_stream + header + sidecar).
+                    // Upload exactly disk_size bytes — no zero-padding needed.
+                    ggml_backend_tensor_set(cur, data, 0, disk_size);
+                } else if (disk_size < n_size) {
+                    ggml_backend_tensor_set(cur, data, 0, disk_size);
+                    ggml_backend_tensor_memset(cur, 0, disk_size, n_size - disk_size);
+                } else {
+                    ggml_backend_tensor_set(cur, data, 0, n_size);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
+                // All SCLP types: disk_size is the exact blob size; get_alloc_size reserves enough.
+                const bool is_sclp = cur->type == GGML_TYPE_SCLP || cur->type == GGML_TYPE_SCLP4 || cur->type == GGML_TYPE_SCLP6;
+                const size_t read_bytes = is_sclp ? disk_size : std::min(disk_size, n_size);
+                file->read_raw(cur->data, read_bytes);
+                if (read_bytes < n_size) {
+                    memset((uint8_t *)cur->data + read_bytes, 0, n_size - read_bytes);
+                }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));

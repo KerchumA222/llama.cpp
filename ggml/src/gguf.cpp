@@ -212,7 +212,12 @@ struct gguf_kv {
 struct gguf_tensor_info {
     struct ggml_tensor t; // for holding the equivalent info
     uint64_t offset;      // offset from start of `data`, must be a multiple of `ALIGNMENT`
+    size_t disk_size;     // actual on-disk byte count; 0 means use ggml_nbytes (default)
 };
+
+static size_t gguf_ti_nbytes(const struct gguf_tensor_info & ti) {
+    return ti.disk_size ? ti.disk_size : ggml_nbytes(&ti.t);
+}
 
 struct gguf_context {
     uint32_t version = GGUF_VERSION;
@@ -713,7 +718,7 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
     {
         ctx->size = 0;
         for (size_t i = 0; i < ctx->info.size(); ++i) {
-            const gguf_tensor_info & ti = ctx->info[i];
+            gguf_tensor_info & ti = ctx->info[i];
             if (ti.offset != ctx->size) {
                 GGML_LOG_ERROR("%s: tensor '%s' has offset %" PRIu64 ", expected %zu\n",
                     __func__, ti.t.name, ti.offset, ctx->size);
@@ -721,14 +726,26 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
                 gguf_free(ctx);
                 return nullptr;
             }
-            size_t padded_size = GGML_PAD(ggml_nbytes(&ti.t), ctx->alignment);
-            if (SIZE_MAX - ctx->size < padded_size) {
+            // For variable-size types: derive disk_size from consecutive offsets.
+            size_t actual_size;
+            if (i + 1 < ctx->info.size()) {
+                size_t next_off = ctx->info[i + 1].offset;
+                size_t inferred = next_off - ti.offset; // includes alignment padding
+                if (inferred != ggml_nbytes(&ti.t)) {
+                    // on-disk size differs from ggml_nbytes — record it
+                    ti.disk_size = inferred;
+                }
+                actual_size = inferred;
+            } else {
+                actual_size = GGML_PAD(gguf_ti_nbytes(ti), ctx->alignment);
+            }
+            if (SIZE_MAX - ctx->size < actual_size) {
                 GGML_LOG_ERROR("%s: tensor '%s' size overflow, cannot accumulate size %zu + %zu\n",
-                    __func__, ti.t.name, ctx->size, padded_size);
+                    __func__, ti.t.name, ctx->size, actual_size);
                 gguf_free(ctx);
                 return nullptr;
             }
-            ctx->size += padded_size;
+            ctx->size += actual_size;
         }
     }
 
@@ -1242,7 +1259,7 @@ void gguf_add_tensor(
     struct gguf_tensor_info ti;
     ti.t = *tensor;
     ti.offset = ctx->info.empty() ? 0 :
-        ctx->info.back().offset + GGML_PAD(ggml_nbytes(&ctx->info.back().t), ctx->alignment);
+        ctx->info.back().offset + GGML_PAD(gguf_ti_nbytes(ctx->info.back()), ctx->alignment);
     ctx->info.push_back(ti);
 }
 
@@ -1264,10 +1281,27 @@ void gguf_set_tensor_type(struct gguf_context * ctx, const char * name, enum ggm
         tensor->nb[i] = tensor->nb[i - 1]*tensor->ne[i - 1];
     }
 
-    // update offsets
+    // Changing the type invalidates any disk_size that was inferred from the original file.
+    // Clear it for this tensor and all subsequent ones before recalculating offsets.
+    ctx->info[tensor_id].disk_size = 0;
     const int64_t n_tensors = gguf_get_n_tensors(ctx);
     for (int64_t i = tensor_id + 1; i < n_tensors; ++i) {
-        ctx->info[i].offset = ctx->info[i - 1].offset + GGML_PAD(ggml_nbytes(&ctx->info[i - 1].t), ctx->alignment);
+        ctx->info[i].disk_size = 0;
+        ctx->info[i].offset = ctx->info[i - 1].offset + GGML_PAD(gguf_ti_nbytes(ctx->info[i - 1]), ctx->alignment);
+    }
+}
+
+void gguf_set_tensor_disk_size(struct gguf_context * ctx, const char * name, size_t disk_size) {
+    const int64_t tensor_id = gguf_find_tensor(ctx, name);
+    if (tensor_id < 0) {
+        GGML_ABORT("tensor not found: %s", name);
+    }
+    ctx->info[tensor_id].disk_size = disk_size;
+
+    // recalculate offsets for all tensors after this one
+    const int64_t n_tensors = gguf_get_n_tensors(ctx);
+    for (int64_t i = tensor_id + 1; i < n_tensors; ++i) {
+        ctx->info[i].offset = ctx->info[i - 1].offset + GGML_PAD(gguf_ti_nbytes(ctx->info[i - 1]), ctx->alignment);
     }
 }
 
@@ -1409,7 +1443,7 @@ struct gguf_writer_buf final : public gguf_writer_base {
 
         GGML_ASSERT(ggml_is_contiguous(&info.t));
         const size_t offset = buf.size();
-        const size_t nbytes = ggml_nbytes(&info.t);
+        const size_t nbytes = gguf_ti_nbytes(info);
 
         buf.resize(offset + nbytes);
         if (info.t.buffer) {
@@ -1453,7 +1487,7 @@ struct gguf_writer_file final : public gguf_writer_base {
         GGML_ASSERT(written_bytes - offset_data == info.offset);
 
         GGML_ASSERT(ggml_is_contiguous(&info.t));
-        const size_t nbytes = ggml_nbytes(&info.t);
+        const size_t nbytes = gguf_ti_nbytes(info);
 
         std::vector<int8_t> buf(nbytes);
         if (info.t.buffer) {
