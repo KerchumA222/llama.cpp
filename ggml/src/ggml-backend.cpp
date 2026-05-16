@@ -331,7 +331,13 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
     }
 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
-    GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+    if (offset + size > ggml_backend_buffer_get_alloc_size(buf, tensor)) {
+        fprintf(stderr, "%s: tensor %s: type=%s ne=%ldx%ldx%ldx%ld offset=%zu size=%zu nbytes=%zu alloc_size=%zu\n",
+            __func__, tensor->name, ggml_type_name(tensor->type),
+            (long)tensor->ne[0], (long)tensor->ne[1], (long)tensor->ne[2], (long)tensor->ne[3],
+            offset, size, ggml_nbytes(tensor), ggml_backend_buffer_get_alloc_size(buf, tensor));
+    }
+    GGML_ASSERT(offset + size <= ggml_backend_buffer_get_alloc_size(buf, tensor) && "tensor write out of bounds");
 
     buf->iface.set_tensor(buf, tensor, data, offset, size);
 }
@@ -480,6 +486,7 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
     if (src == dst) {
         return;
     }
+
 
     if (ggml_backend_buffer_is_host(src->buffer)) {
         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
@@ -1546,6 +1553,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    static int compute_splits_call = 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1556,7 +1565,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
-
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1721,6 +1729,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    compute_splits_call++;
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2319,6 +2328,17 @@ static size_t ggml_backend_cpu_buffer_type_get_alignment(ggml_backend_buffer_typ
     GGML_UNUSED(buft);
 }
 
+static size_t ggml_backend_cpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+    // SCLP type_size=1 means ggml_nbytes=N, but the blob has a small header+sidecar.
+    // Reserve 5% + 64 KB so the full blob fits in host memory for CPU decode.
+    if (tensor->type == GGML_TYPE_SCLP) {
+        size_t n = ggml_nbytes(tensor);
+        return n + n / 20 + 65536;
+    }
+    return ggml_nbytes(tensor);
+    GGML_UNUSED(buft);
+}
+
 static bool ggml_backend_cpu_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
     return true;
 
@@ -2332,7 +2352,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
             /* .alloc_buffer     = */ ggml_backend_cpu_buffer_type_alloc_buffer,
             /* .get_alignment    = */ ggml_backend_cpu_buffer_type_get_alignment,
             /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
-            /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
+            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type_get_alloc_size,
             /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
