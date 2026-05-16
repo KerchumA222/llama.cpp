@@ -2794,24 +2794,45 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         return;
     }
 
-    // SCLP6 MoE: fused decode+GEMV — avoids allocating a full decode buffer for all experts.
+    // SCLP6 MoE: fused GEMV for single-token generation (n_batches==1); two-pass for prefill.
     if (src0->type == GGML_TYPE_SCLP6) {
-        // src0: [K, N, n_experts], src1: [K, src1_ne1, n_batches],
-        // ids: [n_active, n_batches], dst: [N, n_active, n_batches]
         GGML_ASSERT(ids != nullptr && "SCLP6 MUL_MAT_ID requires routing ids");
         GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-        const int64_t K        = src0->ne[0];
-        const int64_t N        = src0->ne[1];
-        const int64_t n_active  = ids->ne[0];
         const int64_t n_batches = ids->ne[1];
-        llama_sclp6_fused_moe_gemv(
-            src0->data,
-            (const float*)src1->data,
-            (const int32_t*)ids->data,
-            (float*)dst->data,
-            (uint32_t)N, (uint32_t)K, (uint32_t)n_active, (uint32_t)n_batches,
-            (uint32_t)src1->ne[1],
-            ctx.stream());
+        if (n_batches == 1) {
+            // Single-token generation: fused decode+GEMV avoids allocating full expert buffer.
+            const int64_t K       = src0->ne[0];
+            const int64_t N       = src0->ne[1];
+            const int64_t n_active = ids->ne[0];
+            llama_sclp6_fused_moe_gemv(
+                src0->data,
+                (const float*)src1->data,
+                (const int32_t*)ids->data,
+                (float*)dst->data,
+                (uint32_t)N, (uint32_t)K, (uint32_t)n_active, (uint32_t)n_batches,
+                (uint32_t)src1->ne[1],
+                ctx.stream());
+            return;
+        }
+        // Prefill (n_batches > 1): decode all experts to BF16, then use native mul_mat_id
+        // so rocBLAS handles the batched GEMM efficiently.
+        cudaStream_t stream = ctx.stream();
+        const int64_t num_weights = ggml_nelements(src0);
+        const uint32_t n_experts = (uint32_t)(src0->ne[2] > 0 ? src0->ne[2] : 1);
+        ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
+        llama_sclp6_dispatch(src0->data, decoded.get(), (uint32_t)num_weights, n_experts, stream);
+
+        ggml_tensor src0_bf16 = *src0;
+        src0_bf16.type  = GGML_TYPE_BF16;
+        src0_bf16.data  = decoded.get();
+        src0_bf16.nb[0] = sizeof(ggml_bf16_t);
+        for (int i = 1; i < GGML_MAX_DIMS; i++) {
+            src0_bf16.nb[i] = src0_bf16.nb[i-1] * src0_bf16.ne[i-1];
+        }
+        ggml_tensor * orig_src0 = dst->src[0];
+        dst->src[0] = &src0_bf16;
+        ggml_cuda_mul_mat_id(ctx, dst);
+        dst->src[0] = orig_src0;
         return;
     }
 

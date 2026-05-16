@@ -1071,7 +1071,6 @@ __global__ void sclp6_fused_gemv_kernel(
             }
             p += 1 + p[0];
         }
-        // ws_start = p - blob; expert's ws section starts at ws_start + expert_idx * expert_groups * 3
         uint32_t ws_start = (uint32_t)(p - blob);
         uint32_t total_nw; __builtin_memcpy(&total_nw, blob, sizeof(uint32_t));
         uint32_t expert_nw     = total_nw / n_experts;
@@ -1080,7 +1079,7 @@ __global__ void sclp6_fused_gemv_kernel(
     }
     __syncthreads();
 
-    const uint8_t* ws = blob + s_ws_offset;  // packed 6-bit groups for this expert
+    const uint8_t* ws = blob + s_ws_offset;
 
     const int warps_per_block = blockDim.x / 32;
     const int warp_id  = threadIdx.x / 32;
@@ -1090,7 +1089,7 @@ __global__ void sclp6_fused_gemv_kernel(
     if (row >= N) return;
 
     float acc = 0.0f;
-    const uint64_t row_group_base = (uint64_t)row * K / 4;
+    const uint64_t row_group_base = (uint64_t)row * ((K + 3) / 4);
     const uint32_t n_groups_row = (K + 3) / 4;
 
     for (uint32_t g = lane; g < n_groups_row; g += 32) {
@@ -1165,6 +1164,12 @@ inline void llama_sclp6_fused_gemv(
 // Thread 0 walks the SCLP6 header to find expert e's palette and ws offset.
 // No intermediate BF16 buffer — avoids the 1 GB allocation for 128 experts.
 __launch_bounds__(1024, 2)
+// Optimized fused MoE GEMV for SCLP6, single-token generation (n_batches==1).
+// Key optimizations vs v1:
+//   1. Activation vector (K floats) loaded cooperatively into shared memory once per block,
+//      eliminating 32x redundant global reads (one per warp).
+//   2. Decoded float lookup table (s_lut[64]) built from palette in shared memory —
+//      replaces per-weight BF16 bit-twiddling with a single smem table lookup.
 __global__ void sclp6_fused_moe_gemv_kernel(
     const uint8_t* __restrict__ blob,
     const float*   __restrict__ src1,     // [K × src1_ne1 × n_batches]
@@ -1172,44 +1177,66 @@ __global__ void sclp6_fused_moe_gemv_kernel(
     float*         __restrict__ dst,      // [N × n_active × n_batches]
     uint32_t N, uint32_t K, uint32_t n_active, uint32_t src1_ne1
 ) {
-    __shared__ uint8_t  s_palette_size;
-    __shared__ uint8_t  s_palette[8];
-    __shared__ uint32_t s_ws_offset;
+    // Shared memory layout:
+    //   [0..3]   s_ws_offset  (uint32)
+    //   [4..255] s_lut[64]    (float, 256 bytes) — decoded float for each (pidx,smn) pair
+    //   [256..]  s_x[K]       (float, K*4 bytes) — activation vector
+    extern __shared__ char smem[];
+    uint32_t* s_ws_offset = (uint32_t*)smem;
+    float*    s_lut       = (float*)(smem + 4);    // 64 floats = 256 bytes
+    float*    s_x         = (float*)(smem + 260);  // K floats
 
     const uint32_t flat    = blockIdx.y;
     const int32_t  e       = ids[flat];
     const uint32_t i_active = flat % n_active;
     const uint32_t i_batch  = flat / n_active;
 
+    // Thread 0: parse blob header, build LUT.
     if (threadIdx.x == 0) {
         uint32_t total_nw, n_experts;
         __builtin_memcpy(&total_nw,   blob,     sizeof(uint32_t));
         __builtin_memcpy(&n_experts,  blob + 4, sizeof(uint32_t));
         const uint8_t* p = blob + 8;
+        uint8_t pal[8];
+        uint8_t pal_size = 0;
         for (uint32_t ei = 0; ei < n_experts; ei++) {
             if (ei == (uint32_t)e) {
-                s_palette_size = p[0];
-                for (int i = 0; i < (int)p[0]; i++) s_palette[i] = p[1 + i];
+                pal_size = p[0];
+                for (int i = 0; i < (int)p[0]; i++) pal[i] = p[1 + i];
             }
             p += 1 + p[0];
         }
-        // p now points past all expert headers to ws_start
-        uint32_t ws_start    = (uint32_t)(p - blob);
-        uint32_t expert_nw   = total_nw / n_experts;
+        uint32_t ws_start     = (uint32_t)(p - blob);
+        uint32_t expert_nw    = total_nw / n_experts;
         uint32_t expert_groups = (expert_nw + 3) / 4;
-        s_ws_offset = ws_start + (uint32_t)e * expert_groups * 3;
+        *s_ws_offset = ws_start + (uint32_t)e * expert_groups * 3;
+
+        // Build 8×8 decode LUT: s_lut[pidx * 8 + smn] = float value
+        for (int pidx = 0; pidx < 8; pidx++) {
+            uint8_t exp = (pidx < (int)pal_size) ? pal[pidx] : 0;
+            for (int smn = 0; smn < 8; smn++) {
+                uint8_t sign = (smn >> 2) & 1;
+                uint8_t mant = smn & 0x3;
+                uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp << 7) | ((uint16_t)mant << 5);
+                s_lut[pidx * 8 + smn] = __bfloat162float(*(__hip_bfloat16*)&bits);
+            }
+        }
+    }
+
+    // Cooperatively load activation vector into shared memory.
+    const float* x = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
+    for (uint32_t k = threadIdx.x; k < K; k += blockDim.x) {
+        s_x[k] = x[k];
     }
     __syncthreads();
 
-    const uint8_t* ws = blob + s_ws_offset;
+    const uint8_t* ws = blob + *s_ws_offset;
     const int warps_per_block = blockDim.x / 32;
     const int warp_id = threadIdx.x / 32;
     const int lane    = threadIdx.x & 31;
     const uint32_t row = (uint32_t)blockIdx.x * warps_per_block + warp_id;
 
     if (row >= N) return;
-
-    const float* x = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
 
     float acc = 0.0f;
     const uint64_t row_group_base = (uint64_t)row * ((K + 3) / 4);
@@ -1230,13 +1257,7 @@ __global__ void sclp6_fused_moe_gemv_kernel(
         uint32_t base_k = g * 4;
         uint32_t n_k = (base_k + 4 <= K) ? 4 : (K - base_k);
         for (uint32_t j = 0; j < n_k; j++) {
-            uint8_t pidx  = sixbits[j] >> 3;
-            uint8_t smn   = sixbits[j] & 0x7;
-            uint8_t exp   = (pidx < s_palette_size) ? s_palette[pidx] : 0;
-            uint8_t sign  = (smn >> 2) & 1;
-            uint8_t mant  = smn & 0x3;
-            uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp << 7) | ((uint16_t)mant << 5);
-            acc += __bfloat162float(*(__hip_bfloat16*)&bits) * x[base_k + j];
+            acc += s_lut[sixbits[j]] * s_x[base_k + j];
         }
     }
 
@@ -1256,10 +1277,12 @@ inline void llama_sclp6_fused_moe_gemv(
     uint32_t       src1_ne1,
     hipStream_t    stream
 ) {
-    constexpr int WARPS_PER_BLOCK = 32;
+    constexpr int WARPS_PER_BLOCK = 16;
     dim3 block(WARPS_PER_BLOCK * 32);
+    // Dynamic shared memory: 4 (ws_offset) + 256 (lut) + K*4 (activations)
+    size_t smem_bytes = 260 + (size_t)K * sizeof(float);
     dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, n_active * n_batches);
-    sclp6_fused_moe_gemv_kernel<<<grid, block, 0, stream>>>(
+    sclp6_fused_moe_gemv_kernel<<<grid, block, smem_bytes, stream>>>(
         (const uint8_t*)blob_ptr,
         src1, ids, dst, N, K, n_active, src1_ne1);
 }
