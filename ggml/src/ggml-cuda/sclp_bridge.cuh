@@ -3,6 +3,10 @@
 #include <hip/hip_bf16.h>
 #include <cstdint>
 
+#ifndef SCLP_MEMSET_STUB
+#define SCLP_MEMSET_STUB 0
+#endif
+
 // SCLP decode bridge for llama.cpp HIP backend.
 //
 // Wire format (SCLP blob stored in VRAM):
@@ -777,8 +781,17 @@ __global__ void sclp4_decode_blob_kernel(
         out[i] = ((uint16_t)sign << 15) | ((uint16_t)exp << 7) | ((uint16_t)mant << 6);
     }
 
-    for (uint32_t i = 0; i < n_this; ++i) {
-        output[base_idx + i] = out[i];
+    // Vectorized stores: 2× uint4 (8 uint16 each) when full; scalar fallback otherwise
+    if (n_this == 16) {
+        uint4 v0, v1;
+        __builtin_memcpy(&v0, out,     sizeof(uint4));
+        __builtin_memcpy(&v1, out + 8, sizeof(uint4));
+        *reinterpret_cast<uint4*>(output + base_idx)     = v0;
+        *reinterpret_cast<uint4*>(output + base_idx + 8) = v1;
+    } else {
+        for (uint32_t i = 0; i < n_this; ++i) {
+            output[base_idx + i] = out[i];
+        }
     }
 }
 
@@ -898,12 +911,17 @@ inline void llama_sclp4_dispatch(
     const uint8_t* data = (const uint8_t*)sclp_data;
     dim3 block(256);
 
+#if SCLP_MEMSET_STUB
+    (void)data; (void)block;
+    hipMemsetAsync(output, 0, (size_t)num_weights * sizeof(uint16_t), stream);
+#else
     // Each thread handles 16 weights (8 nibble bytes)
     uint32_t groups = (num_weights + 15) / 16;
     dim3 decode_grid((groups + 255) / 256);
     sclp4_decode_blob_kernel<<<decode_grid, block, 0, stream>>>(data, output, num_weights);
 
     sclp4_fixup_sidecar_kernel<<<4, block, 0, stream>>>(data, output, num_weights);
+#endif
 }
 
 inline void llama_sclp4_fused_gemv(
@@ -1101,13 +1119,23 @@ __global__ void sclp6_decode_blob_kernel(
     uint32_t remaining = expert_nw - g_local * 4;
     uint32_t n_this = remaining < 4 ? remaining : 4;
 
-    for (uint32_t i = 0; i < n_this; ++i) {
+    uint16_t out[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
         uint8_t pidx = sixbits[i] >> 3;
         uint8_t smn  = sixbits[i] & 0x7;
         uint8_t exp  = (pidx < s_palette_sizes[e]) ? s_palettes[e][pidx] : 0;
         uint8_t sign = (smn >> 2) & 1;
         uint8_t mant = smn & 0x3;
-        output[base_idx + i] = ((uint16_t)sign << 15) | ((uint16_t)exp << 7) | ((uint16_t)mant << 5);
+        out[i] = ((uint16_t)sign << 15) | ((uint16_t)exp << 7) | ((uint16_t)mant << 5);
+    }
+
+    if (n_this == 4) {
+        uint64_t v;
+        __builtin_memcpy(&v, out, sizeof(uint64_t));
+        *reinterpret_cast<uint64_t*>(output + base_idx) = v;
+    } else {
+        for (uint32_t i = 0; i < n_this; ++i) output[base_idx + i] = out[i];
     }
 }
 
@@ -1253,10 +1281,15 @@ inline void llama_sclp6_dispatch(
     uint32_t expert_groups = (expert_nw + 3) / 4;
     uint32_t total_groups  = expert_groups * n_experts;
 
+#if SCLP_MEMSET_STUB
+    (void)data; (void)block; (void)expert_nw; (void)expert_groups; (void)total_groups;
+    hipMemsetAsync(output, 0, (size_t)num_weights * sizeof(uint16_t), stream);
+#else
     dim3 decode_grid((total_groups + 255) / 256);
     sclp6_decode_blob_kernel<<<decode_grid, block, 0, stream>>>(data, output, num_weights);
 
     sclp6_fixup_sidecar_kernel<<<4, block, 0, stream>>>(data, output, num_weights);
+#endif
 }
 
 inline void llama_sclp6_fused_gemv(
@@ -1421,6 +1454,10 @@ inline void llama_sclp_dispatch(
     const uint8_t* data = (const uint8_t*)sclp_data;
     dim3 block(256);
 
+#if SCLP_MEMSET_STUB
+    (void)data; (void)block;
+    hipMemsetAsync(output, 0, (size_t)num_weights * sizeof(uint16_t), stream);
+#else
     // Main decode: one thread per 8 weights (single uint64_t load from ws_stream)
     uint32_t groups = (num_weights + 7) / 8;
     dim3 decode_grid((groups + 255) / 256);
@@ -1429,4 +1466,5 @@ inline void llama_sclp_dispatch(
     // Sidecar fixup: fixed 4-block grid with stride loop handles any sidecar count.
     // Threads where i >= sidecar_count return after a single shared-memory read.
     sclp_fixup_sidecar_kernel<<<4, block, 0, stream>>>(data, output, num_weights);
+#endif
 }
