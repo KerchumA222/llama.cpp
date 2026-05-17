@@ -2776,8 +2776,29 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
-    // SCLP4 MoE: two-pass decode → BF16 → recurse into regular mul_mat_id.
+    // SCLP4 MoE: fused decode+GEMV for single-token gen; two-pass for prefill.
     if (src0->type == GGML_TYPE_SCLP4) {
+        GGML_ASSERT(ids != nullptr && "SCLP4 MUL_MAT_ID requires routing ids");
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        const int64_t n_batches = ids->ne[1];
+        if (n_batches == 1) {
+            // Single-token generation: fused kernel decodes only the routed experts'
+            // bytes inline, never allocates the full BF16 expert buffer.
+            const int64_t K        = src0->ne[0];
+            const int64_t N        = src0->ne[1];
+            const int64_t n_active = ids->ne[0];
+            llama_sclp4_fused_moe_gemv(
+                src0->data,
+                (const float*)src1->data,
+                (const int32_t*)ids->data,
+                (float*)dst->data,
+                (uint32_t)N, (uint32_t)K, (uint32_t)n_active, (uint32_t)n_batches,
+                (uint32_t)src1->ne[1],
+                ctx.stream());
+            return;
+        }
+        // Prefill (n_batches > 1): decode all experts to BF16, then native mul_mat_id
+        // hits rocBLAS for the batched GEMM.
         cudaStream_t stream = ctx.stream();
         const int64_t num_weights = ggml_nelements(src0);
         ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
