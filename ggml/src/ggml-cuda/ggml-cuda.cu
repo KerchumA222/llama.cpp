@@ -2817,7 +2817,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         if (sclp_fused_moe_wmma_mode == 2) {
             hipMalloc(&dst_fused_raw, (size_t)dst_nelem * sizeof(float));
         }
-        ggml_cuda_pool_alloc<float> dst_fused_scratch; // unused now in mode 2, retained for mode 1
         if (sclp_fused_moe_wmma_mode > 0) {
             const int64_t K        = src0->ne[0];
             const int64_t N        = src0->ne[1];
@@ -2832,23 +2831,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 dst_fused_ptr = dst_fused_raw;
             }
 
-            // SCLP_FUSED_MOE_WMMA_SKIP_FUSED=1 to skip fused kernel and just test the
-            // two-pass + diff infrastructure (debug aid).
-            static const bool skip_fused = getenv("SCLP_FUSED_MOE_WMMA_SKIP_FUSED") != nullptr;
-            if (!skip_fused) {
-                llama_sclp4_fused_moe_wmma(
-                    src0->data,
-                    (const float*)src1->data,
-                    (const int32_t*)ids->data,
-                    dst_fused_ptr,
-                    perm_scratch.get(), expert_offsets_scratch.get(),
-                    (uint32_t)N, (uint32_t)K, (uint32_t)n_active,
-                    (uint32_t)n_batches, (uint32_t)src1->ne[1], (uint32_t)n_experts,
-                    stream);
-            } else {
-                // Fill with sentinel so diff is meaningful.
-                hipMemsetAsync(dst_fused_ptr, 0, (size_t)dst_nelem * sizeof(float), stream);
-            }
+            llama_sclp4_fused_moe_wmma(
+                src0->data,
+                (const float*)src1->data,
+                (const int32_t*)ids->data,
+                dst_fused_ptr,
+                perm_scratch.get(), expert_offsets_scratch.get(),
+                (uint32_t)N, (uint32_t)K, (uint32_t)n_active,
+                (uint32_t)n_batches, (uint32_t)src1->ne[1], (uint32_t)n_experts,
+                stream);
 
             if (sclp_fused_moe_wmma_mode == 1) return;
             // mode == 2: fall through to also run the two-pass, then diff below.
@@ -2888,6 +2879,23 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             hipMemcpyAsync(&h_dst0, (float*)dst->data, sizeof(float), hipMemcpyDeviceToHost, stream);
             hipStreamSynchronize(stream);
             static int diff_call_count = 0;
+            // Print shape on every call to detect shape variation across MoE matmul invocations.
+            if (diff_call_count < 30) {
+                float max_abs_total = 0.f, sum_ref_total = 0.f, sum_fused_total = 0.f;
+                for (int64_t i = 0; i < dst_nelem; i++) {
+                    float a = h_ref[i], b = h_fused[i];
+                    max_abs_total = std::max(max_abs_total, std::fabs(a - b));
+                    sum_ref_total += std::fabs(a);
+                    sum_fused_total += std::fabs(b);
+                }
+                fprintf(stderr, "[SCLP_DIFF] call=%d K=%lld N=%lld nact=%lld nbat=%lld src1_ne1=%lld | global: max_abs=%.4g ref|sum|=%.4g fused|sum|=%.4g ratio=%.5f\n",
+                        diff_call_count,
+                        (long long)src0->ne[0], (long long)src0->ne[1],
+                        (long long)ids->ne[0], (long long)n_batches,
+                        (long long)src1->ne[1],
+                        max_abs_total, sum_ref_total, sum_fused_total,
+                        sum_ref_total > 0 ? sum_fused_total/sum_ref_total : 0.f);
+            }
             if (diff_call_count < 2) {
                 const int64_t N        = src0->ne[1];
                 const int64_t n_active = ids->ne[0];
@@ -2904,7 +2912,32 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 for (int i = 0; i < 16 && i < n_active; i++) fprintf(stderr, " %d", h_ids[i]);
                 fprintf(stderr, "\n");
                 // Per-i_active stats for batch=0.
-                for (int i_active = 0; i_active < n_active && i_active < 16; i_active++) {
+                // Sample i_active=0..7 from batch=0 AND batch=1 to cover both.
+                const int batches_to_show[2] = {0, (int)(n_batches > 1 ? 1 : 0)};
+                for (int b_show : batches_to_show)
+                for (int i_active = 0; i_active < n_active && i_active < 8; i_active++) {
+                    int base_active_idx = i_active + b_show * n_active;
+                    int log_active = base_active_idx;
+                    (void)log_active;
+                    int64_t base_dst = (int64_t)(base_active_idx) * N;
+                    fprintf(stderr, "[SCLP_DIFF] b=%d i_a=%d  ", b_show, i_active);
+                    {
+                        float max_abs_a = 0.f, sum_ref = 0.f, sum_fused = 0.f;
+                        int n_ref_nz = 0, n_fused_nz = 0;
+                        for (int n = 0; n < N; n++) {
+                            float a = h_ref  [base_dst + n];
+                            float bv = h_fused[base_dst + n];
+                            max_abs_a = std::max(max_abs_a, std::fabs(a - bv));
+                            sum_ref   += std::fabs(a);
+                            sum_fused += std::fabs(bv);
+                            if (a != 0.f) n_ref_nz++;
+                            if (bv != 0.f) n_fused_nz++;
+                        }
+                        fprintf(stderr, "max_abs=%.4g ref_|sum|=%.4g(%d nz) fused_|sum|=%.4g(%d nz)\n",
+                                max_abs_a, sum_ref, n_ref_nz, sum_fused, n_fused_nz);
+                    }
+                }
+                for (int i_active = 0; i_active < 0; i_active++) {  // disabled old loop
                     float max_abs_a = 0.f, sum_ref = 0.f, sum_fused = 0.f;
                     int n_ref_nz = 0, n_fused_nz = 0;
                     for (int n = 0; n < N; n++) {

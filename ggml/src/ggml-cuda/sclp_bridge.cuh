@@ -1068,47 +1068,62 @@ inline void llama_sclp4_fused_moe_gemv(
 //      tile share an expert ⇒ single A fragment per K iteration is valid.
 //   3. Activations are gathered through perm; outputs are scattered through perm.
 //
-// Status: SCAFFOLDING (May 2026). Launcher is hooked behind `SCLP_FUSED_MOE_WMMA=1`
-// env var; default path remains the two-pass decode → rocBLAS mul_mat_id.
+// Status: WIP (May 2026), default off. Behind these env vars in ggml-cuda.cu:
+//   SCLP_FUSED_MOE_WMMA=1       use fused kernel; baseline two-pass otherwise
+//   SCLP_FUSED_MOE_WMMA_DIFF=1  run BOTH; compare dst values; print stats
+//   SCLP_FUSED_MOE_SCALAR=1     use the scalar reference kernel (slower)
+//   SCLP_FUSED_MOE_NO_SIDECAR=1 skip the sidecar correction kernel
 //
-// PERF: With env var ON, Gemma4 MIXED pp512 = 2822 t/s (vs 1699 two-pass,
-// vs 2937 Q5_K_M). The fused path matches the Q5_K_M ceiling — proving the
-// approach is right.
+// Two kernels are implemented:
+//   1. sclp4_fused_moe_wmma_kernel — RDNA3 WMMA, fast, BUT outputs are ~30%
+//      of the correct magnitude (vs two-pass reference). Has a real bug —
+//      single-warp WMMA fragment layout most likely. Diff per row at chunk 1
+//      shows max_abs ~5-20 with ref|sum|~600-1200, ratio=0.31.
+//   2. sclp4_fused_moe_scalar_kernel — IDENTICAL routing/gather to (1) but
+//      replaces WMMA with per-lane scalar dot products. Outputs are ~92% of
+//      correct magnitude before sidecar correction, ~100% (bit-perfect to
+//      1e-5) after sidecar correction is applied.
 //
-// CORRECTNESS BUG: PPL is 18× worse with this path on (259K vs 13.9K baseline
-// on wikitext-test, 3 chunks, Gemma4-MIXED-imatrix-1%). Cause not yet isolated.
+// Sidecar correction (sclp4_moe_sidecar_correct_kernel) is the missing piece
+// vs the two-pass path. With imatrix-aware encoding, ~1.9% of weights are
+// stored in the sidecar with exact BF16 values. The two-pass decode kernel
+// restores them via fixup; the fused path has to apply delta corrections
+// post-hoc via atomicAdd. Closes the magnitude gap exactly.
 //
-// DEBUG HARNESS: ggml-cuda.cu's SCLP4 mul_mat_id branch supports two debug
-// env vars (default off):
-//   SCLP_FUSED_MOE_WMMA=1      — use fused kernel only (production-mode test)
-//   SCLP_FUSED_MOE_WMMA_DIFF=1 — run fused into scratch, two-pass into dst,
-//                                D2H copy + element-wise diff, print stats
+// PERF (Gemma4 MIXED-imatrix-1%, gfx1100 RX 7900 XTX, real clean build):
+//   Baseline two-pass:        615 t/s pp512   (correct, PPL=940 @ 50 chunks)
+//   WMMA + sidecar:           411 t/s pp512   (WMMA broken; PPL 180M)
+//   Scalar + sidecar:         396 t/s pp512   (math correct; PPL still 23M
+//                                              in mode=1 — see UNSOLVED below)
+// Sidecar correction is the dominant cost: per sidecar weight it iterates
+// over every routed slot in that expert's bin doing atomicAdd. ~75K sidecar
+// weights × ~2 avg slots-per-expert × n_layers × calls/layer compounds.
 //
-// DIFF-HARNESS FINDING (unexplained): in DIFF mode, the two-pass reference
-// dst reads as ALL ZEROS after the recursive `ggml_cuda_mul_mat_id` call,
-// even though the BF16 src1 is non-zero and `decoded` BF16 weight buffer is
-// non-zero (palette lookups produce small nonzero BF16). A sentinel write to
-// dst[0] before the recursive call gets overwritten to 0. With the harness
-// DISABLED (mode=0, normal eval), the same two-pass path produces correct
-// PPL=13.9K, so the BF16 mul_mat_id DOES work in production. Unclear how the
-// harness alters the recursive call's output — pool aliasing was ruled out
-// (raw hipMalloc didn't fix it). May be a stream-ordering interaction with
-// fused MoE graph fusion (mul_mat_id + glu collapse) that decouples dst from
-// the recursive call's output. Not isolated in this session.
+// UNSOLVED PPL MYSTERY (debug log preserved for future work):
+//   In SCLP_FUSED_MOE_WMMA_DIFF=1 mode (mode=2), the fused kernel writes to a
+//   separate buffer, the two-pass writes to dst, and the diff harness verifies
+//   they match. With scalar+sidecar, ALL calls show bit-perfect match (max_abs
+//   ~1e-5, ratio=1.00000) across all 360,448 dst cells. Mode=2 PPL = 1194 at
+//   chunk 10 (matches baseline).
+//   With SCLP_FUSED_MOE_WMMA=1 (mode=1, no two-pass), the fused kernel writes
+//   directly to dst. An in-dispatch diagnostic confirmed dst values match
+//   what the two-pass produces (within 1e-5). YET mode=1 PPL is 22-40M
+//   instead of ~1194. Tested but did NOT fix it:
+//     - hipStreamSynchronize / hipDeviceSynchronize after fused
+//     - Allocating a dummy `decoded`-sized pool buffer (rules out pool state)
+//     - Raw hipMalloc for perm/expert_offsets scratch (rules out pool aliasing)
+//     - Running fused then ALSO running two-pass (this DID fix PPL — but the
+//       two-pass overwrites dst with values bit-identical to what fused already
+//       wrote, so something other than dst content matters).
+//   Hypothesis: the recursive `ggml_cuda_mul_mat_id(ctx, dst)` BF16 call has
+//   a side effect beyond writing dst — possibly registering a tensor-state
+//   flag, updating a graph-eval cache, or invoking a fused-op path that we
+//   skip. Next debug step: instrument WHERE this side effect lives by
+//   bisecting the BF16 mul_mat_id implementation.
 //
-// Likely correctness-bug suspects for the fused kernel itself (orthogonal to
-// the diff-harness anomaly, to revisit when a clean diff is possible):
-//   1. src1->ne[1] semantics for prefill batch (broadcast vs replicate per
-//      slot). DIFF confirmed src1_ne1=1 for both tg and prefill on Gemma4 —
-//      should be identical broadcast semantics, but the working GEMV may rely
-//      on src1->ne[2] = n_batches in a way fused doesn't.
-//   2. Single-warp WMMA fragment layout: SCLP8 ref uses a 4-warp 2×2 tile;
-//      with one warp the fragment register packing may differ subtly.
-//   3. Expert linear scan with empty bins at tile boundaries.
-//
-// Future work: K tiling for occupancy, 2×2 warp tiling for throughput, SCLP6
-// MoE counterpart, on-device diff kernel (avoiding D2H to bypass the harness
-// issue), CPU-side reference computation for a single MoE call.
+// Future work: fix WMMA fragment bug (likely 1-warp vs 4-warp register packing),
+// optimize sidecar to a single launch with per-row reductions, isolate the
+// mode=1 PPL mystery, then bench and decide if fused beats baseline once correct.
 
 __global__ void sclp_moe_route_sort_kernel(
     const int32_t* __restrict__ ids,            // [n_active × n_batches]
@@ -1309,6 +1324,214 @@ __global__ void sclp4_fused_moe_wmma_kernel(
     (void)ids;
 }
 
+// Scalar reference variant of sclp4_fused_moe_wmma_kernel. Uses the IDENTICAL
+// routing/indexing/gather logic but replaces the WMMA inner product with a per-lane
+// scalar accumulator. If this produces correct PPL while the WMMA variant doesn't,
+// the bug is in WMMA fragment layout. If both are wrong, the bug is in routing/gather.
+__launch_bounds__(32, 4)
+__global__ void sclp4_fused_moe_scalar_kernel(
+    const uint8_t* __restrict__ blob,
+    const float*   __restrict__ src1,
+    const int32_t* __restrict__ perm,
+    const int32_t* __restrict__ expert_offsets,
+    const int32_t* __restrict__ ids,
+    float*         __restrict__ dst,
+    uint32_t N, uint32_t K,
+    uint32_t n_active, uint32_t src1_ne1, uint32_t n_experts
+) {
+    constexpr int TILE = 16;
+    const uint32_t m_tile = blockIdx.y;
+    const uint32_t m_base = m_tile * TILE;
+
+    int32_t e = -1;
+    for (uint32_t ei = 0; ei < n_experts; ei++) {
+        if ((uint32_t)expert_offsets[ei] <= m_base && m_base < (uint32_t)expert_offsets[ei + 1]) {
+            e = (int32_t)ei;
+            break;
+        }
+    }
+    if (e < 0) return;
+
+    __shared__ uint8_t  s_palette[4];
+    __shared__ uint8_t  s_palette_size;
+    __shared__ uint32_t s_ws_offset;
+    __shared__ int32_t  s_m_global[TILE];
+
+    if (threadIdx.x == 0) {
+        uint32_t total_nw, ne;
+        __builtin_memcpy(&total_nw, blob,     sizeof(uint32_t));
+        __builtin_memcpy(&ne,       blob + 4, sizeof(uint32_t));
+        const uint8_t* p = blob + 8;
+        uint8_t pal[4] = {0,0,0,0};
+        uint8_t psz = 0;
+        for (uint32_t ei = 0; ei < ne; ei++) {
+            if (ei == (uint32_t)e) {
+                psz = p[0];
+                for (int i = 0; i < (int)p[0]; i++) pal[i] = p[1 + i];
+            }
+            p += 1 + p[0];
+        }
+        s_palette_size = psz;
+        for (int i = 0; i < 4; i++) s_palette[i] = pal[i];
+        uint32_t expert_nibble_bytes = ((total_nw / ne) + 1) / 2;
+        s_ws_offset = (uint32_t)(p - blob) + (uint32_t)e * expert_nibble_bytes;
+    }
+    if (threadIdx.x < TILE) {
+        uint32_t m_g = m_base + threadIdx.x;
+        s_m_global[threadIdx.x] = perm[m_g];
+    }
+    __syncthreads();
+
+    const uint8_t* ws = blob + s_ws_offset;
+    const int lane = threadIdx.x;
+
+    // Each lane computes 8 output cells using the SAME lane→(n_row, m_local) mapping
+    // as the WMMA variant: n_row = n_base + lane%16, m_local ∈ {2l+col_lo : l=0..7}.
+    const int frag_row = lane % TILE;
+    const int col_lo   = lane / TILE;
+    const uint32_t n_base = (uint32_t)blockIdx.x * TILE;
+    const uint32_t n_row  = n_base + (uint32_t)frag_row;
+    if (n_row >= N) return;
+
+    // Decode this lane's row of weights into a __bf16 buffer (one row of K weights).
+    // Then dot it with each of the 8 assigned activations.
+    // For correctness we just compute scalar dot products on the fly.
+    float acc[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    int32_t mgs[8];
+    bool    valid[8];
+    for (int l = 0; l < 8; l++) {
+        uint32_t m_local = (uint32_t)(2 * l + col_lo);
+        mgs[l]   = s_m_global[m_local];
+        valid[l] = (mgs[l] >= 0);
+    }
+
+    for (uint32_t k = 0; k < K; k++) {
+        uint64_t w_idx = (uint64_t)n_row * K + k;
+        uint8_t byte  = ws[w_idx >> 1];
+        uint8_t nib   = (w_idx & 1) ? (byte & 0xF) : (byte >> 4);
+        uint8_t pidx  = nib >> 2;
+        uint8_t smn   = nib & 0x3;
+        uint8_t exp_  = (pidx < s_palette_size) ? s_palette[pidx] : 0;
+        uint8_t sign  = (smn >> 1) & 1;
+        uint8_t mant  = smn & 1;
+        uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 6);
+        float w = __bfloat162float(*(__hip_bfloat16*)&bits);
+
+        for (int l = 0; l < 8; l++) {
+            if (!valid[l]) continue;
+            uint32_t i_active = (uint32_t)mgs[l] % n_active;
+            uint32_t i_batch  = (uint32_t)mgs[l] / n_active;
+            const float* x_row = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
+            acc[l] += w * x_row[k];
+        }
+    }
+
+    for (int l = 0; l < 8; l++) {
+        if (valid[l]) dst[(uint64_t)mgs[l] * N + n_row] = acc[l];
+    }
+}
+
+// Sidecar correction for SCLP4 MoE fused output.
+// For each sidecar weight (n_e, k) in expert e, computes delta = correct - approx
+// and atomically adds delta * X[mg, k] to Y[mg, n_e] for every routed slot mg
+// whose ids[mg] == e. Without this, the fused kernel undershoots magnitude by
+// ~5-15% (the sidecar weights are systematically larger than the palette
+// approximation, since they were placed in sidecar precisely because of large
+// exponent-distance to the palette).
+__global__ void sclp4_moe_sidecar_correct_kernel(
+    const uint8_t* __restrict__ blob,
+    const float*   __restrict__ src1,
+    const int32_t* __restrict__ perm,
+    const int32_t* __restrict__ expert_offsets,
+    float*         __restrict__ dst,
+    uint32_t N, uint32_t K, uint32_t n_active, uint32_t src1_ne1, uint32_t n_experts
+) {
+    __shared__ uint32_t s_total_nw;
+    __shared__ uint32_t s_n_experts;
+    __shared__ uint32_t s_ws_start;
+    __shared__ uint32_t s_sidecar_count;
+    // Per-expert palette (cached for first 4 experts in shared mem if needed).
+    if (threadIdx.x == 0) {
+        uint32_t total_nw, ne;
+        __builtin_memcpy(&total_nw, blob,     sizeof(uint32_t));
+        __builtin_memcpy(&ne,       blob + 4, sizeof(uint32_t));
+        s_total_nw = total_nw;
+        s_n_experts = ne;
+        const uint8_t* p = blob + 8;
+        for (uint32_t e = 0; e < ne; e++) p += 1 + p[0];
+        uint32_t ws_start = (uint32_t)(p - blob);
+        s_ws_start = ws_start;
+        uint32_t expert_nw = total_nw / ne;
+        uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
+        uint64_t total_ws_bytes = (uint64_t)ne * expert_nibble_bytes;
+        uint32_t sc;
+        __builtin_memcpy(&sc, blob + ws_start + total_ws_bytes, sizeof(uint32_t));
+        s_sidecar_count = sc;
+    }
+    __syncthreads();
+
+    if (s_sidecar_count == 0) return;
+
+    const uint32_t expert_nw = s_total_nw / s_n_experts;
+    const uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
+    const uint64_t total_ws_bytes = (uint64_t)s_n_experts * expert_nibble_bytes;
+    const uint8_t* sidecar_base = blob + s_ws_start + total_ws_bytes;
+    const uint8_t* idx_base = sidecar_base + 4;
+    const uint8_t* val_base = idx_base + (uint64_t)s_sidecar_count * sizeof(uint32_t);
+
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < s_sidecar_count; i += stride) {
+        uint32_t global_idx;
+        uint16_t correct_bits;
+        __builtin_memcpy(&global_idx, idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint32_t));
+        __builtin_memcpy(&correct_bits, val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint16_t));
+
+        uint32_t e        = global_idx / expert_nw;
+        uint32_t local    = global_idx - e * expert_nw;
+        uint32_t n_e      = local / K;
+        uint32_t k        = local % K;
+
+        // Re-parse this expert's palette and the approximate nibble value at (n_e, k).
+        const uint8_t* p = blob + 8;
+        for (uint32_t ei = 0; ei < e; ei++) p += 1 + p[0];
+        uint8_t pal_size = p[0];
+        // SCLP4 palette is <=4 bytes; read inline.
+        uint8_t pal[4] = {0,0,0,0};
+        for (int j = 0; j < (int)pal_size && j < 4; j++) pal[j] = p[1 + j];
+
+        const uint8_t* ws_e = blob + s_ws_start + (uint64_t)e * expert_nibble_bytes;
+        uint64_t w_idx = (uint64_t)n_e * K + k;
+        uint8_t byte = ws_e[w_idx >> 1];
+        uint8_t nib  = (w_idx & 1) ? (byte & 0xF) : (byte >> 4);
+        uint8_t pidx = nib >> 2;
+        uint8_t smn  = nib & 0x3;
+        uint8_t exp_a = (pidx < pal_size) ? pal[pidx] : 0;
+        uint8_t sign_a = (smn >> 1) & 1;
+        uint8_t mant_a = smn & 1;
+        uint16_t approx_bits = ((uint16_t)sign_a << 15) | ((uint16_t)exp_a << 7) | ((uint16_t)mant_a << 6);
+
+        float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
+        float w_approx  = __bfloat162float(*(__hip_bfloat16*)&approx_bits);
+        float w_delta   = w_correct - w_approx;
+        if (w_delta == 0.f) continue;
+
+        // For every routed slot mg whose ids[mg] == e (i.e., whose perm position is
+        // in [offsets[e], offsets[e+1])), apply correction.
+        int32_t bin_start = expert_offsets[e];
+        int32_t bin_end   = expert_offsets[e + 1];
+        for (int32_t p_pos = bin_start; p_pos < bin_end; p_pos++) {
+            int32_t mg = perm[p_pos];
+            if (mg < 0) continue;
+            uint32_t i_active = (uint32_t)mg % n_active;
+            uint32_t i_batch  = (uint32_t)mg / n_active;
+            const float* x_row = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
+            float xval = x_row[k];
+            atomicAdd(&dst[(uint64_t)mg * N + n_e], w_delta * xval);
+        }
+    }
+}
+
 // Launcher for fused SCLP4 MoE WMMA prefill. Requires routing-sort scratch
 // allocated by caller (perm + expert_offsets in the CUDA pool).
 inline void llama_sclp4_fused_moe_wmma(
@@ -1340,10 +1563,30 @@ inline void llama_sclp4_fused_moe_wmma(
     const uint32_t m_tile_count = (total_slots + n_experts * TILE + TILE - 1) / TILE;
     dim3 block(32);
     dim3 grid((N + TILE - 1) / TILE, m_tile_count);
-    sclp4_fused_moe_wmma_kernel<<<grid, block, 0, stream>>>(
-        (const uint8_t*)blob_ptr,
-        src1, perm_scratch, expert_offsets_scratch, ids, dst,
-        N, K, n_active, src1_ne1, n_experts);
+
+    // SCLP_FUSED_MOE_SCALAR=1 uses scalar dot product kernel (slow, for correctness debug).
+    static const bool use_scalar = getenv("SCLP_FUSED_MOE_SCALAR") != nullptr;
+    if (use_scalar) {
+        sclp4_fused_moe_scalar_kernel<<<grid, block, 0, stream>>>(
+            (const uint8_t*)blob_ptr,
+            src1, perm_scratch, expert_offsets_scratch, ids, dst,
+            N, K, n_active, src1_ne1, n_experts);
+    } else {
+        sclp4_fused_moe_wmma_kernel<<<grid, block, 0, stream>>>(
+            (const uint8_t*)blob_ptr,
+            src1, perm_scratch, expert_offsets_scratch, ids, dst,
+            N, K, n_active, src1_ne1, n_experts);
+    }
+
+    // Apply sidecar corrections: ~1-2% of weights need exact-value restoration to
+    // match the two-pass path's PPL.
+    static const bool skip_sidecar = getenv("SCLP_FUSED_MOE_NO_SIDECAR") != nullptr;
+    if (!skip_sidecar) {
+        sclp4_moe_sidecar_correct_kernel<<<32, 256, 0, stream>>>(
+            (const uint8_t*)blob_ptr,
+            src1, perm_scratch, expert_offsets_scratch, dst,
+            N, K, n_active, src1_ne1, n_experts);
+    }
 }
 
 // ============================================================
