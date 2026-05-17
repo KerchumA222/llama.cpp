@@ -1086,19 +1086,38 @@ inline void llama_sclp4_fused_moe_gemv(
 //
 // CORRECTNESS BUG: PPL is 18× worse with this path on (259K vs 13.9K baseline
 // on wikitext-test, 3 chunks, Gemma4-MIXED-imatrix-1%). Cause not yet isolated.
-// Triaged: routing-sort is correct (padded bin layout verified by reasoning),
-// scatter/gather indexing matches the working GEMV kernel, WMMA fragment layout
-// matches the working SCLP8 fused_wmma_kernel, BF16 conversion goes through
-// __hip_bfloat16 like the reference. Likely suspects (to investigate next):
-//   1. src1->ne[1] semantics may differ from GEMV for prefill batch (broadcast
-//      vs replicate per slot — need to verify by reading ggml MoE graph build).
+//
+// DEBUG HARNESS: ggml-cuda.cu's SCLP4 mul_mat_id branch supports two debug
+// env vars (default off):
+//   SCLP_FUSED_MOE_WMMA=1      — use fused kernel only (production-mode test)
+//   SCLP_FUSED_MOE_WMMA_DIFF=1 — run fused into scratch, two-pass into dst,
+//                                D2H copy + element-wise diff, print stats
+//
+// DIFF-HARNESS FINDING (unexplained): in DIFF mode, the two-pass reference
+// dst reads as ALL ZEROS after the recursive `ggml_cuda_mul_mat_id` call,
+// even though the BF16 src1 is non-zero and `decoded` BF16 weight buffer is
+// non-zero (palette lookups produce small nonzero BF16). A sentinel write to
+// dst[0] before the recursive call gets overwritten to 0. With the harness
+// DISABLED (mode=0, normal eval), the same two-pass path produces correct
+// PPL=13.9K, so the BF16 mul_mat_id DOES work in production. Unclear how the
+// harness alters the recursive call's output — pool aliasing was ruled out
+// (raw hipMalloc didn't fix it). May be a stream-ordering interaction with
+// fused MoE graph fusion (mul_mat_id + glu collapse) that decouples dst from
+// the recursive call's output. Not isolated in this session.
+//
+// Likely correctness-bug suspects for the fused kernel itself (orthogonal to
+// the diff-harness anomaly, to revisit when a clean diff is possible):
+//   1. src1->ne[1] semantics for prefill batch (broadcast vs replicate per
+//      slot). DIFF confirmed src1_ne1=1 for both tg and prefill on Gemma4 —
+//      should be identical broadcast semantics, but the working GEMV may rely
+//      on src1->ne[2] = n_batches in a way fused doesn't.
 //   2. Single-warp WMMA fragment layout: SCLP8 ref uses a 4-warp 2×2 tile;
-//      with one warp, fragment register packing may differ subtly.
-//   3. Expert linear scan returns wrong expert when bin offsets land at tile
-//      boundaries with mixed empty/non-empty interleaving.
+//      with one warp the fragment register packing may differ subtly.
+//   3. Expert linear scan with empty bins at tile boundaries.
+//
 // Future work: K tiling for occupancy, 2×2 warp tiling for throughput, SCLP6
-// MoE counterpart, smoke-test harness that diffs against the two-pass path on
-// a single MoE tensor with synthetic activations.
+// MoE counterpart, on-device diff kernel (avoiding D2H to bypass the harness
+// issue), CPU-side reference computation for a single MoE call.
 
 __global__ void sclp_moe_route_sort_kernel(
     const int32_t* __restrict__ ids,            // [n_active × n_batches]
