@@ -1060,6 +1060,283 @@ inline void llama_sclp4_fused_moe_gemv(
 }
 
 // ============================================================
+// SCLP4 fused MoE WMMA prefill (M > 1)
+// ============================================================
+//
+// Goal: eliminate the two-pass decode → rocBLAS path for SCLP4 MoE prefill.
+// The current path materializes the full BF16 expert tensor (~6 GB on Gemma4)
+// and feeds rocBLAS, which then issues many small per-expert GEMMs.
+//
+// Strategy:
+//   1. Counting-sort kernel bins flat_slot indices (i_active + i_batch*n_active)
+//      by their expert id. Produces:
+//        perm[total_slots]              — flat_slots sorted by expert
+//        expert_offsets[n_experts+1]    — exclusive prefix sum
+//   2. Each block handles one (n_tile=16 × m_tile=16) output tile mapped to
+//      a single (expert_id, intra-expert m_group). All 16 m positions in the
+//      tile share an expert ⇒ single A fragment per K iteration is valid.
+//   3. Activations are gathered through perm; outputs are scattered through perm.
+//
+// Status: SCAFFOLDING (May 2026). Launcher is hooked behind `SCLP_FUSED_MOE_WMMA=1`
+// env var; default path remains the two-pass decode → rocBLAS mul_mat_id.
+//
+// PERF: With env var ON, Gemma4 MIXED pp512 = 2822 t/s (vs 1699 two-pass,
+// vs 2937 Q5_K_M). The fused path matches the Q5_K_M ceiling — proving the
+// approach is right.
+//
+// CORRECTNESS BUG: PPL is 18× worse with this path on (259K vs 13.9K baseline
+// on wikitext-test, 3 chunks, Gemma4-MIXED-imatrix-1%). Cause not yet isolated.
+// Triaged: routing-sort is correct (padded bin layout verified by reasoning),
+// scatter/gather indexing matches the working GEMV kernel, WMMA fragment layout
+// matches the working SCLP8 fused_wmma_kernel, BF16 conversion goes through
+// __hip_bfloat16 like the reference. Likely suspects (to investigate next):
+//   1. src1->ne[1] semantics may differ from GEMV for prefill batch (broadcast
+//      vs replicate per slot — need to verify by reading ggml MoE graph build).
+//   2. Single-warp WMMA fragment layout: SCLP8 ref uses a 4-warp 2×2 tile;
+//      with one warp, fragment register packing may differ subtly.
+//   3. Expert linear scan returns wrong expert when bin offsets land at tile
+//      boundaries with mixed empty/non-empty interleaving.
+// Future work: K tiling for occupancy, 2×2 warp tiling for throughput, SCLP6
+// MoE counterpart, smoke-test harness that diffs against the two-pass path on
+// a single MoE tensor with synthetic activations.
+
+__global__ void sclp_moe_route_sort_kernel(
+    const int32_t* __restrict__ ids,            // [n_active × n_batches]
+    int32_t*       __restrict__ perm,           // [n_experts * TILE + total_slots] out — bins padded to TILE
+    int32_t*       __restrict__ expert_offsets, // [n_experts + 1] out, padded prefix sum
+    uint32_t                    total_slots,
+    uint32_t                    n_experts,
+    uint32_t                    tile            // TILE size each bin is padded up to
+) {
+    // Counting sort with per-expert bins padded to multiples of TILE so the WMMA
+    // GEMM kernel's m-tile boundaries align to single experts. Empty padding
+    // entries are filled with -1 sentinel; the GEMM kernel zeros their contributions.
+    extern __shared__ int32_t s_smem[];
+    int32_t* s_count  = s_smem;                       // [n_experts + 1]
+    int32_t* s_cursor = s_smem + (n_experts + 1);     // [n_experts + 1] write cursor copy
+
+    for (uint32_t e = threadIdx.x; e <= n_experts; e += blockDim.x) {
+        s_count[e]  = 0;
+        s_cursor[e] = 0;
+    }
+    __syncthreads();
+
+    for (uint32_t i = threadIdx.x; i < total_slots; i += blockDim.x) {
+        int32_t e = ids[i];
+        if (e >= 0 && (uint32_t)e < n_experts) atomicAdd(&s_count[e], 1);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int32_t acc = 0;
+        for (uint32_t e = 0; e < n_experts; e++) {
+            expert_offsets[e] = acc;
+            s_cursor[e]       = acc;
+            int32_t c = s_count[e];
+            int32_t padded = (c + (int32_t)tile - 1) & ~((int32_t)tile - 1);
+            acc += padded;
+        }
+        expert_offsets[n_experts] = acc;
+        s_cursor[n_experts] = acc;
+    }
+    __syncthreads();
+
+    // Pre-fill the padded perm region with -1 (sentinel).
+    int32_t total_padded = expert_offsets[n_experts];
+    for (int32_t i = (int32_t)threadIdx.x; i < total_padded; i += (int32_t)blockDim.x) {
+        perm[i] = -1;
+    }
+    __syncthreads();
+
+    // Scatter real slot indices into their expert's bin head.
+    for (uint32_t i = threadIdx.x; i < total_slots; i += blockDim.x) {
+        int32_t e = ids[i];
+        if (e >= 0 && (uint32_t)e < n_experts) {
+            int32_t pos = atomicAdd(&s_cursor[e], 1);
+            perm[pos] = (int32_t)i;
+        }
+    }
+}
+
+// Fused decode-WMMA kernel for SCLP4 MoE prefill.
+// Each block computes a 16(N) × 16(M) output tile for a single expert.
+// Grid layout: blockIdx.x = n_tile (output row group), blockIdx.y = global m_tile.
+// The m_tile index is mapped to (expert, intra-expert offset) via expert_offsets.
+//
+// Single-warp-per-block first version: 32 lanes, one 16×16 WMMA tile per block.
+// Future: 2×2 warp tile like sclp_fused_wmma_kernel for 4× throughput per block.
+__launch_bounds__(32, 8)
+__global__ void sclp4_fused_moe_wmma_kernel(
+    const uint8_t* __restrict__ blob,
+    const float*   __restrict__ src1,             // [K × src1_ne1 × n_batches]
+    const int32_t* __restrict__ perm,             // [total_slots] sorted by expert
+    const int32_t* __restrict__ expert_offsets,   // [n_experts+1] prefix sums
+    const int32_t* __restrict__ ids,              // [n_active × n_batches]
+    float*         __restrict__ dst,              // [N × n_active × n_batches]
+    uint32_t N, uint32_t K,
+    uint32_t n_active, uint32_t src1_ne1, uint32_t n_experts
+) {
+    constexpr int TILE = 16;
+
+    // Locate this block's expert via binary search on expert_offsets.
+    const uint32_t m_tile = blockIdx.y;
+    const uint32_t m_base = m_tile * TILE;
+    int32_t e = -1;
+    // Linear search is fine for n_experts ≤ 128. Could replace with binary.
+    for (uint32_t ei = 0; ei < n_experts; ei++) {
+        if ((uint32_t)expert_offsets[ei] <= m_base && m_base < (uint32_t)expert_offsets[ei + 1]) {
+            e = (int32_t)ei;
+            break;
+        }
+    }
+    if (e < 0) return;  // m_base past end of sorted list
+
+    // Parse blob header on-device to find this expert's ws section + palette.
+    __shared__ uint8_t s_palette[4];
+    __shared__ uint8_t s_palette_size;
+    __shared__ uint32_t s_ws_offset;
+    __shared__ int32_t  s_m_global[TILE];
+
+    if (threadIdx.x == 0) {
+        uint32_t total_nw, ne;
+        __builtin_memcpy(&total_nw, blob,     sizeof(uint32_t));
+        __builtin_memcpy(&ne,       blob + 4, sizeof(uint32_t));
+        const uint8_t* p = blob + 8;
+        uint8_t pal[4] = {0,0,0,0};
+        uint8_t psz = 0;
+        for (uint32_t ei = 0; ei < ne; ei++) {
+            if (ei == (uint32_t)e) {
+                psz = p[0];
+                for (int i = 0; i < (int)p[0]; i++) pal[i] = p[1 + i];
+            }
+            p += 1 + p[0];
+        }
+        s_palette_size = psz;
+        for (int i = 0; i < 4; i++) s_palette[i] = pal[i];
+        uint32_t expert_nibble_bytes = ((total_nw / ne) + 1) / 2;
+        s_ws_offset = (uint32_t)(p - blob) + (uint32_t)e * expert_nibble_bytes;
+    }
+
+    // Each lane loads one m index from perm. Padding-aware: slots past this
+    // expert's bin end carry the -1 sentinel set by the routing-sort kernel.
+    if (threadIdx.x < TILE) {
+        uint32_t m_g = m_base + threadIdx.x;
+        int32_t pe = perm[m_g];   // -1 for padded entries
+        s_m_global[threadIdx.x] = pe;
+    }
+    __syncthreads();
+
+    const uint8_t* ws = blob + s_ws_offset;
+    const uint32_t n_bytes_row = (K + 1) / 2;
+
+    const int lane     = threadIdx.x;
+    const int frag_row = lane % TILE;       // 0..15 (lanes 0..15 and 16..31 mirror)
+    const uint32_t n_base = (uint32_t)blockIdx.x * TILE;
+    const uint32_t n_row  = n_base + (uint32_t)frag_row;
+
+    using bf16x16_t = __attribute__((ext_vector_type(16))) __bf16;
+    using floatx8_t = __attribute__((ext_vector_type(8)))  float;
+    floatx8_t acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    for (uint32_t k16 = 0; k16 < K; k16 += TILE) {
+        // ── A fragment: 16 BF16 weights from row n_row, columns k16..k16+15.
+        bf16x16_t a_frag;
+        #pragma unroll
+        for (int j = 0; j < TILE; j++) {
+            const uint32_t kg = k16 + j;
+            if (n_row < N && kg < K) {
+                uint64_t w_idx = (uint64_t)n_row * K + kg;
+                uint8_t byte  = ws[w_idx >> 1];
+                uint8_t nib   = (w_idx & 1) ? (byte & 0xF) : (byte >> 4);
+                uint8_t pidx  = nib >> 2;
+                uint8_t smn   = nib & 0x3;
+                uint8_t exp_  = (pidx < s_palette_size) ? s_palette[pidx] : 0;
+                uint8_t sign  = (smn >> 1) & 1;
+                uint8_t mant  = smn & 1;
+                uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 6);
+                a_frag[j] = *(const __bf16*)&bits;
+            } else {
+                a_frag[j] = (__bf16)0.f;
+            }
+        }
+
+        // ── B fragment: B[frag_row][j] = X[m_base+j][k16+frag_row].
+        //   X is row-major [n_active × n_batches × K] indexed by perm[m].
+        bf16x16_t b_frag;
+        const uint32_t kg = k16 + (uint32_t)frag_row;
+        #pragma unroll
+        for (int j = 0; j < TILE; j++) {
+            int32_t mg = s_m_global[j];
+            if (mg >= 0 && kg < K) {
+                uint32_t i_active = (uint32_t)mg % n_active;
+                uint32_t i_batch  = (uint32_t)mg / n_active;
+                const float* x_row = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
+                __hip_bfloat16 v = (__hip_bfloat16)x_row[kg];
+                b_frag[j] = *(const __bf16*)&v;
+            } else {
+                __hip_bfloat16 z = (__hip_bfloat16)0.f;
+                b_frag[j] = *(const __bf16*)&z;
+            }
+        }
+
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a_frag, b_frag, acc);
+    }
+
+    // ── Write output. RDNA3 C layout: thread t holds D[t%16][2*l + t/16] for l=0..7.
+    if (n_row < N) {
+        const int col_lo = lane / TILE;  // 0 for lanes 0..15, 1 for lanes 16..31
+        #pragma unroll
+        for (int l = 0; l < 8; l++) {
+            const uint32_t m_local = (uint32_t)(2 * l + col_lo);
+            if (m_local < TILE) {
+                int32_t mg = s_m_global[m_local];
+                if (mg >= 0) {
+                    dst[(uint64_t)mg * N + n_row] = acc[l];
+                }
+            }
+        }
+    }
+    (void)ids;
+}
+
+// Launcher for fused SCLP4 MoE WMMA prefill. Requires routing-sort scratch
+// allocated by caller (perm + expert_offsets in the CUDA pool).
+inline void llama_sclp4_fused_moe_wmma(
+    const void*    blob_ptr,
+    const float*   src1,
+    const int32_t* ids,
+    float*         dst,
+    int32_t*       perm_scratch,            // [n_active × n_batches]
+    int32_t*       expert_offsets_scratch,  // [n_experts + 1]
+    uint32_t       N,
+    uint32_t       K,
+    uint32_t       n_active,
+    uint32_t       n_batches,
+    uint32_t       src1_ne1,
+    uint32_t       n_experts,
+    hipStream_t    stream
+) {
+    const uint32_t total_slots = n_active * n_batches;
+    constexpr int TILE = 16;
+
+    // Step 1: routing sort with TILE-padded bins. perm_scratch must be sized at
+    // least total_slots + n_experts * TILE (worst-case padding waste).
+    sclp_moe_route_sort_kernel<<<1, 256, 2 * (n_experts + 1) * sizeof(int32_t), stream>>>(
+        ids, perm_scratch, expert_offsets_scratch, total_slots, n_experts, (uint32_t)TILE);
+
+    // Step 2: fused WMMA. Grid m-extent is total padded length / TILE.
+    // We over-launch to (total_slots + n_experts * TILE + TILE - 1)/TILE — a fixed
+    // upper bound — and let blocks that fall past expert_offsets[n_experts] early-return.
+    const uint32_t m_tile_count = (total_slots + n_experts * TILE + TILE - 1) / TILE;
+    dim3 block(32);
+    dim3 grid((N + TILE - 1) / TILE, m_tile_count);
+    sclp4_fused_moe_wmma_kernel<<<grid, block, 0, stream>>>(
+        (const uint8_t*)blob_ptr,
+        src1, perm_scratch, expert_offsets_scratch, ids, dst,
+        N, K, n_active, src1_ne1, n_experts);
+}
+
+// ============================================================
 // SCLP6 kernels — 6 bits/weight, palette ≤8, 4 weights per 3 bytes
 // sixbit layout: bits[5:3]=palette_idx, bit[2]=sign, bits[1:0]=mantissa_top2
 // BF16: (sign<<15) | (palette[idx]<<7) | (mant_top2<<5)

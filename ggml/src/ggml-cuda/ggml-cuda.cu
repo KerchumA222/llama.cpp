@@ -2800,6 +2800,35 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // Prefill (n_batches > 1): decode all experts to BF16, then native mul_mat_id
         // hits rocBLAS for the batched GEMM.
         cudaStream_t stream = ctx.stream();
+
+        // Experimental: fused decode+WMMA MoE GEMM path. Off by default while in
+        // scaffolding. Set SCLP_FUSED_MOE_WMMA=1 to enable.
+        static const bool sclp_fused_moe_wmma_enabled = [] {
+            const char * v = getenv("SCLP_FUSED_MOE_WMMA");
+            return v && v[0] == '1';
+        }();
+        if (sclp_fused_moe_wmma_enabled) {
+            const int64_t K        = src0->ne[0];
+            const int64_t N        = src0->ne[1];
+            const int64_t n_active = ids->ne[0];
+            const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
+            const int64_t total_slots = n_active * n_batches;
+            // Padded perm: each expert's bin rounded up to TILE=16; worst case
+            // adds n_experts * 15 entries.
+            ggml_cuda_pool_alloc<int32_t> perm_scratch(ctx.pool(), (size_t)(total_slots + n_experts * 16));
+            ggml_cuda_pool_alloc<int32_t> expert_offsets_scratch(ctx.pool(), (size_t)(n_experts + 1));
+            llama_sclp4_fused_moe_wmma(
+                src0->data,
+                (const float*)src1->data,
+                (const int32_t*)ids->data,
+                (float*)dst->data,
+                perm_scratch.get(), expert_offsets_scratch.get(),
+                (uint32_t)N, (uint32_t)K, (uint32_t)n_active,
+                (uint32_t)n_batches, (uint32_t)src1->ne[1], (uint32_t)n_experts,
+                stream);
+            return;
+        }
+
         const int64_t num_weights = ggml_nelements(src0);
         ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
         llama_sclp4_dispatch(src0->data, decoded.get(), (uint32_t)num_weights, stream);
