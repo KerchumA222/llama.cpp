@@ -804,21 +804,23 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     size_t size = ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
-    if (tensor->type == GGML_TYPE_SCLP) {
-        // SCLP type_size=1 means ggml_nbytes = N bytes, but the blob includes a small header
-        // and sidecar section (~0.3% of weights x 6 bytes). Reserve 5% + 64 KB overhead.
-        return size + size / 20 + 65536;
-    }
-    if (tensor->type == GGML_TYPE_SCLP4) {
-        // SCLP4 type_size=1,blck_size=2 => ggml_nbytes = N/2 bytes. Blob includes header +
-        // sidecar. With k-means+sidecar_dist=1, sidecar is ~1.4% of weights x 6 bytes = ~16.8%
-        // of N/2 ws bytes. Reserve 25% + 64 KB to cover this comfortably.
+    if (tensor->type == GGML_TYPE_SCLP  ||
+        tensor->type == GGML_TYPE_SCLP4 ||
+        tensor->type == GGML_TYPE_SCLP6) {
+        // Prefer an exact per-tensor hint stashed by the model loader (op_params[13..15]
+        // — see llama_model_loader::create_tensor). Falls back to a conservative heuristic
+        // when the hint is absent (compute-graph temporaries, unit tests, etc.).
+        const int32_t * p = tensor->op_params;
+        if (p[13] == (int32_t) 0x504C4353) {
+            uint64_t ds = (uint32_t) p[14] | ((uint64_t)(uint32_t) p[15] << 32);
+            // Round up to 256B (covers CUDA/ROCm buffer alignment); +64 KB for safety.
+            return ((size_t) ds + 255u) & ~((size_t) 255u);
+        }
+        // Heuristic fallback. SCLP4 worst case observed = 2.34× nbytes on Llama-3-8B
+        // attn_q; SCLP6 max ~1.05×; SCLP max ~1.05×. Use 3× for SCLP4 and 1.25× for the
+        // others to keep headroom across all models we've tested.
+        if (tensor->type == GGML_TYPE_SCLP4) return 3 * size + 65536;
         return size + size / 4 + 65536;
-    }
-    if (tensor->type == GGML_TYPE_SCLP6) {
-        // SCLP6 type_size=3,blck_size=4 => ggml_nbytes = N*3/4 bytes. Blob includes header.
-        // Reserve 5% + 64 KB overhead.
-        return size + size / 20 + 65536;
     }
 
     if (ggml_is_quantized(tensor->type)) {
