@@ -3,10 +3,6 @@
 #include <hip/hip_bf16.h>
 #include <cstdint>
 
-#ifndef SCLP_MEMSET_STUB
-#define SCLP_MEMSET_STUB 0
-#endif
-
 // SCLP decode bridge for llama.cpp HIP backend.
 //
 // Wire format (SCLP blob stored in VRAM):
@@ -911,17 +907,12 @@ inline void llama_sclp4_dispatch(
     const uint8_t* data = (const uint8_t*)sclp_data;
     dim3 block(256);
 
-#if SCLP_MEMSET_STUB
-    (void)data; (void)block;
-    hipMemsetAsync(output, 0, (size_t)num_weights * sizeof(uint16_t), stream);
-#else
     // Each thread handles 16 weights (8 nibble bytes)
     uint32_t groups = (num_weights + 15) / 16;
     dim3 decode_grid((groups + 255) / 256);
     sclp4_decode_blob_kernel<<<decode_grid, block, 0, stream>>>(data, output, num_weights);
 
     sclp4_fixup_sidecar_kernel<<<4, block, 0, stream>>>(data, output, num_weights);
-#endif
 }
 
 inline void llama_sclp4_fused_gemv(
@@ -1577,15 +1568,10 @@ inline void llama_sclp6_dispatch(
     uint32_t expert_groups = (expert_nw + 3) / 4;
     uint32_t total_groups  = expert_groups * n_experts;
 
-#if SCLP_MEMSET_STUB
-    (void)data; (void)block; (void)expert_nw; (void)expert_groups; (void)total_groups;
-    hipMemsetAsync(output, 0, (size_t)num_weights * sizeof(uint16_t), stream);
-#else
     dim3 decode_grid((total_groups + 255) / 256);
     sclp6_decode_blob_kernel<<<decode_grid, block, 0, stream>>>(data, output, num_weights);
 
     sclp6_fixup_sidecar_kernel<<<4, block, 0, stream>>>(data, output, num_weights);
-#endif
 }
 
 inline void llama_sclp6_fused_gemv(
@@ -1750,10 +1736,6 @@ inline void llama_sclp_dispatch(
     const uint8_t* data = (const uint8_t*)sclp_data;
     dim3 block(256);
 
-#if SCLP_MEMSET_STUB
-    (void)data; (void)block;
-    hipMemsetAsync(output, 0, (size_t)num_weights * sizeof(uint16_t), stream);
-#else
     // Main decode: one thread per 8 weights (single uint64_t load from ws_stream)
     uint32_t groups = (num_weights + 7) / 8;
     dim3 decode_grid((groups + 255) / 256);
@@ -1762,5 +1744,4 @@ inline void llama_sclp_dispatch(
     // Sidecar fixup: fixed 4-block grid with stride loop handles any sidecar count.
     // Threads where i >= sidecar_count return after a single shared-memory read.
     sclp_fixup_sidecar_kernel<<<4, block, 0, stream>>>(data, output, num_weights);
-#endif
 }
