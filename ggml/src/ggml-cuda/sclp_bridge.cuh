@@ -1491,6 +1491,8 @@ __global__ void sclp4_fused_moe_scalar_kernel(
         valid[l] = (mgs[l] >= 0);
     }
 
+    // Simplest possible loop: no caches, recompute row pointer each access. This
+    // rules out any caching/aliasing in x_rows[] as a cause of the prefill-shape bug.
     for (uint32_t k = 0; k < K; k++) {
         uint64_t w_idx = (uint64_t)n_row * K + k;
         uint8_t byte  = ws[w_idx >> 1];
@@ -1508,10 +1510,10 @@ __global__ void sclp4_fused_moe_scalar_kernel(
             uint32_t i_active = (uint32_t)mgs[l] % n_active;
             uint32_t i_batch  = (uint32_t)mgs[l] / n_active;
             const float* x_row = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
-            // BF16-truncated X matches two-pass numerics in magnitude but accumulation
-            // order still differs from rocBLAS, leaving ~0.5% per-cell drift.
-            __hip_bfloat16 xb = (__hip_bfloat16)x_row[k];
-            float xf = __bfloat162float(xb);
+            // F32 activation, no BF16 truncation. Critical for matching two-pass:
+            // any BF16 conversion here compounds catastrophically through 26 MoE
+            // FFN layers with GLU gating.
+            float xf = x_row[k];
             acc[l] += w * xf;
         }
     }

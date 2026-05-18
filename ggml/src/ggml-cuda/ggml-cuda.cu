@@ -2918,9 +2918,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             hipMemcpyAsync(&h_dst0, (float*)dst->data, sizeof(float), hipMemcpyDeviceToHost, stream);
             hipStreamSynchronize(stream);
             static int diff_call_count = 0;
+            float max_abs_total = 0.f, sum_ref_total = 0.f, sum_fused_total = 0.f;
             // Print shape on every call to detect shape variation across MoE matmul invocations.
             if (diff_call_count < 3) {
-                float max_abs_total = 0.f, sum_ref_total = 0.f, sum_fused_total = 0.f;
                 double sum_abs_diff = 0.0;
                 double sum_sq_diff  = 0.0;
                 int n_large_diff = 0;
