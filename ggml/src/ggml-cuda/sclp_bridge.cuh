@@ -1099,27 +1099,35 @@ inline void llama_sclp4_fused_moe_gemv(
 // over every routed slot in that expert's bin doing atomicAdd. ~75K sidecar
 // weights × ~2 avg slots-per-expert × n_layers × calls/layer compounds.
 //
-// UNSOLVED PPL MYSTERY (debug log preserved for future work):
-//   In SCLP_FUSED_MOE_WMMA_DIFF=1 mode (mode=2), the fused kernel writes to a
-//   separate buffer, the two-pass writes to dst, and the diff harness verifies
-//   they match. With scalar+sidecar, ALL calls show bit-perfect match (max_abs
-//   ~1e-5, ratio=1.00000) across all 360,448 dst cells. Mode=2 PPL = 1194 at
-//   chunk 10 (matches baseline).
-//   With SCLP_FUSED_MOE_WMMA=1 (mode=1, no two-pass), the fused kernel writes
-//   directly to dst. An in-dispatch diagnostic confirmed dst values match
-//   what the two-pass produces (within 1e-5). YET mode=1 PPL is 22-40M
-//   instead of ~1194. Tested but did NOT fix it:
-//     - hipStreamSynchronize / hipDeviceSynchronize after fused
-//     - Allocating a dummy `decoded`-sized pool buffer (rules out pool state)
-//     - Raw hipMalloc for perm/expert_offsets scratch (rules out pool aliasing)
-//     - Running fused then ALSO running two-pass (this DID fix PPL — but the
-//       two-pass overwrites dst with values bit-identical to what fused already
-//       wrote, so something other than dst content matters).
-//   Hypothesis: the recursive `ggml_cuda_mul_mat_id(ctx, dst)` BF16 call has
-//   a side effect beyond writing dst — possibly registering a tensor-state
-//   flag, updating a graph-eval cache, or invoking a fused-op path that we
-//   skip. Next debug step: instrument WHERE this side effect lives by
-//   bisecting the BF16 mul_mat_id implementation.
+// PPL DIVERGENCE EXPLAINED (was misclassified as a mystery — actually a real
+// numerical bug). Earlier diff prints sampled max_abs per-row across the first 16
+// rows and reported ~1e-5 (bit-perfect-looking). Running the diff over the FULL
+// 360K-cell dst tensor shows:
+//   max abs cell-level diff = 0.005
+//   mean abs cell-level diff = 0.00065
+//   89% of cells differ by > 1e-4
+// That's ~0.5% per-cell relative error. Each MoE FFN matmul produces this, and
+// it compounds through 26 layers + GLU (multiplicative) → catastrophic PPL.
+// Definitive test: SCLP_M2_OVERWRITE_FUSED=1 in DIFF mode copies fused output
+// onto dst at end of dispatch; PPL drops from 1650 (baseline, dst=two-pass) to
+// 10.6M (dst=fused). Same dst tensor; only difference is which path wrote.
+// The fused/two-pass values are simply not bit-identical, even with scalar +
+// BF16-truncated activations.
+//
+// Source of the 0.5% drift: rocBLAS BF16 GEMM accumulates in F32 but tensor
+// cores likely round partial sums differently than our sequential F32-accumulator
+// scalar loop. K=2816 multiplications accumulated sequentially vs in tiled
+// chunks gives non-associative-addition divergence at ~1e-3 magnitudes for
+// typical values. The model (Gemma4-IT) is very sensitive to FFN-output noise
+// at this scale because outputs feed GLU (multiplicative), then ffn_down_exps,
+// then residual stream; errors compound across 26 layers.
+//
+// To match rocBLAS exactly we'd need to either (a) use rocBLAS for the GEMM
+// (defeats fusion), (b) reproduce its tile + accumulation order in our kernel,
+// or (c) accept the drift and retrain/calibrate from BF16 instead of Q5_K_M
+// (long shot). The fused-MoE-prefill program is therefore likely a dead end
+// for THIS model unless we replicate rocBLAS's numerics — substantially harder
+// than the original assumption.
 //
 // Future work: fix WMMA fragment bug (likely 1-warp vs 4-warp register packing),
 // optimize sidecar to a single launch with per-row reductions, isolate the
@@ -1422,7 +1430,11 @@ __global__ void sclp4_fused_moe_scalar_kernel(
             uint32_t i_active = (uint32_t)mgs[l] % n_active;
             uint32_t i_batch  = (uint32_t)mgs[l] / n_active;
             const float* x_row = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
-            acc[l] += w * x_row[k];
+            // BF16-truncated X matches two-pass numerics in magnitude but accumulation
+            // order still differs from rocBLAS, leaving ~0.5% per-cell drift.
+            __hip_bfloat16 xb = (__hip_bfloat16)x_row[k];
+            float xf = __bfloat162float(xb);
+            acc[l] += w * xf;
         }
     }
 

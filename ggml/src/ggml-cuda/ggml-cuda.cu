@@ -2862,6 +2862,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst->src[0] = orig_src0;
 
         if (sclp_fused_moe_wmma_mode == 2) {
+            // OVERWRITE_FUSED=1: at the end, copy fused values back into dst.
+            // PPL should drop to mode=1's broken value if dst values are what matters.
+            static const bool overwrite_fused = getenv("SCLP_M2_OVERWRITE_FUSED") != nullptr;
+            if (overwrite_fused) {
+                hipMemcpyAsync((float*)dst->data, dst_fused_raw, dst_nelem * sizeof(float), hipMemcpyDeviceToDevice, stream);
+            }
             // Diff: copy entire dst back to host and compute per-slot stats.
             std::vector<float> h_ref(dst_nelem), h_fused(dst_nelem);
             hipMemcpyAsync(h_ref.data(),   (float*)dst->data,           dst_nelem * sizeof(float), hipMemcpyDeviceToHost, stream);
@@ -2880,31 +2886,45 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             hipStreamSynchronize(stream);
             static int diff_call_count = 0;
             // Print shape on every call to detect shape variation across MoE matmul invocations.
-            if (diff_call_count < 30) {
+            if (diff_call_count < 3) {
                 float max_abs_total = 0.f, sum_ref_total = 0.f, sum_fused_total = 0.f;
+                double sum_abs_diff = 0.0;
+                double sum_sq_diff  = 0.0;
+                int n_large_diff = 0;
+                float largest = 0.f; int largest_idx = -1;
                 for (int64_t i = 0; i < dst_nelem; i++) {
                     float a = h_ref[i], b = h_fused[i];
-                    max_abs_total = std::max(max_abs_total, std::fabs(a - b));
+                    float d = std::fabs(a - b);
+                    if (d > largest) { largest = d; largest_idx = (int)i; }
+                    max_abs_total = std::max(max_abs_total, d);
+                    sum_abs_diff += d;
+                    sum_sq_diff  += (double)d * d;
                     sum_ref_total += std::fabs(a);
                     sum_fused_total += std::fabs(b);
+                    if (d > 1e-4f) n_large_diff++;
                 }
-                fprintf(stderr, "[SCLP_DIFF] call=%d K=%lld N=%lld nact=%lld nbat=%lld src1_ne1=%lld | global: max_abs=%.4g ref|sum|=%.4g fused|sum|=%.4g ratio=%.5f\n",
+                float mean_abs = (float)(sum_abs_diff / dst_nelem);
+                float rms = (float)std::sqrt(sum_sq_diff / dst_nelem);
+                fprintf(stderr, "[SCLP_DIFF] call=%d max=%.4g mean_abs=%.4g rms=%.4g  >1e-4: %d  ref|sum|=%.4g fused|sum|=%.4g ratio=%.7f  worst@%d: ref=%.6g fused=%.6g\n",
                         diff_call_count,
-                        (long long)src0->ne[0], (long long)src0->ne[1],
-                        (long long)ids->ne[0], (long long)n_batches,
-                        (long long)src1->ne[1],
-                        max_abs_total, sum_ref_total, sum_fused_total,
-                        sum_ref_total > 0 ? sum_fused_total/sum_ref_total : 0.f);
+                        max_abs_total, mean_abs, rms, n_large_diff,
+                        sum_ref_total, sum_fused_total,
+                        sum_ref_total > 0 ? sum_fused_total/sum_ref_total : 0.f,
+                        largest_idx,
+                        largest_idx >= 0 ? h_ref[largest_idx] : 0.f,
+                        largest_idx >= 0 ? h_fused[largest_idx] : 0.f);
             }
             if (diff_call_count < 2) {
                 const int64_t N        = src0->ne[1];
                 const int64_t n_active = ids->ne[0];
-                fprintf(stderr, "[SCLP_DIFF] call=%d src0 ne=[%lld,%lld,%lld] src1 ne=[%lld,%lld,%lld,%lld] ids ne=[%lld,%lld] dst ne=[%lld,%lld,%lld]\n",
+                fprintf(stderr, "[SCLP_DIFF] call=%d src0 ne=[%lld,%lld,%lld] src1 ne=[%lld,%lld,%lld,%lld] ids ne=[%lld,%lld] dst ne=[%lld,%lld,%lld] dst nb=[%lld,%lld,%lld,%lld] (ts=%zu)\n",
                         diff_call_count,
                         (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2],
                         (long long)src1->ne[0], (long long)src1->ne[1], (long long)src1->ne[2], (long long)src1->ne[3],
                         (long long)ids->ne[0], (long long)ids->ne[1],
-                        (long long)dst->ne[0], (long long)dst->ne[1], (long long)dst->ne[2]);
+                        (long long)dst->ne[0], (long long)dst->ne[1], (long long)dst->ne[2],
+                        (long long)dst->nb[0], (long long)dst->nb[1], (long long)dst->nb[2], (long long)dst->nb[3],
+                        ggml_type_size(dst->type));
                 fprintf(stderr, "[SCLP_DIFF]   sentinel after recurse: dst[0] = %g  (we wrote 9999 before recurse)\n", h_dst0);
                 fprintf(stderr, "[SCLP_DIFF]   src1[0..7, 0, 0]:");
                 for (size_t i = 0; i < h_src1_first.size(); i++) fprintf(stderr, " %g", h_src1_first[i]);
