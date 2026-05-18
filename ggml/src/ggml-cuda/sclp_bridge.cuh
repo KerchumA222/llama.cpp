@@ -107,13 +107,27 @@ __global__ void sclp_fixup_sidecar_kernel(
     const uint8_t* val_base = sidecar_base + 4 + (uint64_t)sidecar_count_s * sizeof(uint32_t);
 
     uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < sidecar_count_s;
-         i += stride) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Vectorized path: 4 entries per thread (32 bytes per thread: 16 index + 8 value + 8 output_write)
+    uint32_t i = tid * 4;
+    for (; i + 3 < sidecar_count_s; i += stride * 4) {
+        uint4 idx4;
+        uint64_t val4_64;
+        __builtin_memcpy(&idx4,    idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint4));
+        __builtin_memcpy(&val4_64, val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint64_t));
+        output[idx4.x] = (uint16_t)(val4_64 & 0xFFFF);
+        output[idx4.y] = (uint16_t)((val4_64 >> 16) & 0xFFFF);
+        output[idx4.z] = (uint16_t)((val4_64 >> 32) & 0xFFFF);
+        output[idx4.w] = (uint16_t)(val4_64 >> 48);
+    }
+
+    // Scalar tail
+    for (uint32_t si = i; si < sidecar_count_s; si++) {
         uint32_t idx;
         uint16_t val;
-        __builtin_memcpy(&idx, idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint32_t));
-        __builtin_memcpy(&val, val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint16_t));
+        __builtin_memcpy(&idx, idx_base + (uint64_t)si * sizeof(uint32_t), sizeof(uint32_t));
+        __builtin_memcpy(&val, val_base + (uint64_t)si * sizeof(uint16_t), sizeof(uint16_t));
         output[idx] = val;
     }
 }
@@ -721,18 +735,12 @@ __global__ void sclp4_decode_blob_kernel(
     uint16_t*      __restrict__ output,
     uint32_t                    num_weights
 ) {
-    // Parse header: n_experts and all palettes (thread 0 only)
     __shared__ uint32_t s_n_experts;
     __shared__ uint32_t s_ws_start;
     __shared__ uint8_t  s_palette_sizes[128];
     __shared__ uint8_t  s_palettes[128][4];
-    // Per-block expert resolution — saves 256 integer divisions per block.
-    __shared__ uint32_t s_block_e_lo;     // expert id at first weight of block
-    __shared__ uint32_t s_block_e_hi;     // expert id at last weight of block (may differ)
-    __shared__ uint32_t s_block_lo_local; // local_base of first weight within s_block_e_lo
     __shared__ uint32_t s_expert_nw;
     __shared__ uint32_t s_expert_nibble_bytes;
-    __shared__ uint32_t s_expert_lo_end_global; // global index where lo-expert ends
 
     if (threadIdx.x == 0) {
         uint32_t ne;
@@ -748,98 +756,83 @@ __global__ void sclp4_decode_blob_kernel(
         uint32_t enw = num_weights / ne;
         s_expert_nw = enw;
         s_expert_nibble_bytes = (enw + 1) / 2;
-
-        // Compute expert id for the FIRST weight in this block, once.
-        // Each thread now does 32 weights, so block covers 256*32=8192 weights.
-        uint32_t block_base_idx = blockIdx.x * blockDim.x * 32;
-        uint32_t e_lo = block_base_idx / enw;
-        s_block_e_lo = e_lo;
-        s_block_lo_local = block_base_idx - e_lo * enw;
-        s_expert_lo_end_global = (e_lo + 1) * enw;
-        uint32_t last_base = block_base_idx + (blockDim.x - 1) * 32;
-        s_block_e_hi = (last_base >= s_expert_lo_end_global) ? (e_lo + 1) : e_lo;
     }
     __syncthreads();
 
     const uint8_t* ws = blob + s_ws_start;
     uint32_t expert_nw = s_expert_nw;
-    uint32_t expert_nibble_bytes = s_expert_nibble_bytes;
 
-    // Each thread handles 16 weights (8 bytes of nibble data)
     const uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     constexpr uint32_t W_PER_THREAD = 32;
     const uint32_t base_idx   = thread_idx * W_PER_THREAD;
 
     if (base_idx >= num_weights) return;
 
-    // Resolve this thread's expert from the cached block-level data — no division.
-    // Fast path: this thread is inside e_lo's range.
-    uint32_t e;
-    uint32_t local_base;
-    if (base_idx < s_expert_lo_end_global) {
-        e = s_block_e_lo;
-        local_base = base_idx - s_block_e_lo * expert_nw;
-    } else {
-        // Straddle: this thread belongs to e_hi (= e_lo + 1).
-        e = s_block_e_hi;
-        local_base = base_idx - e * expert_nw;
-    }
+    const uint32_t e          = base_idx / expert_nw;
+    const uint32_t local_base = base_idx - e * expert_nw;
     if (e >= s_n_experts) return;
 
+    const uint8_t pal0 = s_palettes[e][0];
+    const uint8_t pal1 = s_palettes[e][1];
+    const uint8_t pal2 = s_palettes[e][2];
+    const uint8_t pal3 = s_palettes[e][3];
+    const uint8_t pal_size = s_palette_sizes[e];
+
+    const uint8_t* ws_p = ws + (uint64_t)e * s_expert_nibble_bytes + local_base / 2;
     uint32_t remaining_expert = expert_nw - local_base;
     uint32_t n_this = min(W_PER_THREAD, remaining_expert);
 
-    // Read 16 bytes (2× uint64) covering up to 32 nibbles.
-    uint64_t ws8a = 0, ws8b = 0;
-    const uint8_t * ws_p = ws + (uint64_t)e * expert_nibble_bytes + local_base / 2;
-    uint32_t bytes_this = (n_this + 1) / 2;
-    __builtin_memcpy(&ws8a, ws_p,     min(8u, bytes_this));
-    if (bytes_this > 8) __builtin_memcpy(&ws8b, ws_p + 8, min(8u, bytes_this - 8));
-
-    // Preload palette into thread-private registers.
-    uint8_t pal_size = s_palette_sizes[e];
-    uint8_t pal0 = s_palettes[e][0];
-    uint8_t pal1 = s_palettes[e][1];
-    uint8_t pal2 = s_palettes[e][2];
-    uint8_t pal3 = s_palettes[e][3];
-
-    uint16_t out[W_PER_THREAD];
-    #pragma unroll
-    for (int i = 0; i < (int)W_PER_THREAD; ++i) {
-        uint64_t source = (i < 16) ? ws8a : ws8b;
-        int local_i = i & 15;
-        uint8_t byte   = (uint8_t)(source >> ((local_i / 2) * 8));
-        uint8_t nibble = (local_i % 2 == 0) ? (byte >> 4) : (byte & 0xF);
-        uint8_t pidx   = nibble >> 2;
-        uint8_t smn    = nibble & 0x3;
-        uint8_t exp_   = 0;
-        if (pidx < pal_size) {
-            switch (pidx) {
-                case 0: exp_ = pal0; break;
-                case 1: exp_ = pal1; break;
-                case 2: exp_ = pal2; break;
-                case 3: exp_ = pal3; break;
+    uint16_t out[32];
+    if (n_this == 32) {
+        // Handle 32 weights using 2x 64-bit vectorized loads (16 bytes total)
+        for (int q = 0; q < 2; q++) {
+            uint64_t ws8;
+            __builtin_memcpy(&ws8, ws_p + q * 8, 8);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                uint8_t byte = (uint8_t)(ws8 >> (i * 8));
+                #pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    uint8_t nibble = (j == 0) ? (byte >> 4) : (byte & 0xF);
+                    uint8_t pidx = nibble >> 2;
+                    uint8_t smn  = nibble & 0x3;
+                    uint8_t exp_ = 0;
+                    if (pidx < pal_size) {
+                        switch(pidx) {
+                            case 0: exp_ = pal0; break;
+                            case 1: exp_ = pal1; break;
+                            case 2: exp_ = pal2; break;
+                            case 3: exp_ = pal3; break;
+                        }
+                    }
+                    uint8_t sign = (smn >> 1) & 1;
+                    uint8_t mant = smn & 1;
+                    out[q * 16 + i * 2 + j] = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 6);
+                }
             }
         }
-        uint8_t sign   = (smn >> 1) & 1;
-        uint8_t mant   = smn & 1;
-        out[i] = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 6);
-    }
-
-    // Vectorized stores: 4× uint4 when full (32 weights = 64 bytes).
-    if (n_this == W_PER_THREAD) {
-        uint4 v0, v1, v2, v3;
-        __builtin_memcpy(&v0, out,      sizeof(uint4));
-        __builtin_memcpy(&v1, out + 8,  sizeof(uint4));
-        __builtin_memcpy(&v2, out + 16, sizeof(uint4));
-        __builtin_memcpy(&v3, out + 24, sizeof(uint4));
-        *reinterpret_cast<uint4*>(output + base_idx)      = v0;
-        *reinterpret_cast<uint4*>(output + base_idx + 8)  = v1;
-        *reinterpret_cast<uint4*>(output + base_idx + 16) = v2;
-        *reinterpret_cast<uint4*>(output + base_idx + 24) = v3;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            *reinterpret_cast<uint4*>(output + base_idx + i * 8) = *reinterpret_cast<const uint4*>(out + i * 8);
+        }
     } else {
         for (uint32_t i = 0; i < n_this; ++i) {
-            output[base_idx + i] = out[i];
+            uint8_t byte = ws_p[i / 2];
+            uint8_t nibble = (i % 2 == 0) ? (byte >> 4) : (byte & 0xF);
+            uint8_t pidx = nibble >> 2;
+            uint8_t smn  = nibble & 0x3;
+            uint8_t exp_ = 0;
+            if (pidx < pal_size) {
+                switch(pidx) {
+                    case 0: exp_ = pal0; break;
+                    case 1: exp_ = pal1; break;
+                    case 2: exp_ = pal2; break;
+                    case 3: exp_ = pal3; break;
+                }
+            }
+            uint8_t sign = (smn >> 1) & 1;
+            uint8_t mant = smn & 1;
+            output[base_idx + i] = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 6);
         }
     }
 }
@@ -881,13 +874,27 @@ __global__ void sclp4_fixup_sidecar_kernel(
     const uint8_t* val_base = sidecar_base + 4 + (uint64_t)sidecar_count_s * sizeof(uint32_t);
 
     uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < sidecar_count_s;
-         i += stride) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Vectorized path: 4 entries per thread (32 bytes per thread: 16 index + 8 value + 8 output_write)
+    uint32_t i = tid * 4;
+    for (; i + 3 < sidecar_count_s; i += stride * 4) {
+        uint4 idx4;
+        uint64_t val4_64;
+        __builtin_memcpy(&idx4,    idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint4));
+        __builtin_memcpy(&val4_64, val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint64_t));
+        output[idx4.x] = (uint16_t)(val4_64 & 0xFFFF);
+        output[idx4.y] = (uint16_t)((val4_64 >> 16) & 0xFFFF);
+        output[idx4.z] = (uint16_t)((val4_64 >> 32) & 0xFFFF);
+        output[idx4.w] = (uint16_t)(val4_64 >> 48);
+    }
+
+    // Scalar tail
+    for (uint32_t si = i; si < sidecar_count_s; si++) {
         uint32_t idx;
         uint16_t val;
-        __builtin_memcpy(&idx, idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint32_t));
-        __builtin_memcpy(&val, val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint16_t));
+        __builtin_memcpy(&idx, idx_base + (uint64_t)si * sizeof(uint32_t), sizeof(uint32_t));
+        __builtin_memcpy(&val, val_base + (uint64_t)si * sizeof(uint16_t), sizeof(uint16_t));
         output[idx] = val;
     }
 }
@@ -965,31 +972,36 @@ inline void llama_sclp4_dispatch(
     dim3 decode_grid((groups + 255) / 256);
 
     static const bool time_decode = getenv("SCLP_TIME_DECODE") != nullptr;
-    hipEvent_t ev_a, ev_b, ev_c;
-    if (time_decode) { hipEventCreate(&ev_a); hipEventCreate(&ev_b); hipEventCreate(&ev_c); hipEventRecord(ev_a, stream); }
+    hipEvent_t ev_a = nullptr, ev_b = nullptr, ev_c = nullptr;
+    if (time_decode) {
+        (void)hipEventCreate(&ev_a);
+        (void)hipEventCreate(&ev_b);
+        (void)hipEventCreate(&ev_c);
+        (void)hipEventRecord(ev_a, stream);
+    }
 
     sclp4_decode_blob_kernel<<<decode_grid, block, 0, stream>>>(data, output, num_weights);
 
-    if (time_decode) hipEventRecord(ev_b, stream);
+    if (time_decode) (void)hipEventRecord(ev_b, stream);
 
-    // Sidecar fixup: was 4 blocks (criminally underparallelized on 96-CU gfx1100).
-    // 256 blocks × 256 threads gives full CU saturation; grid-stride loop handles any
-    // sidecar count without overlaunching.
-    sclp4_fixup_sidecar_kernel<<<256, block, 0, stream>>>(data, output, num_weights);
+    // Increase grid size to 1024 blocks to saturate all 96 CUs on gfx1100.
+    sclp4_fixup_sidecar_kernel<<<1024, block, 0, stream>>>(data, output, num_weights);
 
     if (time_decode) {
-        hipEventRecord(ev_c, stream);
-        hipStreamSynchronize(stream);
-        float ms_dec, ms_sc;
-        hipEventElapsedTime(&ms_dec, ev_a, ev_b);
-        hipEventElapsedTime(&ms_sc,  ev_b, ev_c);
+        (void)hipEventRecord(ev_c, stream);
+        (void)hipStreamSynchronize(stream);
+        float ms_dec = 0.0f, ms_sc = 0.0f;
+        (void)hipEventElapsedTime(&ms_dec, ev_a, ev_b);
+        (void)hipEventElapsedTime(&ms_sc,  ev_b, ev_c);
         static int dec_call = 0;
         if (dec_call < 10) {
             fprintf(stderr, "[DEC] call=%d nw=%u  decode=%.3fms  sidecar_fixup=%.3fms\n",
                     dec_call, num_weights, ms_dec, ms_sc);
             dec_call++;
         }
-        hipEventDestroy(ev_a); hipEventDestroy(ev_b); hipEventDestroy(ev_c);
+        (void)hipEventDestroy(ev_a);
+        (void)hipEventDestroy(ev_b);
+        (void)hipEventDestroy(ev_c);
     }
 }
 
@@ -1847,13 +1859,27 @@ __global__ void sclp6_fixup_sidecar_kernel(
     const uint8_t* val_base = sidecar_base + 4 + (uint64_t)sidecar_count_s * sizeof(uint32_t);
 
     uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < sidecar_count_s;
-         i += stride) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Vectorized path: 4 entries per thread (32 bytes per thread: 16 index + 8 value + 8 output_write)
+    uint32_t i = tid * 4;
+    for (; i + 3 < sidecar_count_s; i += stride * 4) {
+        uint4 idx4;
+        uint64_t val4_64;
+        __builtin_memcpy(&idx4,    idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint4));
+        __builtin_memcpy(&val4_64, val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint64_t));
+        output[idx4.x] = (uint16_t)(val4_64 & 0xFFFF);
+        output[idx4.y] = (uint16_t)((val4_64 >> 16) & 0xFFFF);
+        output[idx4.z] = (uint16_t)((val4_64 >> 32) & 0xFFFF);
+        output[idx4.w] = (uint16_t)(val4_64 >> 48);
+    }
+
+    // Scalar tail
+    for (uint32_t si = i; si < sidecar_count_s; si++) {
         uint32_t idx;
         uint16_t val;
-        __builtin_memcpy(&idx, idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint32_t));
-        __builtin_memcpy(&val, val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint16_t));
+        __builtin_memcpy(&idx, idx_base + (uint64_t)si * sizeof(uint32_t), sizeof(uint32_t));
+        __builtin_memcpy(&val, val_base + (uint64_t)si * sizeof(uint16_t), sizeof(uint16_t));
         output[idx] = val;
     }
 }
