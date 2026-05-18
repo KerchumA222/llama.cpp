@@ -2847,7 +2847,22 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         const int64_t num_weights = ggml_nelements(src0);
         ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
+
+        // SCLP_TIME_TWOPASS=1 measures decode vs recursive-GEMM split on the SCLP4
+        // two-pass path. Prints per-call ms breakdown for the first N calls.
+        static const bool time_twopass = getenv("SCLP_TIME_TWOPASS") != nullptr;
+        static int time_call_count = 0;
+        hipEvent_t ev_start, ev_decode, ev_gemm;
+        if (time_twopass) {
+            hipEventCreate(&ev_start);
+            hipEventCreate(&ev_decode);
+            hipEventCreate(&ev_gemm);
+            hipEventRecord(ev_start, stream);
+        }
+
         llama_sclp4_dispatch(src0->data, decoded.get(), (uint32_t)num_weights, stream);
+
+        if (time_twopass) hipEventRecord(ev_decode, stream);
 
         ggml_tensor src0_bf16 = *src0;
         src0_bf16.type  = GGML_TYPE_BF16;
@@ -2860,6 +2875,24 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst->src[0] = &src0_bf16;
         ggml_cuda_mul_mat_id(ctx, dst);
         dst->src[0] = orig_src0;
+
+        if (time_twopass) {
+            hipEventRecord(ev_gemm, stream);
+            hipStreamSynchronize(stream);
+            float ms_decode = 0.f, ms_gemm = 0.f;
+            hipEventElapsedTime(&ms_decode, ev_start,  ev_decode);
+            hipEventElapsedTime(&ms_gemm,   ev_decode, ev_gemm);
+            if (time_call_count < 20) {
+                fprintf(stderr, "[SCLP_TIME] call=%d decode=%.3fms gemm=%.3fms split=%.0f%%/%.0f%%\n",
+                        time_call_count, ms_decode, ms_gemm,
+                        100.f * ms_decode / (ms_decode + ms_gemm),
+                        100.f * ms_gemm   / (ms_decode + ms_gemm));
+                time_call_count++;
+            }
+            hipEventDestroy(ev_start);
+            hipEventDestroy(ev_decode);
+            hipEventDestroy(ev_gemm);
+        }
 
         if (sclp_fused_moe_wmma_mode == 2) {
             // OVERWRITE_FUSED=1: at the end, copy fused values back into dst.

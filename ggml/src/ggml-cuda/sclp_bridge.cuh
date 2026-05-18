@@ -409,7 +409,7 @@ inline void llama_sclp_fused_gemm(
         dst_f32, N, K, M);
 
     // Sidecar correction for all M token rows.
-    sclp_sidecar_correct_gemm_kernel<<<4, 256, 0, stream>>>(
+    sclp_sidecar_correct_gemm_kernel<<<256, 256, 0, stream>>>(
         (const uint8_t*)blob_ptr,
         (const __hip_bfloat16*)tmp_bf16,
         dst_f32, N, K, M);
@@ -702,7 +702,7 @@ inline void llama_sclp_fused_wmma(
         dst_f32, N, K, M);
 
     // Sidecar correction (same kernel used by scalar fused GEMM path).
-    sclp_sidecar_correct_gemm_kernel<<<4, 256, 0, stream>>>(
+    sclp_sidecar_correct_gemm_kernel<<<256, 256, 0, stream>>>(
         (const uint8_t*)blob_ptr,
         (const __hip_bfloat16*)tmp_bf16,
         dst_f32, N, K, M);
@@ -726,6 +726,13 @@ __global__ void sclp4_decode_blob_kernel(
     __shared__ uint32_t s_ws_start;
     __shared__ uint8_t  s_palette_sizes[128];
     __shared__ uint8_t  s_palettes[128][4];
+    // Per-block expert resolution — saves 256 integer divisions per block.
+    __shared__ uint32_t s_block_e_lo;     // expert id at first weight of block
+    __shared__ uint32_t s_block_e_hi;     // expert id at last weight of block (may differ)
+    __shared__ uint32_t s_block_lo_local; // local_base of first weight within s_block_e_lo
+    __shared__ uint32_t s_expert_nw;
+    __shared__ uint32_t s_expert_nibble_bytes;
+    __shared__ uint32_t s_expert_lo_end_global; // global index where lo-expert ends
 
     if (threadIdx.x == 0) {
         uint32_t ne;
@@ -738,52 +745,98 @@ __global__ void sclp4_decode_blob_kernel(
             p += 1 + p[0];
         }
         s_ws_start = (uint32_t)(p - blob);
+        uint32_t enw = num_weights / ne;
+        s_expert_nw = enw;
+        s_expert_nibble_bytes = (enw + 1) / 2;
+
+        // Compute expert id for the FIRST weight in this block, once.
+        // Each thread now does 32 weights, so block covers 256*32=8192 weights.
+        uint32_t block_base_idx = blockIdx.x * blockDim.x * 32;
+        uint32_t e_lo = block_base_idx / enw;
+        s_block_e_lo = e_lo;
+        s_block_lo_local = block_base_idx - e_lo * enw;
+        s_expert_lo_end_global = (e_lo + 1) * enw;
+        uint32_t last_base = block_base_idx + (blockDim.x - 1) * 32;
+        s_block_e_hi = (last_base >= s_expert_lo_end_global) ? (e_lo + 1) : e_lo;
     }
     __syncthreads();
 
     const uint8_t* ws = blob + s_ws_start;
-    uint32_t n_experts = s_n_experts;
-    uint32_t expert_nw = num_weights / n_experts;
-    uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
+    uint32_t expert_nw = s_expert_nw;
+    uint32_t expert_nibble_bytes = s_expert_nibble_bytes;
 
     // Each thread handles 16 weights (8 bytes of nibble data)
-    // Global weight index: thread processes weights [base_idx .. base_idx+15]
     const uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t base_idx   = thread_idx * 16;
+    constexpr uint32_t W_PER_THREAD = 32;
+    const uint32_t base_idx   = thread_idx * W_PER_THREAD;
 
     if (base_idx >= num_weights) return;
 
-    uint32_t e = base_idx / expert_nw;
-    uint32_t local_base = base_idx - e * expert_nw;
-    if (e >= n_experts) return;
+    // Resolve this thread's expert from the cached block-level data — no division.
+    // Fast path: this thread is inside e_lo's range.
+    uint32_t e;
+    uint32_t local_base;
+    if (base_idx < s_expert_lo_end_global) {
+        e = s_block_e_lo;
+        local_base = base_idx - s_block_e_lo * expert_nw;
+    } else {
+        // Straddle: this thread belongs to e_hi (= e_lo + 1).
+        e = s_block_e_hi;
+        local_base = base_idx - e * expert_nw;
+    }
+    if (e >= s_n_experts) return;
 
     uint32_t remaining_expert = expert_nw - local_base;
-    uint32_t n_this = min(16u, remaining_expert);
+    uint32_t n_this = min(W_PER_THREAD, remaining_expert);
 
-    uint64_t ws8 = 0;
-    __builtin_memcpy(&ws8, ws + (uint64_t)e * expert_nibble_bytes + local_base / 2,
-                     min(8u, (n_this + 1) / 2));
+    // Read 16 bytes (2× uint64) covering up to 32 nibbles.
+    uint64_t ws8a = 0, ws8b = 0;
+    const uint8_t * ws_p = ws + (uint64_t)e * expert_nibble_bytes + local_base / 2;
+    uint32_t bytes_this = (n_this + 1) / 2;
+    __builtin_memcpy(&ws8a, ws_p,     min(8u, bytes_this));
+    if (bytes_this > 8) __builtin_memcpy(&ws8b, ws_p + 8, min(8u, bytes_this - 8));
 
-    uint16_t out[16];
+    // Preload palette into thread-private registers.
+    uint8_t pal_size = s_palette_sizes[e];
+    uint8_t pal0 = s_palettes[e][0];
+    uint8_t pal1 = s_palettes[e][1];
+    uint8_t pal2 = s_palettes[e][2];
+    uint8_t pal3 = s_palettes[e][3];
+
+    uint16_t out[W_PER_THREAD];
     #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        uint8_t byte   = (uint8_t)(ws8 >> ((i / 2) * 8));
-        uint8_t nibble = (i % 2 == 0) ? (byte >> 4) : (byte & 0xF);
+    for (int i = 0; i < (int)W_PER_THREAD; ++i) {
+        uint64_t source = (i < 16) ? ws8a : ws8b;
+        int local_i = i & 15;
+        uint8_t byte   = (uint8_t)(source >> ((local_i / 2) * 8));
+        uint8_t nibble = (local_i % 2 == 0) ? (byte >> 4) : (byte & 0xF);
         uint8_t pidx   = nibble >> 2;
         uint8_t smn    = nibble & 0x3;
-        uint8_t exp    = (pidx < s_palette_sizes[e]) ? s_palettes[e][pidx] : 0;
+        uint8_t exp_   = 0;
+        if (pidx < pal_size) {
+            switch (pidx) {
+                case 0: exp_ = pal0; break;
+                case 1: exp_ = pal1; break;
+                case 2: exp_ = pal2; break;
+                case 3: exp_ = pal3; break;
+            }
+        }
         uint8_t sign   = (smn >> 1) & 1;
         uint8_t mant   = smn & 1;
-        out[i] = ((uint16_t)sign << 15) | ((uint16_t)exp << 7) | ((uint16_t)mant << 6);
+        out[i] = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 6);
     }
 
-    // Vectorized stores: 2× uint4 (8 uint16 each) when full; scalar fallback otherwise
-    if (n_this == 16) {
-        uint4 v0, v1;
-        __builtin_memcpy(&v0, out,     sizeof(uint4));
-        __builtin_memcpy(&v1, out + 8, sizeof(uint4));
-        *reinterpret_cast<uint4*>(output + base_idx)     = v0;
-        *reinterpret_cast<uint4*>(output + base_idx + 8) = v1;
+    // Vectorized stores: 4× uint4 when full (32 weights = 64 bytes).
+    if (n_this == W_PER_THREAD) {
+        uint4 v0, v1, v2, v3;
+        __builtin_memcpy(&v0, out,      sizeof(uint4));
+        __builtin_memcpy(&v1, out + 8,  sizeof(uint4));
+        __builtin_memcpy(&v2, out + 16, sizeof(uint4));
+        __builtin_memcpy(&v3, out + 24, sizeof(uint4));
+        *reinterpret_cast<uint4*>(output + base_idx)      = v0;
+        *reinterpret_cast<uint4*>(output + base_idx + 8)  = v1;
+        *reinterpret_cast<uint4*>(output + base_idx + 16) = v2;
+        *reinterpret_cast<uint4*>(output + base_idx + 24) = v3;
     } else {
         for (uint32_t i = 0; i < n_this; ++i) {
             output[base_idx + i] = out[i];
@@ -907,12 +960,37 @@ inline void llama_sclp4_dispatch(
     const uint8_t* data = (const uint8_t*)sclp_data;
     dim3 block(256);
 
-    // Each thread handles 16 weights (8 nibble bytes)
-    uint32_t groups = (num_weights + 15) / 16;
+    // Each thread handles 32 weights (16 nibble bytes).
+    uint32_t groups = (num_weights + 31) / 32;
     dim3 decode_grid((groups + 255) / 256);
+
+    static const bool time_decode = getenv("SCLP_TIME_DECODE") != nullptr;
+    hipEvent_t ev_a, ev_b, ev_c;
+    if (time_decode) { hipEventCreate(&ev_a); hipEventCreate(&ev_b); hipEventCreate(&ev_c); hipEventRecord(ev_a, stream); }
+
     sclp4_decode_blob_kernel<<<decode_grid, block, 0, stream>>>(data, output, num_weights);
 
-    sclp4_fixup_sidecar_kernel<<<4, block, 0, stream>>>(data, output, num_weights);
+    if (time_decode) hipEventRecord(ev_b, stream);
+
+    // Sidecar fixup: was 4 blocks (criminally underparallelized on 96-CU gfx1100).
+    // 256 blocks × 256 threads gives full CU saturation; grid-stride loop handles any
+    // sidecar count without overlaunching.
+    sclp4_fixup_sidecar_kernel<<<256, block, 0, stream>>>(data, output, num_weights);
+
+    if (time_decode) {
+        hipEventRecord(ev_c, stream);
+        hipStreamSynchronize(stream);
+        float ms_dec, ms_sc;
+        hipEventElapsedTime(&ms_dec, ev_a, ev_b);
+        hipEventElapsedTime(&ms_sc,  ev_b, ev_c);
+        static int dec_call = 0;
+        if (dec_call < 10) {
+            fprintf(stderr, "[DEC] call=%d nw=%u  decode=%.3fms  sidecar_fixup=%.3fms\n",
+                    dec_call, num_weights, ms_dec, ms_sc);
+            dec_call++;
+        }
+        hipEventDestroy(ev_a); hipEventDestroy(ev_b); hipEventDestroy(ev_c);
+    }
 }
 
 inline void llama_sclp4_fused_gemv(
@@ -1619,6 +1697,7 @@ __global__ void sclp6_decode_blob_kernel(
     __shared__ uint32_t s_ws_start;
     __shared__ uint8_t  s_palette_sizes[128];
     __shared__ uint8_t  s_palettes[128][8];
+    __shared__ uint32_t s_expert_groups;
 
     if (threadIdx.x == 0) {
         uint32_t ne;
@@ -1631,53 +1710,100 @@ __global__ void sclp6_decode_blob_kernel(
             p += 1 + p[0];
         }
         s_ws_start = (uint32_t)(p - blob);
+        uint32_t enw = num_weights / ne;
+        s_expert_groups = (enw + 3) / 4;
     }
     __syncthreads();
 
     const uint8_t* ws = blob + s_ws_start;
-    uint32_t n_experts   = s_n_experts;
-    uint32_t expert_nw   = num_weights / n_experts;
-    uint32_t expert_groups = (expert_nw + 3) / 4;
-    uint32_t total_groups  = expert_groups * n_experts;
+    uint32_t n_experts     = s_n_experts;
+    uint32_t expert_groups = s_expert_groups;
+    uint32_t expert_nw     = num_weights / n_experts;
 
-    // Each thread handles one 3-byte group (4 weights)
-    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (gid >= total_groups) return;
+    // Each thread now handles SUPER_GROUPS=8 groups = 32 weights = 24 bytes input,
+    // 64 bytes (4× uint4) output. Reduces total threads 8x vs original.
+    constexpr uint32_t SUPER_GROUPS = 8;
+    const uint32_t super_gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t first_gid = super_gid * SUPER_GROUPS;
+    if (first_gid >= (uint32_t)(expert_groups * n_experts)) return;
 
-    uint32_t e      = gid / expert_groups;
-    uint32_t g_local = gid % expert_groups;
+    // Each super-group stays inside one expert (we don't cross expert boundaries
+    // within a thread). Compute expert and intra-expert group offset.
+    const uint32_t e         = first_gid / expert_groups;
+    const uint32_t g0_local  = first_gid - e * expert_groups;
+    if (e >= n_experts) return;
 
-    const uint8_t b0 = ws[gid * 3 + 0];
-    const uint8_t b1 = ws[gid * 3 + 1];
-    const uint8_t b2 = ws[gid * 3 + 2];
+    // Load palette into thread-private regs (4 of 8 entries used per nibble pidx; we
+    // load up to 8 to be safe).
+    uint8_t pal0 = s_palettes[e][0];
+    uint8_t pal1 = s_palettes[e][1];
+    uint8_t pal2 = s_palettes[e][2];
+    uint8_t pal3 = s_palettes[e][3];
+    uint8_t pal4 = s_palettes[e][4];
+    uint8_t pal5 = s_palettes[e][5];
+    uint8_t pal6 = s_palettes[e][6];
+    uint8_t pal7 = s_palettes[e][7];
+    uint8_t pal_size = s_palette_sizes[e];
 
-    uint8_t sixbits[4];
-    sixbits[0] = b0 >> 2;
-    sixbits[1] = ((b0 & 0x3) << 4) | (b1 >> 4);
-    sixbits[2] = ((b1 & 0xF) << 2) | (b2 >> 6);
-    sixbits[3] = b2 & 0x3F;
+    uint16_t out16[32];
 
-    uint32_t base_idx = e * expert_nw + g_local * 4;
-    uint32_t remaining = expert_nw - g_local * 4;
-    uint32_t n_this = remaining < 4 ? remaining : 4;
-
-    uint16_t out[4];
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        uint8_t pidx = sixbits[i] >> 3;
-        uint8_t smn  = sixbits[i] & 0x7;
-        uint8_t exp  = (pidx < s_palette_sizes[e]) ? s_palettes[e][pidx] : 0;
-        uint8_t sign = (smn >> 2) & 1;
-        uint8_t mant = smn & 0x3;
-        out[i] = ((uint16_t)sign << 15) | ((uint16_t)exp << 7) | ((uint16_t)mant << 5);
+    for (uint32_t sub = 0; sub < SUPER_GROUPS; ++sub) {
+        uint32_t g_local = g0_local + sub;
+        if (g_local >= expert_groups) break;
+        uint32_t gid = e * expert_groups + g_local;
+
+        const uint8_t b0 = ws[gid * 3 + 0];
+        const uint8_t b1 = ws[gid * 3 + 1];
+        const uint8_t b2 = ws[gid * 3 + 2];
+
+        uint8_t sixbits[4];
+        sixbits[0] = b0 >> 2;
+        sixbits[1] = ((b0 & 0x3) << 4) | (b1 >> 4);
+        sixbits[2] = ((b1 & 0xF) << 2) | (b2 >> 6);
+        sixbits[3] = b2 & 0x3F;
+
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            uint8_t pidx = sixbits[i] >> 3;
+            uint8_t smn  = sixbits[i] & 0x7;
+            uint8_t exp_ = 0;
+            if (pidx < pal_size) {
+                switch (pidx) {
+                    case 0: exp_ = pal0; break;
+                    case 1: exp_ = pal1; break;
+                    case 2: exp_ = pal2; break;
+                    case 3: exp_ = pal3; break;
+                    case 4: exp_ = pal4; break;
+                    case 5: exp_ = pal5; break;
+                    case 6: exp_ = pal6; break;
+                    case 7: exp_ = pal7; break;
+                }
+            }
+            uint8_t sign = (smn >> 2) & 1;
+            uint8_t mant = smn & 0x3;
+            out16[sub * 4 + i] = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 5);
+        }
     }
 
-    if (n_this == 4) {
-        uint64_t v;
-        __builtin_memcpy(&v, out, sizeof(uint64_t));
-        *reinterpret_cast<uint64_t*>(output + base_idx) = v;
+    // Fast path: super-group fully inside expert with all 16 weights valid.
+    uint32_t base_idx = e * expert_nw + g0_local * 4;
+    uint32_t remaining_expert = expert_nw - g0_local * 4;
+    uint32_t n_groups_this   = min((uint32_t)SUPER_GROUPS, expert_groups - g0_local);
+    uint32_t n_weights_this  = min(n_groups_this * 4, remaining_expert);
+
+    if (n_weights_this == 32) {
+        uint4 v0, v1, v2, v3;
+        __builtin_memcpy(&v0, out16,      sizeof(uint4));
+        __builtin_memcpy(&v1, out16 + 8,  sizeof(uint4));
+        __builtin_memcpy(&v2, out16 + 16, sizeof(uint4));
+        __builtin_memcpy(&v3, out16 + 24, sizeof(uint4));
+        *reinterpret_cast<uint4*>(output + base_idx)      = v0;
+        *reinterpret_cast<uint4*>(output + base_idx + 8)  = v1;
+        *reinterpret_cast<uint4*>(output + base_idx + 16) = v2;
+        *reinterpret_cast<uint4*>(output + base_idx + 24) = v3;
     } else {
-        for (uint32_t i = 0; i < n_this; ++i) output[base_idx + i] = out[i];
+        for (uint32_t i = 0; i < n_weights_this; ++i) output[base_idx + i] = out16[i];
     }
 }
 
@@ -1823,10 +1949,34 @@ inline void llama_sclp6_dispatch(
     uint32_t expert_groups = (expert_nw + 3) / 4;
     uint32_t total_groups  = expert_groups * n_experts;
 
-    dim3 decode_grid((total_groups + 255) / 256);
+    // Thread now handles 8 groups (32 weights). Divide total_groups by 8.
+    uint32_t super_groups = (total_groups + 7) / 8;
+    dim3 decode_grid((super_groups + 255) / 256);
+
+    static const bool time_sclp6 = getenv("SCLP6_TIME_DECODE") != nullptr;
+    hipEvent_t s6a, s6b, s6c;
+    if (time_sclp6) { hipEventCreate(&s6a); hipEventCreate(&s6b); hipEventCreate(&s6c); hipEventRecord(s6a, stream); }
+
     sclp6_decode_blob_kernel<<<decode_grid, block, 0, stream>>>(data, output, num_weights);
 
-    sclp6_fixup_sidecar_kernel<<<4, block, 0, stream>>>(data, output, num_weights);
+    if (time_sclp6) hipEventRecord(s6b, stream);
+
+    sclp6_fixup_sidecar_kernel<<<256, block, 0, stream>>>(data, output, num_weights);
+
+    if (time_sclp6) {
+        hipEventRecord(s6c, stream);
+        hipStreamSynchronize(stream);
+        float ms_dec, ms_sc;
+        hipEventElapsedTime(&ms_dec, s6a, s6b);
+        hipEventElapsedTime(&ms_sc,  s6b, s6c);
+        static int s6_call = 0;
+        if (s6_call < 5) {
+            fprintf(stderr, "[S6] call=%d nw=%u decode=%.3fms sidecar=%.3fms\n",
+                    s6_call, num_weights, ms_dec, ms_sc);
+            s6_call++;
+        }
+        hipEventDestroy(s6a); hipEventDestroy(s6b); hipEventDestroy(s6c);
+    }
 }
 
 inline void llama_sclp6_fused_gemv(
@@ -1998,5 +2148,5 @@ inline void llama_sclp_dispatch(
 
     // Sidecar fixup: fixed 4-block grid with stride loop handles any sidecar count.
     // Threads where i >= sidecar_count return after a single shared-memory read.
-    sclp_fixup_sidecar_kernel<<<4, block, 0, stream>>>(data, output, num_weights);
+    sclp_fixup_sidecar_kernel<<<256, block, 0, stream>>>(data, output, num_weights);
 }
