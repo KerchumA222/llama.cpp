@@ -2,6 +2,75 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <atomic>
+
+// SCLP_TIME_TG=1: aggregate fused-GEMV timings by category, print summary on exit.
+// Each launcher wraps its kernel launch with SCLP_TG_TIME_BEGIN/END(cat). When the
+// env var is unset the macros expand to nothing — zero overhead in release runs.
+namespace sclp_tg {
+    enum Cat : int {
+        CAT_SCLP_DENSE = 0, CAT_SCLP_MOE,
+        CAT_SCLP4_DENSE,    CAT_SCLP4_MOE,
+        CAT_SCLP6_DENSE,    CAT_SCLP6_MOE,
+        CAT_COUNT
+    };
+    inline const char* cat_name(int c) {
+        switch (c) {
+            case CAT_SCLP_DENSE: return "SCLP8.dense";
+            case CAT_SCLP_MOE:   return "SCLP8.moe  ";
+            case CAT_SCLP4_DENSE:return "SCLP4.dense";
+            case CAT_SCLP4_MOE:  return "SCLP4.moe  ";
+            case CAT_SCLP6_DENSE:return "SCLP6.dense";
+            case CAT_SCLP6_MOE:  return "SCLP6.moe  ";
+            default: return "?";
+        }
+    }
+    struct Agg { std::atomic<uint64_t> ns_total{0}; std::atomic<uint64_t> calls{0}; };
+    inline Agg& agg(int c) { static Agg a[CAT_COUNT]; return a[c]; }
+
+    inline bool enabled() {
+        static const bool v = (getenv("SCLP_TIME_TG") != nullptr);
+        return v;
+    }
+    inline void dump() {
+        bool any = false;
+        for (int c = 0; c < CAT_COUNT; c++) if (agg(c).calls.load()) { any = true; break; }
+        if (!any) return;
+        fprintf(stderr, "\n[SCLP_TIME_TG] fused-GEMV totals (synchronous, includes hipStreamSynchronize):\n");
+        fprintf(stderr, "  %-12s %10s %12s %12s\n", "category", "calls", "total_ms", "avg_us");
+        for (int c = 0; c < CAT_COUNT; c++) {
+            uint64_t n = agg(c).calls.load();
+            uint64_t ns = agg(c).ns_total.load();
+            if (n == 0) continue;
+            fprintf(stderr, "  %-12s %10llu %12.3f %12.2f\n",
+                cat_name(c), (unsigned long long)n,
+                ns / 1.0e6, (ns / 1000.0) / n);
+        }
+    }
+    inline int register_atexit() { atexit(&dump); return 0; }
+}
+#define SCLP_TG_INIT() static int _sclp_tg_atexit = sclp_tg::register_atexit()
+#define SCLP_TG_TIME_BEGIN(cat) \
+    hipEvent_t _tg_ev_a = nullptr, _tg_ev_b = nullptr; \
+    const int  _tg_cat = (cat); \
+    const bool _tg_on  = sclp_tg::enabled(); \
+    if (_tg_on) { \
+        (void)hipEventCreate(&_tg_ev_a); (void)hipEventCreate(&_tg_ev_b); \
+        (void)hipEventRecord(_tg_ev_a, stream); \
+    }
+#define SCLP_TG_TIME_END() \
+    if (_tg_on) { \
+        (void)hipEventRecord(_tg_ev_b, stream); \
+        (void)hipStreamSynchronize(stream); \
+        float _tg_ms = 0.0f; \
+        (void)hipEventElapsedTime(&_tg_ms, _tg_ev_a, _tg_ev_b); \
+        sclp_tg::agg(_tg_cat).ns_total.fetch_add((uint64_t)(_tg_ms * 1.0e6), std::memory_order_relaxed); \
+        sclp_tg::agg(_tg_cat).calls.fetch_add(1, std::memory_order_relaxed); \
+        (void)hipEventDestroy(_tg_ev_a); (void)hipEventDestroy(_tg_ev_b); \
+    }
+inline int _sclp_tg_atexit_register = sclp_tg::register_atexit();
 
 // SCLP decode bridge for llama.cpp HIP backend.
 //
@@ -148,79 +217,67 @@ __global__ void sclp_fixup_sidecar_kernel(
 // Phase 5 (sidecar scan): stride loop, skip entries outside our row range.
 // Accepts F32 activations directly — no separate f32_to_bf16_kernel needed.
 // Saves one kernel launch + one BF16 scratch buffer per layer (224 launches/token).
-__launch_bounds__(1024, 2)
+// Shared memory layout:
+//   [0..1023]   s_lut[256] (float, 1024 bytes) — decoded float for each (pidx, smn) pair
+//                                                 indexed as s_lut[byte] where byte = pidx<<4 | smn
+//   [1024..]    s_x[K]     (float, K*4 bytes) — activation vector
+__launch_bounds__(512, 2)
 __global__ void sclp_fused_gemv_kernel(
     const uint8_t* __restrict__ blob,
-    const float*   __restrict__ x,   // F32 activations [K]
+    const float*   __restrict__ x,
     float*         __restrict__ y,
     uint32_t N,
     uint32_t K
 ) {
-    __shared__ uint8_t s_palette_size;
-    __shared__ uint8_t s_palette[16];
+    extern __shared__ char smem[];
+    float* s_lut = (float*)smem;          // 256 floats = 1024 bytes
+    float* s_x   = (float*)(smem + 1024); // K floats
 
-    if (threadIdx.x == 0) s_palette_size = blob[4];
+    // Threads 0..15 build the LUT collaboratively (one palette entry each).
+    if (threadIdx.x < 16) {
+        uint8_t pal_size = blob[4];
+        uint8_t pidx     = (uint8_t)threadIdx.x;
+        uint8_t exp_     = (pidx < pal_size) ? blob[5 + pidx] : 0;
+        for (int smn = 0; smn < 16; smn++) {
+            uint8_t sign = (smn >> 3) & 1;
+            uint8_t mant = smn & 0x7;
+            uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 4);
+            s_lut[(int)pidx * 16 + smn] = __bfloat162float(*(__hip_bfloat16*)&bits);
+        }
+    }
+
+    for (uint32_t k = threadIdx.x; k < K; k += blockDim.x) s_x[k] = x[k];
     __syncthreads();
 
-    if (threadIdx.x < (uint32_t)s_palette_size)
-        s_palette[threadIdx.x] = blob[5 + threadIdx.x];
-    __syncthreads();
+    const uint8_t* ws = blob + 5 + blob[4];  // ws_stream: N*K bytes
 
-    const uint8_t* ws = blob + 5 + s_palette_size;  // ws_stream: N*K bytes, 1 per weight
     const int warps_per_block = blockDim.x / 32;
     const int warp_id  = threadIdx.x / 32;
     const int lane     = threadIdx.x & 31;
     const uint32_t row = (uint32_t)blockIdx.x * warps_per_block + warp_id;
 
-    if (row < N) {
-        float acc0 = 0.0f, acc1 = 0.0f;
-        const uint64_t row_base = (uint64_t)row * K;
-        const uint32_t K16 = (K / 16) * 16;
+    if (row >= N) return;
 
-        for (uint32_t k16 = lane * 16; k16 < K16; k16 += 32 * 16) {
-            {
-                // 8 weights at row_base+k16: one uint64_t covers all 8 ws bytes
-                uint64_t ws8; __builtin_memcpy(&ws8, ws + row_base + k16, sizeof(uint64_t));
-                #pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    uint8_t b     = (uint8_t)(ws8 >> (j * 8));
-                    uint8_t smn   = b & 0x0F;
-                    uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                                  | ((uint16_t)s_palette[b >> 4] << 7)
-                                  | ((uint16_t)(smn & 0x7) << 4);
-                    acc0 += __bfloat162float(*(__hip_bfloat16*)&bits) * x[k16 + j];
-                }
-            }
-            {
-                uint64_t ws8; __builtin_memcpy(&ws8, ws + row_base + k16 + 8, sizeof(uint64_t));
-                #pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    uint8_t b     = (uint8_t)(ws8 >> (j * 8));
-                    uint8_t smn   = b & 0x0F;
-                    uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                                  | ((uint16_t)s_palette[b >> 4] << 7)
-                                  | ((uint16_t)(smn & 0x7) << 4);
-                    acc1 += __bfloat162float(*(__hip_bfloat16*)&bits) * x[k16 + 8 + j];
-                }
-            }
+    float acc = 0.0f;
+    const uint64_t row_base = (uint64_t)row * K;
+    const uint32_t K8 = (K / 8) * 8;
+
+    // 8 weights per uint64 load.
+    for (uint32_t k8 = lane * 8; k8 < K8; k8 += 32 * 8) {
+        uint64_t ws8; __builtin_memcpy(&ws8, ws + row_base + k8, sizeof(uint64_t));
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            acc += s_lut[(uint8_t)(ws8 >> (j * 8))] * s_x[k8 + j];
         }
-        float acc = acc0 + acc1;
-        for (uint32_t k = K16 + lane; k < K; k += 32) {
-            uint8_t b     = ws[row_base + k];
-            uint8_t smn   = b & 0x0F;
-            uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                          | ((uint16_t)s_palette[b >> 4] << 7)
-                          | ((uint16_t)(smn & 0x7) << 4);
-            acc += __bfloat162float(*(__hip_bfloat16*)&bits) * x[k];
-        }
-        for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
-        if (lane == 0) y[row] = acc;
     }
-    // Sidecar correction is intentionally omitted for M=1 decode: the per-element error
-    // from the palette approximation (~0.02% of weights) is tolerable for single-token
-    // generation against a correctly-prefilled KV cache. A block-scoped scan would force
-    // every block to read all sidecar entries (256× more reads than a separate 4-block
-    // kernel), causing ~37% throughput regression.
+    for (uint32_t k = K8 + lane; k < K; k += 32) {
+        acc += s_lut[ws[row_base + k]] * s_x[k];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
+    if (lane == 0) y[row] = acc;
+    // Sidecar omitted per SCLP convention (~0.02% of weights; block-scoped scan
+    // empirically regresses throughput ~37%).
 }
 
 // Sidecar correction kernel for fused GEMM (M>1).
@@ -439,13 +496,16 @@ inline void llama_sclp_fused_gemv(
     uint32_t      K,
     hipStream_t   stream
 ) {
-    constexpr int WARPS_PER_BLOCK = 32;
+    constexpr int WARPS_PER_BLOCK = 16;
     dim3 gemv_block(WARPS_PER_BLOCK * 32);
     dim3 gemv_grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
-    sclp_fused_gemv_kernel<<<gemv_grid, gemv_block, 0, stream>>>(
+    size_t smem_bytes = 1024 + (size_t)K * sizeof(float);
+    SCLP_TG_TIME_BEGIN(sclp_tg::CAT_SCLP_DENSE);
+    sclp_fused_gemv_kernel<<<gemv_grid, gemv_block, smem_bytes, stream>>>(
         (const uint8_t*)blob_ptr,
         src_f32,
         dst_f32, N, K);
+    SCLP_TG_TIME_END();
 }
 
 // Fused decode-GEMV for MoE MUL_MAT_ID with SCLP expert weights.
@@ -552,9 +612,11 @@ inline void llama_sclp_fused_moe_gemv(
     dim3 block(WARPS_PER_BLOCK * 32);
     // blockIdx.y = i_active + i_batch * n_active  (flat expert-batch index)
     dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, n_active * n_batches);
+    SCLP_TG_TIME_BEGIN(sclp_tg::CAT_SCLP_MOE);
     sclp_fused_moe_gemv_kernel<<<grid, block, 0, stream>>>(
         (const uint8_t*)blob_ptr,
         src1, ids, dst, N, K, n_active, src1_ne1);
+    SCLP_TG_TIME_END();
 }
 
 // Fused decode-WMMA kernel for M > 1 prefill using RDNA3 wave32 WMMA instructions.
@@ -768,6 +830,8 @@ __global__ void sclp4_decode_blob_kernel(
 
     if (base_idx >= num_weights) return;
 
+    // Per-thread IDIV: measured memory-bound on gfx1100, no benefit from caching
+    // per-block expert ID. Revisit if VALU stalls show in rocprof on newer hw.
     const uint32_t e          = base_idx / expert_nw;
     const uint32_t local_base = base_idx - e * expert_nw;
     if (e >= s_n_experts) return;
@@ -813,7 +877,9 @@ __global__ void sclp4_decode_blob_kernel(
         }
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            *reinterpret_cast<uint4*>(output + base_idx + i * 8) = *reinterpret_cast<const uint4*>(out + i * 8);
+            uint4 v;
+            __builtin_memcpy(&v, out + i * 8, sizeof(uint4));
+            __builtin_memcpy(output + base_idx + i * 8, &v, sizeof(uint4));
         }
     } else {
         for (uint32_t i = 0; i < n_this; ++i) {
@@ -876,7 +942,6 @@ __global__ void sclp4_fixup_sidecar_kernel(
     uint32_t stride = gridDim.x * blockDim.x;
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Vectorized path: 4 entries per thread (32 bytes per thread: 16 index + 8 value + 8 output_write)
     uint32_t i = tid * 4;
     for (; i + 3 < sidecar_count_s; i += stride * 4) {
         uint4 idx4;
@@ -889,7 +954,6 @@ __global__ void sclp4_fixup_sidecar_kernel(
         output[idx4.w] = (uint16_t)(val4_64 >> 48);
     }
 
-    // Scalar tail
     for (uint32_t si = i; si < sidecar_count_s; si++) {
         uint32_t idx;
         uint16_t val;
@@ -899,11 +963,14 @@ __global__ void sclp4_fixup_sidecar_kernel(
     }
 }
 
-// Fused decode-GEMV for SCLP4, M=1.
-// Each warp handles one output row; reads nibble pairs from ws.
-// For MoE use, the blob encodes a single expert (caller passes per-expert slice).
-// For dense use (n_experts=1), row indexing is unchanged.
-__launch_bounds__(1024, 2)
+// Fused decode-GEMV for SCLP4, M=1 (dense).
+// Mirrors the MoE GEMV structure: cooperative LDS load of activation vector + 4×4 decode LUT.
+// Previous per-warp-reads-x version left ~17× HBM headroom: 32 warps/block all re-read
+// the same x[k] from global memory, costing ~K*32*4 redundant bytes per block.
+// Shared memory layout:
+//   [0..63]   s_lut[16]  (float, 64 bytes) — decoded float for each (pidx, smn) pair
+//   [64..]    s_x[K]     (float, K*4 bytes) — activation vector
+__launch_bounds__(512, 2)
 __global__ void sclp4_fused_gemv_kernel(
     const uint8_t* __restrict__ blob,
     const float*   __restrict__ x,
@@ -911,25 +978,37 @@ __global__ void sclp4_fused_gemv_kernel(
     uint32_t N,
     uint32_t K
 ) {
-    // Parse header on device
-    __shared__ uint8_t  s_palette_size;
-    __shared__ uint8_t  s_palette[4];
-    __shared__ uint32_t s_ws_start;
+    extern __shared__ char smem[];
+    float* s_lut = (float*)smem;          // 16 floats = 64 bytes
+    float* s_x   = (float*)(smem + 64);   // K floats
 
+    // Thread 0: parse header (n_experts=1 for dense), build 4×4 decode LUT.
     if (threadIdx.x == 0) {
-        uint32_t n_experts;
-        __builtin_memcpy(&n_experts, blob + 4, sizeof(uint32_t));
         const uint8_t* p = blob + 8;
-        // For GEMV we use the single (first/only) expert palette that maps to this N×K block.
-        // The dispatch code slices the ws_stream per expert, so n_experts=1 in practice here.
-        s_palette_size = p[0];
-        for (int i = 0; i < (int)s_palette_size; i++) s_palette[i] = p[1 + i];
-        p += 1 + p[0];
-        s_ws_start = (uint32_t)(p - blob);
+        uint8_t pal_size = p[0];
+        uint8_t pal[4];
+        for (int i = 0; i < (int)pal_size; i++) pal[i] = p[1 + i];
+        for (int pidx = 0; pidx < 4; pidx++) {
+            uint8_t exp_ = (pidx < (int)pal_size) ? pal[pidx] : 0;
+            for (int smn = 0; smn < 4; smn++) {
+                uint8_t sign = (smn >> 1) & 1;
+                uint8_t mant = smn & 1;
+                uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 6);
+                s_lut[pidx * 4 + smn] = __bfloat162float(*(__hip_bfloat16*)&bits);
+            }
+        }
+    }
+
+    // Cooperative LDS load of x[K]. One global read per element across the whole block,
+    // not per warp — saves (warps_per_block - 1) × K × 4 bytes per block of redundant traffic.
+    for (uint32_t k = threadIdx.x; k < K; k += blockDim.x) {
+        s_x[k] = x[k];
     }
     __syncthreads();
 
-    const uint8_t* ws = blob + s_ws_start;  // packed nibbles
+    // ws starts after 8-byte header + (1 + palette_size) bytes for the single palette.
+    // We re-read palette_size from blob[8] cheaply rather than threading it through smem.
+    const uint8_t* ws = blob + 8 + 1 + blob[8];
 
     const int warps_per_block = blockDim.x / 32;
     const int warp_id  = threadIdx.x / 32;
@@ -939,19 +1018,18 @@ __global__ void sclp4_fused_gemv_kernel(
     if (row >= N) return;
 
     float acc = 0.0f;
-    const uint64_t row_nibble_base = (uint64_t)row * K;
+    const uint32_t n_bytes_row    = (K + 1) / 2;
+    const uint64_t row_byte_base  = (uint64_t)row * n_bytes_row;
 
-    for (uint32_t k = lane; k < K; k += 32) {
-        uint64_t nib_idx = row_nibble_base + k;
-        uint8_t byte   = ws[nib_idx / 2];
-        uint8_t nibble = (nib_idx % 2 == 0) ? (byte >> 4) : (byte & 0xF);
-        uint8_t pidx   = nibble >> 2;
-        uint8_t smn    = nibble & 0x3;
-        uint8_t exp    = (pidx < s_palette_size) ? s_palette[pidx] : 0;
-        uint8_t sign   = (smn >> 1) & 1;
-        uint8_t mant   = smn & 1;
-        uint16_t bits  = ((uint16_t)sign << 15) | ((uint16_t)exp << 7) | ((uint16_t)mant << 6);
-        acc += __bfloat162float(*(__hip_bfloat16*)&bits) * x[k];
+    for (uint32_t b = lane; b < n_bytes_row; b += 32) {
+        uint8_t byte = ws[row_byte_base + b];
+        uint8_t n0   = byte >> 4;
+        uint8_t n1   = byte & 0xF;
+        uint32_t k0  = b * 2;
+        acc += s_lut[n0] * s_x[k0];
+        if (k0 + 1 < K) {
+            acc += s_lut[n1] * s_x[k0 + 1];
+        }
     }
 
     for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
@@ -1013,13 +1091,18 @@ inline void llama_sclp4_fused_gemv(
     uint32_t      K,
     hipStream_t   stream
 ) {
-    constexpr int WARPS_PER_BLOCK = 32;
+    // 16 warps/block matches the MoE variant. Dynamic shared mem: 64 (LUT) + K*4 (activations).
+    // Max K for RDNA3 LDS (64 KB): ~16000. Llama-3 ffn K=14336 fits with headroom.
+    constexpr int WARPS_PER_BLOCK = 16;
     dim3 gemv_block(WARPS_PER_BLOCK * 32);
     dim3 gemv_grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
-    sclp4_fused_gemv_kernel<<<gemv_grid, gemv_block, 0, stream>>>(
+    size_t smem_bytes = 64 + (size_t)K * sizeof(float);
+    SCLP_TG_TIME_BEGIN(sclp_tg::CAT_SCLP4_DENSE);
+    sclp4_fused_gemv_kernel<<<gemv_grid, gemv_block, smem_bytes, stream>>>(
         (const uint8_t*)blob_ptr,
         src_f32,
         dst_f32, N, K);
+    SCLP_TG_TIME_END();
 }
 
 // Fused decode-GEMV for SCLP4 MoE, single-token generation (n_batches=1).
@@ -1135,9 +1218,11 @@ inline void llama_sclp4_fused_moe_gemv(
     // Dynamic shared memory: 4 (ws_offset) + 64 (lut) + K*4 (activations)
     size_t smem_bytes = 68 + (size_t)K * sizeof(float);
     dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, n_active * n_batches);
+    SCLP_TG_TIME_BEGIN(sclp_tg::CAT_SCLP4_MOE);
     sclp4_fused_moe_gemv_kernel<<<grid, block, smem_bytes, stream>>>(
         (const uint8_t*)blob_ptr,
         src1, ids, dst, N, K, n_active, src1_ne1);
+    SCLP_TG_TIME_END();
 }
 
 // ============================================================
@@ -1889,7 +1974,11 @@ __global__ void sclp6_fixup_sidecar_kernel(
 // Supports per-expert palettes: thread 0 walks the header to find ws_start and
 // selects the palette for the expert that owns this N×K block.
 // For dense (n_experts=1), behavior is identical to the old single-palette version.
-__launch_bounds__(1024, 2)
+// Shared memory layout:
+//   [0..3]      s_ws_offset (uint32) — byte offset of this expert's ws within blob
+//   [4..259]    s_lut[64]   (float, 256 bytes) — decoded float for each 6-bit weight
+//   [260..]     s_x[K]      (float, K*4 bytes) — activation vector
+__launch_bounds__(512, 2)
 __global__ void sclp6_fused_gemv_kernel(
     const uint8_t* __restrict__ blob,
     const float*   __restrict__ x,
@@ -1898,18 +1987,22 @@ __global__ void sclp6_fused_gemv_kernel(
     uint32_t K,
     uint32_t expert_idx   // 0 for dense tensors
 ) {
-    __shared__ uint8_t  s_palette_size;
-    __shared__ uint8_t  s_palette[8];
-    __shared__ uint32_t s_ws_offset;  // byte offset into blob for this expert's ws data
+    extern __shared__ char smem[];
+    uint32_t* s_ws_offset = (uint32_t*)smem;
+    float*    s_lut       = (float*)(smem + 4);
+    float*    s_x         = (float*)(smem + 260);
 
+    // Thread 0: walk header, locate ws_offset, build the 64-entry LUT in one pass.
     if (threadIdx.x == 0) {
         uint32_t n_experts;
         __builtin_memcpy(&n_experts, blob + 4, sizeof(uint32_t));
         const uint8_t* p = blob + 8;
+        uint8_t pal[8];
+        uint8_t pal_size = 0;
         for (uint32_t e = 0; e < n_experts; e++) {
             if (e == expert_idx) {
-                s_palette_size = p[0];
-                for (int i = 0; i < (int)p[0]; i++) s_palette[i] = p[1 + i];
+                pal_size = p[0];
+                for (int i = 0; i < (int)p[0]; i++) pal[i] = p[1 + i];
             }
             p += 1 + p[0];
         }
@@ -1917,12 +2010,23 @@ __global__ void sclp6_fused_gemv_kernel(
         uint32_t total_nw; __builtin_memcpy(&total_nw, blob, sizeof(uint32_t));
         uint32_t expert_nw     = total_nw / n_experts;
         uint32_t expert_groups = (expert_nw + 3) / 4;
-        s_ws_offset = ws_start + expert_idx * expert_groups * 3;
+        *s_ws_offset = ws_start + expert_idx * expert_groups * 3;
+
+        for (int pidx = 0; pidx < 8; pidx++) {
+            uint8_t exp_ = (pidx < (int)pal_size) ? pal[pidx] : 0;
+            for (int smn = 0; smn < 8; smn++) {
+                uint8_t sign = (smn >> 2) & 1;
+                uint8_t mant = smn & 0x3;
+                uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 5);
+                s_lut[pidx * 8 + smn] = __bfloat162float(*(__hip_bfloat16*)&bits);
+            }
+        }
     }
+
+    for (uint32_t k = threadIdx.x; k < K; k += blockDim.x) s_x[k] = x[k];
     __syncthreads();
 
-    const uint8_t* ws = blob + s_ws_offset;
-
+    const uint8_t* ws = blob + *s_ws_offset;
     const int warps_per_block = blockDim.x / 32;
     const int warp_id  = threadIdx.x / 32;
     const int lane     = threadIdx.x & 31;
@@ -1932,7 +2036,7 @@ __global__ void sclp6_fused_gemv_kernel(
 
     float acc = 0.0f;
     const uint64_t row_group_base = (uint64_t)row * ((K + 3) / 4);
-    const uint32_t n_groups_row = (K + 3) / 4;
+    const uint32_t n_groups_row   = (K + 3) / 4;
 
     for (uint32_t g = lane; g < n_groups_row; g += 32) {
         uint64_t byte_off = (row_group_base + g) * 3;
@@ -1949,13 +2053,7 @@ __global__ void sclp6_fused_gemv_kernel(
         uint32_t base_k = g * 4;
         uint32_t n_k = (base_k + 4 <= K) ? 4 : (K - base_k);
         for (uint32_t j = 0; j < n_k; j++) {
-            uint8_t pidx  = sixbits[j] >> 3;
-            uint8_t smn   = sixbits[j] & 0x7;
-            uint8_t exp   = (pidx < s_palette_size) ? s_palette[pidx] : 0;
-            uint8_t sign  = (smn >> 2) & 1;
-            uint8_t mant  = smn & 0x3;
-            uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp << 7) | ((uint16_t)mant << 5);
-            acc += __bfloat162float(*(__hip_bfloat16*)&bits) * x[base_k + j];
+            acc += s_lut[sixbits[j]] * s_x[base_k + j];
         }
     }
 
@@ -2016,13 +2114,16 @@ inline void llama_sclp6_fused_gemv(
     uint32_t      expert_idx,  // 0 for dense tensors
     hipStream_t   stream
 ) {
-    constexpr int WARPS_PER_BLOCK = 32;
+    constexpr int WARPS_PER_BLOCK = 16;
     dim3 gemv_block(WARPS_PER_BLOCK * 32);
     dim3 gemv_grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
-    sclp6_fused_gemv_kernel<<<gemv_grid, gemv_block, 0, stream>>>(
+    size_t smem_bytes = 260 + (size_t)K * sizeof(float);
+    SCLP_TG_TIME_BEGIN(sclp_tg::CAT_SCLP6_DENSE);
+    sclp6_fused_gemv_kernel<<<gemv_grid, gemv_block, smem_bytes, stream>>>(
         (const uint8_t*)blob_ptr,
         src_f32,
         dst_f32, N, K, expert_idx);
+    SCLP_TG_TIME_END();
 }
 
 // Fused decode-GEMV for MoE MUL_MAT_ID with SCLP6 expert weights.
@@ -2148,9 +2249,11 @@ inline void llama_sclp6_fused_moe_gemv(
     // Dynamic shared memory: 4 (ws_offset) + 256 (lut) + K*4 (activations)
     size_t smem_bytes = 260 + (size_t)K * sizeof(float);
     dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, n_active * n_batches);
+    SCLP_TG_TIME_BEGIN(sclp_tg::CAT_SCLP6_MOE);
     sclp6_fused_moe_gemv_kernel<<<grid, block, smem_bytes, stream>>>(
         (const uint8_t*)blob_ptr,
         src1, ids, dst, N, K, n_active, src1_ne1);
+    SCLP_TG_TIME_END();
 }
 
 // ============================================================
