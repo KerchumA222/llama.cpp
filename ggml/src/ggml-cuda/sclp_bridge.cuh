@@ -1754,6 +1754,193 @@ __global__ void sclp4_moe_sidecar_correct_kernel(
     }
 }
 
+// Blocked sidecar correction. One block per fused-output tile (n_tile, m_tile).
+// Each block:
+//   1. Resolves its expert e from m_base (same as fused).
+//   2. Cooperatively scans the sidecar list, filtering for (expert==e AND
+//      n_e in [n_base, n_base+TILE)). Stores matches in LDS.
+//   3. For each (m_local, n_e) cell it owns, scans LDS matches and accumulates
+//      the correction. Non-atomic dst[mg, n_e] += correction.
+// Since each (mg, n_e) cell maps to exactly one (n_tile, m_tile), no atomic.
+// Replaces sclp4_moe_sidecar_correct_kernel's per-sidecar atomicAdd loop, which
+// was the ~92% bottleneck of fused MoE prefill time.
+__launch_bounds__(128, 1)
+
+__launch_bounds__(128, 1)
+__global__ void sclp4_moe_sidecar_correct_blocked_kernel(
+    const uint8_t* __restrict__ blob,
+    const float*   __restrict__ src1,
+    const int32_t* __restrict__ perm,
+    const int32_t* __restrict__ expert_offsets,
+    float*         __restrict__ dst,
+    uint32_t N, uint32_t K, uint32_t n_active, uint32_t src1_ne1, uint32_t n_experts
+) {
+    constexpr int TILE = 16;
+    constexpr int MAX_SC_PER_BLOCK = 4096;
+
+    const uint32_t m_tile = blockIdx.y;
+    const uint32_t m_base = m_tile * TILE;
+    int32_t e = -1;
+    for (uint32_t ei = 0; ei < n_experts; ei++) {
+        if ((uint32_t)expert_offsets[ei] <= m_base && m_base < (uint32_t)expert_offsets[ei + 1]) {
+            e = (int32_t)ei;
+            break;
+        }
+    }
+    if (e < 0) return;
+
+    __shared__ uint32_t s_total_nw;
+    __shared__ uint32_t s_ne;
+    __shared__ uint32_t s_ws_start;
+    __shared__ uint8_t  s_palette[4];
+    __shared__ uint8_t  s_palette_size;
+    __shared__ uint32_t s_ws_offset_e;
+    __shared__ int32_t  s_m_global[TILE];
+    __shared__ uint32_t s_sc_n_e[MAX_SC_PER_BLOCK];
+    __shared__ uint32_t s_sc_k[MAX_SC_PER_BLOCK];
+    __shared__ float    s_sc_delta[MAX_SC_PER_BLOCK];
+    __shared__ uint32_t s_sc_count;
+    __shared__ uint32_t s_sc_range_begin;
+    __shared__ uint32_t s_sc_range_end;
+
+    if (threadIdx.x == 0) {
+        uint32_t total_nw, ne;
+        __builtin_memcpy(&total_nw, blob,     sizeof(uint32_t));
+        __builtin_memcpy(&ne,       blob + 4, sizeof(uint32_t));
+        s_total_nw = total_nw;
+        s_ne = ne;
+        const uint8_t* p = blob + 8;
+        for (uint32_t ei = 0; ei < ne; ei++) {
+            if (ei == (uint32_t)e) {
+                s_palette_size = p[0];
+                for (int i = 0; i < (int)p[0] && i < 4; i++) s_palette[i] = p[1 + i];
+            }
+            p += 1 + p[0];
+        }
+        uint32_t ws_start = (uint32_t)(p - blob);
+        s_ws_start = ws_start;
+        uint32_t expert_nw = total_nw / ne;
+        uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
+        s_ws_offset_e = ws_start + (uint32_t)e * expert_nibble_bytes;
+
+        // Inline binary search for this expert's sidecar range.
+        uint64_t total_ws_bytes = (uint64_t)ne * expert_nibble_bytes;
+        const uint8_t* sc_base = blob + ws_start + total_ws_bytes;
+        uint32_t sc_total;
+        __builtin_memcpy(&sc_total, sc_base, sizeof(uint32_t));
+        const uint8_t* sc_idx = sc_base + 4;
+
+        uint32_t target_lo = (uint32_t)e * expert_nw;
+        uint32_t target_hi = ((uint32_t)e + 1) * expert_nw;
+
+        // lower_bound for target_lo
+        uint32_t lo = 0, hi = sc_total;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            uint32_t val;
+            __builtin_memcpy(&val, sc_idx + (uint64_t)mid * 4, 4);
+            if (val < target_lo) lo = mid + 1; else hi = mid;
+        }
+        s_sc_range_begin = lo;
+
+        // lower_bound for target_hi
+        lo = s_sc_range_begin; hi = sc_total;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            uint32_t val;
+            __builtin_memcpy(&val, sc_idx + (uint64_t)mid * 4, 4);
+            if (val < target_hi) lo = mid + 1; else hi = mid;
+        }
+        s_sc_range_end = lo;
+        s_sc_count = 0;
+    }
+    if (threadIdx.x < TILE) {
+        uint32_t m_g = m_base + threadIdx.x;
+        s_m_global[threadIdx.x] = perm[m_g];
+    }
+    __syncthreads();
+
+    const uint32_t sc_begin = s_sc_range_begin;
+    const uint32_t sc_end   = s_sc_range_end;
+    if (sc_begin >= sc_end) return;
+
+    const uint32_t expert_nw = s_total_nw / s_ne;
+    const uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
+    const uint64_t total_ws_bytes = (uint64_t)s_ne * expert_nibble_bytes;
+    const uint8_t* sidecar_base = blob + s_ws_start + total_ws_bytes;
+    uint32_t sc_total;
+    __builtin_memcpy(&sc_total, sidecar_base, sizeof(uint32_t));
+    const uint8_t* sc_idx_base = sidecar_base + 4;
+    const uint8_t* sc_val_base = sc_idx_base + (uint64_t)sc_total * sizeof(uint32_t);
+    const uint8_t* ws_e = blob + s_ws_offset_e;
+
+    const uint32_t n_base = (uint32_t)blockIdx.x * TILE;
+    const uint32_t n_end  = min(n_base + (uint32_t)TILE, N);
+
+    // Only scan this expert's sidecar range (not the full sidecar list).
+    const uint32_t range_size = sc_end - sc_begin;
+    for (uint32_t ri = threadIdx.x; ri < range_size; ri += blockDim.x) {
+        uint32_t i = sc_begin + ri;
+        uint32_t global_idx;
+        __builtin_memcpy(&global_idx, sc_idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint32_t));
+
+        uint32_t local = global_idx - (uint32_t)e * expert_nw;
+        uint32_t n_e = local / K;
+        if (n_e < n_base || n_e >= n_end) continue;
+
+        uint32_t k = local % K;
+        uint16_t correct_bits;
+        __builtin_memcpy(&correct_bits, sc_val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint16_t));
+
+        uint64_t w_idx = (uint64_t)n_e * K + k;
+        uint8_t byte = ws_e[w_idx >> 1];
+        uint8_t nib  = (w_idx & 1) ? (byte & 0xF) : (byte >> 4);
+        uint8_t pidx = nib >> 2;
+        uint8_t smn  = nib & 0x3;
+        uint8_t exp_a = (pidx < s_palette_size) ? s_palette[pidx] : 0;
+        uint8_t sign_a = (smn >> 1) & 1;
+        uint8_t mant_a = smn & 1;
+        uint16_t approx_bits = ((uint16_t)sign_a << 15) | ((uint16_t)exp_a << 7) | ((uint16_t)mant_a << 6);
+
+        float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
+        float w_approx  = __bfloat162float(*(__hip_bfloat16*)&approx_bits);
+        float w_delta   = w_correct - w_approx;
+        if (w_delta == 0.f) continue;
+
+        uint32_t slot = atomicAdd(&s_sc_count, 1);
+        if (slot >= MAX_SC_PER_BLOCK) continue;
+        s_sc_n_e[slot] = n_e;
+        s_sc_k[slot]   = k;
+        s_sc_delta[slot] = w_delta;
+    }
+    __syncthreads();
+
+    const uint32_t sc_count = min(s_sc_count, (uint32_t)MAX_SC_PER_BLOCK);
+    if (sc_count == 0) return;
+
+    for (uint32_t cell_idx = threadIdx.x; cell_idx < (uint32_t)TILE * (uint32_t)TILE; cell_idx += blockDim.x) {
+        uint32_t n_local = cell_idx / TILE;
+        uint32_t m_local = cell_idx % TILE;
+        uint32_t n_e = n_base + n_local;
+        if (n_e >= N) continue;
+        int32_t mg = s_m_global[m_local];
+        if (mg < 0) continue;
+
+        uint32_t i_active = (uint32_t)mg % n_active;
+        uint32_t i_batch  = (uint32_t)mg / n_active;
+        const float* x_row = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
+
+        float correction = 0.f;
+        for (uint32_t s = 0; s < sc_count; s++) {
+            if (s_sc_n_e[s] != n_e) continue;
+            correction += s_sc_delta[s] * x_row[s_sc_k[s]];
+        }
+        if (correction != 0.f) {
+            dst[(uint64_t)mg * N + n_e] += correction;
+        }
+    }
+}
+
 // Launcher for fused SCLP4 MoE WMMA prefill. Requires routing-sort scratch
 // allocated by caller (perm + expert_offsets in the CUDA pool).
 inline void llama_sclp4_fused_moe_wmma(
@@ -1811,12 +1998,27 @@ inline void llama_sclp4_fused_moe_wmma(
 
     // Apply sidecar corrections: ~1-2% of weights need exact-value restoration to
     // match the two-pass path's PPL.
-    static const bool skip_sidecar = getenv("SCLP_FUSED_MOE_NO_SIDECAR") != nullptr;
+    static const bool skip_sidecar    = getenv("SCLP_FUSED_MOE_NO_SIDECAR") != nullptr;
+    static const bool legacy_sidecar  = getenv("SCLP_FUSED_MOE_SIDECAR_LEGACY") != nullptr;
     if (!skip_sidecar) {
-        sclp4_moe_sidecar_correct_kernel<<<32, 256, 0, stream>>>(
-            (const uint8_t*)blob_ptr,
-            src1, perm_scratch, expert_offsets_scratch, dst,
-            N, K, n_active, src1_ne1, n_experts, sidecar_mode);
+        if (legacy_sidecar) {
+            // Original per-sidecar-weight kernel with atomicAdd over routed slots.
+            // Kept for A/B comparison; the blocked kernel below is the default.
+            sclp4_moe_sidecar_correct_kernel<<<32, 256, 0, stream>>>(
+                (const uint8_t*)blob_ptr,
+                src1, perm_scratch, expert_offsets_scratch, dst,
+                N, K, n_active, src1_ne1, n_experts, sidecar_mode);
+        } else {
+            // Blocked sidecar with inline per-expert binary search.
+            constexpr int SC_TILE = 16;
+            const uint32_t sc_m_tile_count = (total_slots + n_experts * SC_TILE + SC_TILE - 1) / SC_TILE;
+            dim3 sc_block(128);
+            dim3 sc_grid((N + SC_TILE - 1) / SC_TILE, sc_m_tile_count);
+            sclp4_moe_sidecar_correct_blocked_kernel<<<sc_grid, sc_block, 0, stream>>>(
+                (const uint8_t*)blob_ptr,
+                src1, perm_scratch, expert_offsets_scratch, dst,
+                N, K, n_active, src1_ne1, n_experts);
+        }
     }
 }
 
