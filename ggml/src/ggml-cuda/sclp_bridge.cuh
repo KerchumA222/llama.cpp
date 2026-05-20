@@ -76,7 +76,7 @@ inline int _sclp_tg_atexit_register = sclp_tg::register_atexit();
 //
 // Wire format (SCLP blob stored in VRAM):
 //   [uint32 num_weights][uint8 palette_size][palette (palette_size bytes)]
-//   [packed_indices (ceil(num_weights/2) bytes)][sm_stream (num_weights bytes)]
+//   [ws_stream (num_weights bytes): palette_idx(7:4) | smn(3:0)]
 //   [uint32 sidecar_count]
 //   [uint32 × sidecar_count sidecar_indices]
 //   [uint16 × sidecar_count sidecar_values]
@@ -98,20 +98,28 @@ __global__ void sclp_decode_blob_kernel(
     uint16_t*      __restrict__ output,
     uint32_t                    num_weights
 ) {
-    __shared__ uint8_t palette_size_s;
-    __shared__ uint8_t s_palette[16];
+    __shared__ uint32_t s_n_experts;
+    __shared__ uint32_t s_ws_start;
+    __shared__ uint8_t  s_palette_sizes[128];
+    __shared__ uint8_t  s_palettes[128][16];
+    __shared__ uint32_t s_expert_nw;
 
     if (threadIdx.x == 0) {
-        palette_size_s = blob[4];
+        uint32_t ne;
+        __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
+        s_n_experts = ne;
+        const uint8_t* p = blob + 8;
+        for (uint32_t e = 0; e < ne && e < 128; e++) {
+            s_palette_sizes[e] = p[0];
+            for (int i = 0; i < (int)s_palette_sizes[e]; i++) s_palettes[e][i] = p[1 + i];
+            p += 1 + p[0];
+        }
+        s_ws_start = (uint32_t)(p - blob);
+        s_expert_nw = num_weights / ne;
     }
     __syncthreads();
 
-    if (threadIdx.x < palette_size_s) {
-        s_palette[threadIdx.x] = blob[5 + threadIdx.x];
-    }
-    __syncthreads();
-
-    const uint8_t* ws = blob + 5 + palette_size_s;  // ws_stream: N bytes
+    const uint8_t* ws = blob + s_ws_start;
 
     // Each thread handles 8 weights via a single uint64_t load
     const uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -119,15 +127,21 @@ __global__ void sclp_decode_blob_kernel(
 
     if (base_idx >= num_weights) return;
 
+    const uint32_t expert_nw = s_expert_nw;
+    const uint32_t e         = base_idx / expert_nw;
+    const uint32_t local_idx = base_idx % expert_nw;
+
+    if (e >= s_n_experts) return;
+
     uint64_t ws8 = 0;
-    uint32_t remaining = num_weights - base_idx;
-    __builtin_memcpy(&ws8, ws + base_idx, min(8u, remaining));
+    uint32_t remaining = expert_nw - local_idx;
+    __builtin_memcpy(&ws8, ws + (uint64_t)e * expert_nw + local_idx, min(8u, remaining));
 
     uint16_t out[8];
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         uint8_t b   = (uint8_t)(ws8 >> (i * 8));
-        uint8_t exp = s_palette[b >> 4];
+        uint8_t exp = s_palettes[e][b >> 4];
         uint8_t smn = b & 0x0F;
         out[i] = ((uint16_t)(smn >> 3) << 15) | ((uint16_t)exp << 7) | ((uint16_t)(smn & 0x7) << 4);
     }
@@ -151,16 +165,20 @@ __global__ void sclp_fixup_sidecar_kernel(
     uint16_t*      __restrict__ output,
     uint32_t                    num_weights
 ) {
-    __shared__ uint8_t  palette_size_s;
+    __shared__ uint32_t s_ws_start;
     __shared__ uint32_t sidecar_count_s;
 
     if (threadIdx.x == 0) {
-        palette_size_s = blob[4];
+        uint32_t ne;
+        __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
+        const uint8_t* p = blob + 8;
+        for (uint32_t ei = 0; ei < ne; ei++) p += 1 + p[0];
+        s_ws_start = (uint32_t)(p - blob);
     }
     __syncthreads();
 
-    const uint8_t* ws           = blob + 5 + palette_size_s;
-    const uint8_t* sidecar_base = ws + num_weights;  // ws_stream is N bytes (1 per weight)
+    const uint8_t* ws           = blob + s_ws_start;
+    const uint8_t* sidecar_base = ws + num_weights;  // ws_stream is num_weights bytes (1 per weight)
 
     if (threadIdx.x == 0) {
         uint32_t sc;
@@ -234,22 +252,33 @@ __global__ void sclp_fused_gemv_kernel(
     float* s_x   = (float*)(smem + 1024); // K floats
 
     // Threads 0..15 build the LUT collaboratively (one palette entry each).
+    // For GEMV, we assume n_experts=1 since it's the dense kernel.
+    __shared__ uint32_t s_ws_start;
     if (threadIdx.x < 16) {
-        uint8_t pal_size = blob[4];
+        uint32_t ne;
+        __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
+        const uint8_t* p = blob + 8;
+        uint8_t pal_size = p[0];
         uint8_t pidx     = (uint8_t)threadIdx.x;
-        uint8_t exp_     = (pidx < pal_size) ? blob[5 + pidx] : 0;
+        uint8_t exp_     = (pidx < pal_size) ? p[1 + pidx] : 0;
         for (int smn = 0; smn < 16; smn++) {
             uint8_t sign = (smn >> 3) & 1;
             uint8_t mant = smn & 0x7;
             uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 4);
             s_lut[(int)pidx * 16 + smn] = __bfloat162float(*(__hip_bfloat16*)&bits);
         }
+        if (threadIdx.x == 0) {
+            // ws_start for ne experts (only used for ne=1 here)
+            const uint8_t* p_ws = blob + 8;
+            for (uint32_t ei = 0; ei < ne; ei++) p_ws += 1 + p_ws[0];
+            s_ws_start = (uint32_t)(p_ws - blob);
+        }
     }
 
     for (uint32_t k = threadIdx.x; k < K; k += blockDim.x) s_x[k] = x[k];
     __syncthreads();
 
-    const uint8_t* ws = blob + 5 + blob[4];  // ws_stream: N*K bytes
+    const uint8_t* ws = blob + s_ws_start;  // ws_stream: N*K bytes
 
     const int warps_per_block = blockDim.x / 32;
     const int warp_id  = threadIdx.x / 32;
@@ -288,16 +317,23 @@ __global__ void sclp_sidecar_correct_gemm_kernel(
     float*                             Y,  // F32 output [M × N], updated atomically
     uint32_t N, uint32_t K, uint32_t M
 ) {
-    __shared__ uint8_t  s_palette_size;
+    __shared__ uint32_t s_ws_start;
     __shared__ uint32_t s_sidecar_count;
     __shared__ uint8_t  s_palette[16];
 
-    if (threadIdx.x == 0) s_palette_size = blob[4];
-    __syncthreads();
-    if (threadIdx.x < (uint32_t)s_palette_size) s_palette[threadIdx.x] = blob[5 + threadIdx.x];
+    if (threadIdx.x == 0) {
+        uint32_t ne;
+        __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
+        const uint8_t* p = blob + 8;
+        // Sidecar kernel is currently only used for Dense (n_experts=1) SCLP8.
+        // We parse expert 0's palette.
+        for (int i = 0; i < (int)p[0]; i++) s_palette[i] = p[1 + i];
+        for (uint32_t ei = 0; ei < ne; ei++) p += 1 + p[0];
+        s_ws_start = (uint32_t)(p - blob);
+    }
     __syncthreads();
 
-    const uint8_t* ws           = blob + 5 + s_palette_size;
+    const uint8_t* ws = blob + s_ws_start;
     const uint8_t* sidecar_base = ws + (uint64_t)N * K;  // ws_stream is N*K bytes
 
     if (threadIdx.x == 0) {
@@ -375,15 +411,25 @@ __global__ void sclp_fused_gemm_kernel(
     float*                __restrict__ Y,   // [M × N] output, row-major
     uint32_t N, uint32_t K, uint32_t M
 ) {
-    __shared__ uint8_t s_palette_size;
-    __shared__ uint8_t s_palette[16];
+    __shared__ uint32_t s_ws_start;
+    __shared__ uint8_t  s_palette[16];
 
-    if (threadIdx.x == 0) s_palette_size = blob[4];
-    __syncthreads();
-    if (threadIdx.x < (uint32_t)s_palette_size) s_palette[threadIdx.x] = blob[5 + threadIdx.x];
+    if (threadIdx.x < 16) {
+        uint32_t ne;
+        __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
+        const uint8_t* p = blob + 8;
+        uint8_t pal_size = p[0];
+        uint8_t pidx     = (uint8_t)threadIdx.x;
+        s_palette[pidx]  = (pidx < pal_size) ? p[1 + pidx] : 0;
+        if (threadIdx.x == 0) {
+            const uint8_t* p_ws = blob + 8;
+            for (uint32_t ei = 0; ei < ne; ei++) p_ws += 1 + p_ws[0];
+            s_ws_start = (uint32_t)(p_ws - blob);
+        }
+    }
     __syncthreads();
 
-    const uint8_t* ws = blob + 5 + s_palette_size;  // ws_stream: N*K bytes, 1 per weight
+    const uint8_t* ws = blob + s_ws_start;  // ws_stream: N*K bytes, 1 per weight
 
     const int warp_id      = threadIdx.x / 32;
     const int lane         = threadIdx.x & 31;
@@ -522,15 +568,28 @@ __global__ void sclp_fused_moe_gemv_kernel(
     float*         __restrict__ dst,    // [N × n_active × n_batches]
     uint32_t N, uint32_t K, uint32_t n_active, uint32_t src1_ne1
 ) {
-    __shared__ uint8_t s_palette_size;
-    __shared__ uint8_t s_palette[16];
+    __shared__ uint32_t s_ws_start;
+    __shared__ uint8_t  s_palette[16];
 
-    if (threadIdx.x == 0) s_palette_size = blob[4];
-    __syncthreads();
-    if (threadIdx.x < (uint32_t)s_palette_size) s_palette[threadIdx.x] = blob[5 + threadIdx.x];
+    // blockIdx.x = row group, blockIdx.y = flat index (i_active + i_batch * n_active)
+    const uint32_t flat = blockIdx.y;
+    const int32_t  e    = ids[flat];
+
+    if (threadIdx.x == 0) {
+        uint32_t ne;
+        __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
+        const uint8_t* p = blob + 8;
+        for (uint32_t ei = 0; ei < ne; ei++) {
+            if ((int32_t)ei == e) {
+                for (int i = 0; i < (int)p[0]; i++) s_palette[i] = p[1 + i];
+            }
+            p += 1 + p[0];
+        }
+        s_ws_start = (uint32_t)(p - blob);
+    }
     __syncthreads();
 
-    const uint8_t* ws = blob + 5 + s_palette_size;
+    const uint8_t* ws = blob + s_ws_start;
 
     const int warps_per_block = blockDim.x / 32;
     const int warp_id = threadIdx.x / 32;
@@ -538,14 +597,12 @@ __global__ void sclp_fused_moe_gemv_kernel(
 
     // blockIdx.x = row group, blockIdx.y = flat index (i_active + i_batch * n_active)
     const uint32_t row    = (uint32_t)blockIdx.x * warps_per_block + warp_id;
-    const uint32_t flat   = blockIdx.y;  // flat (i_active, i_batch) index
 
     if (row >= N) return;
 
     const uint32_t i_active = flat % n_active;
     const uint32_t i_batch  = flat / n_active;
 
-    const int32_t e = ids[flat];
     // ws index for weight (k, row, e): k + row*K + e*N*K
     const uint64_t ws_base = (uint64_t)e * N * K + (uint64_t)row * K;
     const float* x = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
@@ -649,19 +706,28 @@ __global__ void sclp_fused_wmma_kernel(
     constexpr int BLOCK_N   = WMMA_WARPS_N * WMMA_TILE;  // 32
     constexpr int BLOCK_M   = WMMA_WARPS_M * WMMA_TILE;  // 32
 
-    __shared__ uint8_t s_palette_size;
-    __shared__ uint8_t s_palette[16];
+    __shared__ uint32_t s_ws_start;
+    __shared__ uint8_t  s_palette[16];
     // Transposed activation tile: s_XT[k_local][m_local] = X[block_m+m_local][k16+k_local]
     // +1 column padding avoids LDS bank conflicts on the 32-bank RDNA3 layout.
     __shared__ __hip_bfloat16 s_XT[WMMA_TILE][BLOCK_M + 1];
 
-    if (threadIdx.x == 0) s_palette_size = blob[4];
-    __syncthreads();
-    if (threadIdx.x < (uint32_t)s_palette_size) s_palette[threadIdx.x] = blob[5 + threadIdx.x];
+    if (threadIdx.x < 16) {
+        uint32_t ne;
+        __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
+        const uint8_t* p = blob + 8;
+        uint8_t pal_size = p[0];
+        uint8_t pidx     = (uint8_t)threadIdx.x;
+        s_palette[pidx]  = (pidx < pal_size) ? p[1 + pidx] : 0;
+        if (threadIdx.x == 0) {
+            const uint8_t* p_ws = blob + 8;
+            for (uint32_t ei = 0; ei < ne; ei++) p_ws += 1 + p_ws[0];
+            s_ws_start = (uint32_t)(p_ws - blob);
+        }
+    }
     __syncthreads();
 
-    const uint8_t* packed = blob + 5 + s_palette_size;
-    const uint8_t* sm     = packed + ((uint64_t)(N * K + 1) / 2);
+    const uint8_t* ws = blob + s_ws_start;  // ws_stream: N*K bytes, 1 per weight
 
     const int warp_id  = threadIdx.x / 32;
     const int lane     = threadIdx.x & 31;
@@ -705,12 +771,12 @@ __global__ void sclp_fused_wmma_kernel(
             const uint32_t kg = k16 + j;
             if (n_row < N && kg < K) {
                 uint64_t w_idx = (uint64_t)n_row * K + kg;
-                uint8_t pb     = packed[w_idx >> 1];
-                uint8_t p_idx  = (w_idx & 1) ? (pb & 0x0F) : (pb >> 4);
-                uint8_t sm_val = sm[w_idx];
-                uint16_t bits  = ((uint16_t)(sm_val >> 7) << 15)
+                uint8_t b      = ws[w_idx];
+                uint8_t p_idx  = b >> 4;
+                uint8_t smn    = b & 0x0F;
+                uint16_t bits  = ((uint16_t)(smn >> 3) << 15)
                                | ((uint16_t)s_palette[p_idx] << 7)
-                               | (sm_val & 0x7F);
+                               | ((uint16_t)(smn & 0x7) << 4);
                 a_frag[j] = *(const __bf16*)&bits;
             } else {
                 a_frag[j] = (__bf16)0.f;
