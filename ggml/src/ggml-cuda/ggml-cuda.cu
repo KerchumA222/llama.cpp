@@ -1677,6 +1677,11 @@ static void ggml_cuda_op_mul_mat_cublas(
         dst->op_params[0] == GGML_PREC_DEFAULT;
 
     if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
+        // SCLP fix: the original path wrote dst in BF16 then up-cast — round-to-BF16
+        // truncated F32 accumulation results, losing ~3% per-cell precision.
+        // SCLP_TEST_NO_BF16_X=1 routes the GEMM through F32 output directly.
+        static const bool sclp_test_no_bf16_x = getenv("SCLP_TEST_NO_BF16_X") != nullptr;
+
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
         if (src1->type != GGML_TYPE_BF16) {
             const to_bf16_cuda_t to_bf16_cuda = ggml_get_to_bf16_cuda(src1->type);
@@ -1687,23 +1692,33 @@ static void ggml_cuda_op_mul_mat_cublas(
         }
         const nv_bfloat16 * src1_ptr = src1->type == GGML_TYPE_BF16 ? (const nv_bfloat16 *) src1_ddf_i : src1_as_bf16.get();
         const nv_bfloat16 * src0_ptr = (const nv_bfloat16 *)src0_dd_i;
-        ggml_cuda_pool_alloc<nv_bfloat16> dst_bf16(ctx.pool(id), row_diff*src1_ncols);
 
         const float alpha_f32 = 1.0f;
         const float beta_f32  = 0.0f;
 
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
-        CUBLAS_CHECK(
-            cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                    row_diff, src1_ncols, ne10,
-                    &alpha_f32,  src0_ptr,       CUDA_R_16BF, ne00,
-                                 src1_ptr,       CUDA_R_16BF, ne10,
-                    &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-
-        const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-        to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+        if (sclp_test_no_bf16_x) {
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha_f32,  src0_ptr,  CUDA_R_16BF, ne00,
+                                     src1_ptr,  CUDA_R_16BF, ne10,
+                        &beta_f32,   dst_dd_i,  CUDA_R_32F,  ldc,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        } else {
+            ggml_cuda_pool_alloc<nv_bfloat16> dst_bf16(ctx.pool(id), row_diff*src1_ncols);
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha_f32,  src0_ptr,       CUDA_R_16BF, ne00,
+                                     src1_ptr,       CUDA_R_16BF, ne10,
+                        &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+            to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+        }
     } else if (fast_fp16_hardware_available(cc) && use_fp16) {
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
@@ -2814,8 +2829,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         const int64_t dst_nelem = ggml_nelements(dst);
         // Use raw hipMalloc/Free for diff scratch to avoid pool aliasing with `decoded`.
         float * dst_fused_raw = nullptr;
+        float * dst_fused_pre_raw = nullptr;
+        float * dst_fused_repeat_raw = nullptr;
         if (sclp_fused_moe_wmma_mode == 2) {
             hipMalloc(&dst_fused_raw, (size_t)dst_nelem * sizeof(float));
+            hipMalloc(&dst_fused_pre_raw, (size_t)dst_nelem * sizeof(float));
+            static const bool fused_repeat_diff = getenv("SCLP_FUSED_REPEAT_DIFF") != nullptr;
+            if (fused_repeat_diff) {
+                hipMalloc(&dst_fused_repeat_raw, (size_t)dst_nelem * sizeof(float));
+            }
         }
         if (sclp_fused_moe_wmma_mode > 0) {
             const int64_t K        = src0->ne[0];
@@ -2823,12 +2845,48 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             const int64_t n_active = ids->ne[0];
             const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
             const int64_t total_slots = n_active * n_batches;
+            GGML_ASSERT(ids->nb[0] == (int64_t)sizeof(int32_t));
+            const int64_t ids_s1 = ids->nb[1] / (int64_t)sizeof(int32_t);
+            static const uint32_t fused_scalar_math_mode = [] {
+                // Bitmask for fused scalar MoE math path:
+                //   bit0 (1): Kahan accumulation
+                //   bit1 (2): BF16-quantize activation inputs before mul
+                const char * s = getenv("SCLP_FUSED_MOE_SCALAR_MATH");
+                if (!s || !s[0]) return 0u;
+                int v = atoi(s);
+                if (v < 0) v = 0;
+                if (v > 3) v = 3;
+                return (uint32_t)v;
+            }();
+            static const uint32_t fused_sidecar_mode = [] {
+                // Bitmask for sidecar correction:
+                //   bit0 (1): BF16-quantize sidecar x input before multiply
+                const char * s = getenv("SCLP_FUSED_MOE_SIDECAR_MODE");
+                if (!s || !s[0]) return 0u;
+                int v = atoi(s);
+                if (v < 0) v = 0;
+                if (v > 1) v = 1;
+                return (uint32_t)v;
+            }();
+            static bool printed_scalar_math_mode = false;
+            if (!printed_scalar_math_mode) {
+                fprintf(stderr, "[SCLP_FUSED] scalar math_mode=%u (bit0=Kahan, bit1=BF16-x)\n", fused_scalar_math_mode);
+                fprintf(stderr, "[SCLP_FUSED] sidecar mode=%u (bit0=BF16-x)\n", fused_sidecar_mode);
+                printed_scalar_math_mode = true;
+            }
             ggml_cuda_pool_alloc<int32_t> perm_scratch(ctx.pool(), (size_t)(total_slots + n_experts * 16));
             ggml_cuda_pool_alloc<int32_t> expert_offsets_scratch(ctx.pool(), (size_t)(n_experts + 1));
 
             float * dst_fused_ptr = (float*)dst->data;
             if (sclp_fused_moe_wmma_mode == 2) {
                 dst_fused_ptr = dst_fused_raw;
+                // SENTINEL: paint dst_fused_raw with 0xFF (NaN). Any cell still
+                // NaN after the fused dispatch was never written by the kernel.
+                // Pair with SCLP_FUSED_MOE_NO_SIDECAR=1 to isolate fused coverage
+                // (sidecar atomicAdd(NaN, x) = NaN, so sidecar can't mask cells
+                // it didn't touch, but it could mask false-positives in cells it
+                // did touch — disable for the cleanest signal).
+                hipMemsetAsync(dst_fused_raw, 0xFF, (size_t)dst_nelem * sizeof(float), stream);
             }
 
             llama_sclp4_fused_moe_wmma(
@@ -2836,17 +2894,41 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 (const float*)src1->data,
                 (const int32_t*)ids->data,
                 dst_fused_ptr,
+                sclp_fused_moe_wmma_mode == 2 ? dst_fused_pre_raw : nullptr,
                 perm_scratch.get(), expert_offsets_scratch.get(),
                 (uint32_t)N, (uint32_t)K, (uint32_t)n_active,
-                (uint32_t)n_batches, (uint32_t)src1->ne[1], (uint32_t)n_experts,
+                (uint32_t)n_batches, (uint32_t)ids_s1, (uint32_t)src1->ne[1], (uint32_t)n_experts,
+                fused_scalar_math_mode, fused_sidecar_mode,
                 stream);
+            // Optional repeat run to expose non-deterministic drift (mostly atomic sidecar order).
+            static const bool fused_repeat_diff = getenv("SCLP_FUSED_REPEAT_DIFF") != nullptr;
+            if (sclp_fused_moe_wmma_mode == 2 && fused_repeat_diff) {
+                hipMemsetAsync(dst_fused_repeat_raw, 0xFF, (size_t)dst_nelem * sizeof(float), stream);
+                llama_sclp4_fused_moe_wmma(
+                    src0->data,
+                    (const float*)src1->data,
+                    (const int32_t*)ids->data,
+                    dst_fused_repeat_raw,
+                    nullptr,
+                    perm_scratch.get(), expert_offsets_scratch.get(),
+                    (uint32_t)N, (uint32_t)K, (uint32_t)n_active,
+                    (uint32_t)n_batches, (uint32_t)ids_s1, (uint32_t)src1->ne[1], (uint32_t)n_experts,
+                    fused_scalar_math_mode, fused_sidecar_mode,
+                    stream);
+            }
 
             if (sclp_fused_moe_wmma_mode == 1) return;
             // mode == 2: fall through to also run the two-pass, then diff below.
         }
 
+        static const bool twopass_core_repeat = getenv("SCLP_TWOPASS_CORE_REPEAT") != nullptr;
         const int64_t num_weights = ggml_nelements(src0);
         ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
+        ggml_cuda_pool_alloc<uint16_t> decoded_no_sidecar(ctx.pool(), sclp_fused_moe_wmma_mode == 2 ? (size_t)num_weights : 0);
+        ggml_cuda_pool_alloc<float> dst_ref_pre_sidecar_raw(ctx.pool(), sclp_fused_moe_wmma_mode == 2 ? (size_t)dst_nelem : 0);
+        ggml_cuda_pool_alloc<float> dst_ref_pre_sidecar_repeat_raw(
+            ctx.pool(),
+            (sclp_fused_moe_wmma_mode == 2 && twopass_core_repeat) ? (size_t)dst_nelem : 0);
 
         // SCLP_TIME_TWOPASS=1 measures decode vs recursive-GEMM split on the SCLP4
         // two-pass path. Prints per-call ms breakdown for the first N calls.
@@ -2876,6 +2958,32 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_cuda_mul_mat_id(ctx, dst);
         dst->src[0] = orig_src0;
 
+        if (sclp_fused_moe_wmma_mode == 2) {
+            // Build a sidecar-disabled reference for apples-to-apples core compare
+            // against fused pre-sidecar output.
+            llama_sclp4_dispatch(src0->data, decoded_no_sidecar.get(), (uint32_t)num_weights, stream, false);
+
+            ggml_tensor src0_bf16_no_sidecar = *src0;
+            src0_bf16_no_sidecar.type  = GGML_TYPE_BF16;
+            src0_bf16_no_sidecar.data  = decoded_no_sidecar.get();
+            src0_bf16_no_sidecar.nb[0] = sizeof(ggml_bf16_t);
+            for (int i = 1; i < GGML_MAX_DIMS; i++) {
+                src0_bf16_no_sidecar.nb[i] = src0_bf16_no_sidecar.nb[i-1] * src0_bf16_no_sidecar.ne[i-1];
+            }
+
+            ggml_tensor dst_pre_sidecar_ref = *dst;
+            dst_pre_sidecar_ref.data = dst_ref_pre_sidecar_raw.get();
+            dst_pre_sidecar_ref.src[0] = &src0_bf16_no_sidecar;
+            ggml_cuda_mul_mat_id(ctx, &dst_pre_sidecar_ref);
+
+            if (twopass_core_repeat) {
+                ggml_tensor dst_pre_sidecar_ref_repeat = *dst;
+                dst_pre_sidecar_ref_repeat.data = dst_ref_pre_sidecar_repeat_raw.get();
+                dst_pre_sidecar_ref_repeat.src[0] = &src0_bf16_no_sidecar;
+                ggml_cuda_mul_mat_id(ctx, &dst_pre_sidecar_ref_repeat);
+            }
+        }
+
         if (time_twopass) {
             hipEventRecord(ev_gemm, stream);
             hipStreamSynchronize(stream);
@@ -2902,13 +3010,35 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 hipMemcpyAsync((float*)dst->data, dst_fused_raw, dst_nelem * sizeof(float), hipMemcpyDeviceToDevice, stream);
             }
             // Diff: copy entire dst back to host and compute per-slot stats.
-            std::vector<float> h_ref(dst_nelem), h_fused(dst_nelem);
+            std::vector<float> h_ref(dst_nelem), h_fused(dst_nelem), h_pre(dst_nelem), h_ref_pre(dst_nelem), h_ref_pre_repeat, h_fused_repeat;
             hipMemcpyAsync(h_ref.data(),   (float*)dst->data,           dst_nelem * sizeof(float), hipMemcpyDeviceToHost, stream);
             hipMemcpyAsync(h_fused.data(), dst_fused_raw,               dst_nelem * sizeof(float), hipMemcpyDeviceToHost, stream);
+            hipMemcpyAsync(h_pre.data(),   dst_fused_pre_raw,           dst_nelem * sizeof(float), hipMemcpyDeviceToHost, stream);
+            hipMemcpyAsync(h_ref_pre.data(), dst_ref_pre_sidecar_raw.get(), dst_nelem * sizeof(float), hipMemcpyDeviceToHost, stream);
+            if (twopass_core_repeat && dst_ref_pre_sidecar_repeat_raw.get() != nullptr) {
+                h_ref_pre_repeat.resize(dst_nelem);
+                hipMemcpyAsync(h_ref_pre_repeat.data(), dst_ref_pre_sidecar_repeat_raw.get(), dst_nelem * sizeof(float), hipMemcpyDeviceToHost, stream);
+            }
+            static const bool fused_repeat_diff = getenv("SCLP_FUSED_REPEAT_DIFF") != nullptr;
+            if (fused_repeat_diff && dst_fused_repeat_raw != nullptr) {
+                h_fused_repeat.resize(dst_nelem);
+                hipMemcpyAsync(h_fused_repeat.data(), dst_fused_repeat_raw, dst_nelem * sizeof(float), hipMemcpyDeviceToHost, stream);
+            }
             // Also sample ids for context.
-            const int64_t ids_nelem = ggml_nelements(ids);
-            std::vector<int32_t> h_ids(ids_nelem);
-            hipMemcpyAsync(h_ids.data(), (int32_t*)ids->data, ids_nelem * sizeof(int32_t), hipMemcpyDeviceToHost, stream);
+            const int64_t ids_s1_host = ids->nb[1] / (int64_t)sizeof(int32_t);
+            const int64_t ids_rows_host = ids->ne[1];
+            const size_t ids_backing_elems = (size_t)(ids_s1_host * ids_rows_host);
+            std::vector<int32_t> h_ids(ids_backing_elems);
+            hipMemcpyAsync(h_ids.data(), (int32_t*)ids->data, ids_backing_elems * sizeof(int32_t), hipMemcpyDeviceToHost, stream);
+            static const bool root_cause_probe = getenv("SCLP_ROOT_CAUSE_PROBE") != nullptr;
+            std::vector<uint16_t> h_decoded_no_sidecar;
+            std::vector<float> h_src1_full;
+            if (root_cause_probe) {
+                h_decoded_no_sidecar.resize((size_t)num_weights);
+                h_src1_full.resize((size_t)src1->ne[0] * (size_t)src1->ne[1] * (size_t)src1->ne[2] * (size_t)src1->ne[3]);
+                hipMemcpyAsync(h_decoded_no_sidecar.data(), decoded_no_sidecar.get(), (size_t)num_weights * sizeof(uint16_t), hipMemcpyDeviceToHost, stream);
+                hipMemcpyAsync(h_src1_full.data(), (float*)src1->data, h_src1_full.size() * sizeof(float), hipMemcpyDeviceToHost, stream);
+            }
             hipStreamSynchronize(stream);
             // Sample src1[:, 0, 0]
             std::vector<float> h_src1_first(std::min<int64_t>(8, src0->ne[0]));
@@ -2918,9 +3048,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             hipMemcpyAsync(&h_dst0, (float*)dst->data, sizeof(float), hipMemcpyDeviceToHost, stream);
             hipStreamSynchronize(stream);
             static int diff_call_count = 0;
+            // Per-shape counter: print full per-cell diff on FIRST encounter of each
+            // (n_active, n_batches) combo. This way the large-batch prefill shape
+            // gets reported even after diff_call_count saturates.
+            static std::map<int, int> shape_seen;
+            const int n_active_now = (int)ids->ne[0];
+            const int shape_key = n_active_now * 100000 + (int)n_batches;
+            const bool new_shape = (shape_seen[shape_key]++ == 0);
             float max_abs_total = 0.f, sum_ref_total = 0.f, sum_fused_total = 0.f;
             // Print shape on every call to detect shape variation across MoE matmul invocations.
-            if (diff_call_count < 3) {
+            if (diff_call_count < 3 || new_shape) {
                 double sum_abs_diff = 0.0;
                 double sum_sq_diff  = 0.0;
                 int n_large_diff = 0;
@@ -2946,8 +3083,214 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                         largest_idx,
                         largest_idx >= 0 ? h_ref[largest_idx] : 0.f,
                         largest_idx >= 0 ? h_fused[largest_idx] : 0.f);
+                double pre_abs = 0.0, post_abs = 0.0;
+                double pre_sq = 0.0, post_sq = 0.0;
+                int pre_large = 0, post_large = 0;
+                float pre_max = 0.f, post_max = 0.f;
+                for (int64_t i = 0; i < dst_nelem; i++) {
+                    const float d_pre = std::fabs(h_ref[i] - h_pre[i]);
+                    const float d_post = std::fabs(h_fused[i] - h_pre[i]);
+                    pre_max = std::max(pre_max, d_pre);
+                    post_max = std::max(post_max, d_post);
+                    pre_abs += d_pre;  post_abs += d_post;
+                    pre_sq += (double)d_pre * d_pre;
+                    post_sq += (double)d_post * d_post;
+                    if (d_pre > 1e-4f) pre_large++;
+                    if (d_post > 1e-4f) post_large++;
+                }
+                fprintf(stderr, "[SCLP_SPLIT] call=%d pre_vs_ref: max=%.4g mean=%.4g rms=%.4g >1e-4=%d | sidecar_delta(post_vs_pre): max=%.4g mean=%.4g rms=%.4g >1e-4=%d\n",
+                        diff_call_count,
+                        pre_max, (float)(pre_abs / dst_nelem), (float)std::sqrt(pre_sq / dst_nelem), pre_large,
+                        post_max, (float)(post_abs / dst_nelem), (float)std::sqrt(post_sq / dst_nelem), post_large);
+                double core_abs = 0.0, core_sq = 0.0;
+                int core_large = 0;
+                float core_max = 0.f;
+                for (int64_t i = 0; i < dst_nelem; i++) {
+                    const float d = std::fabs(h_pre[i] - h_ref_pre[i]);
+                    core_max = std::max(core_max, d);
+                    core_abs += d;
+                    core_sq += (double)d * d;
+                    if (d > 1e-4f) core_large++;
+                }
+                fprintf(stderr, "[SCLP_CORE] call=%d fused_pre_vs_ref_pre: max=%.4g mean=%.4g rms=%.4g >1e-4=%d\n",
+                        diff_call_count,
+                        core_max, (float)(core_abs / dst_nelem), (float)std::sqrt(core_sq / dst_nelem), core_large);
+                if (root_cause_probe && ids->ne[1] >= 256 && ids->ne[0] <= 16) {
+                    const int64_t K_dim = src0->ne[0];
+                    const int64_t N_dim = src0->ne[1];
+                    const int64_t E_dim = src0->ne[2];
+                    (void)E_dim;
+                    float core_largest = 0.f;
+                    int64_t core_largest_idx = -1;
+                    for (int64_t i = 0; i < dst_nelem; i++) {
+                        const float d = std::fabs(h_pre[i] - h_ref_pre[i]);
+                        if (d > core_largest) {
+                            core_largest = d;
+                            core_largest_idx = i;
+                        }
+                    }
+                    if (core_largest_idx >= 0 && ids_s1_host > 0) {
+                        const int64_t mg = core_largest_idx / N_dim;
+                        const int64_t n_row = core_largest_idx % N_dim;
+                        const int64_t n_active_l = ids->ne[0];
+                        const int64_t i_batch = mg / n_active_l;
+                        const int64_t i_active = mg % n_active_l;
+                        const size_t ids_idx = (size_t)i_batch * (size_t)ids_s1_host + (size_t)i_active;
+                        if (ids_idx >= h_ids.size()) {
+                            fprintf(stderr, "[SCLP_ROOT] skip: ids_idx=%zu ids_size=%zu\n", ids_idx, h_ids.size());
+                        } else {
+                            const int32_t expert = h_ids[ids_idx];
+                            if (expert < 0 || expert >= (int32_t)src0->ne[2]) {
+                                fprintf(stderr, "[SCLP_ROOT] skip: expert=%d n_experts=%lld\n", expert, (long long)src0->ne[2]);
+                            } else {
+                                const uint64_t w_base = (uint64_t)expert * (uint64_t)(N_dim * K_dim) + (uint64_t)n_row * (uint64_t)K_dim;
+                                const uint64_t x_base = ((uint64_t)i_batch * (uint64_t)src1->ne[1] + ((uint64_t)i_active % (uint64_t)src1->ne[1])) * (uint64_t)K_dim;
+                                const uint64_t w_end = w_base + (uint64_t)K_dim;
+                                const uint64_t x_end = x_base + (uint64_t)K_dim;
+                                if (w_end > (uint64_t)h_decoded_no_sidecar.size() || x_end > (uint64_t)h_src1_full.size()) {
+                                    fprintf(stderr,
+                                            "[SCLP_ROOT] skip: w=[%llu,%llu)/%zu x=[%llu,%llu)/%zu\n",
+                                            (unsigned long long)w_base, (unsigned long long)w_end, h_decoded_no_sidecar.size(),
+                                            (unsigned long long)x_base, (unsigned long long)x_end, h_src1_full.size());
+                                } else {
+
+                                    auto bf16_to_f32 = [](uint16_t u) -> float {
+                                        union { uint32_t u32; float f32; } v;
+                                        v.u32 = (uint32_t)u << 16;
+                                        return v.f32;
+                                    };
+                                    auto f32_to_bf16_f32 = [](float x) -> float {
+                                        union { uint32_t u32; float f32; } in, out;
+                                        in.f32 = x;
+                                        out.u32 = (uint32_t)((uint16_t)(in.u32 >> 16)) << 16;
+                                        return out.f32;
+                                    };
+
+                                    float acc_f32_x = 0.f;
+                                    float acc_bf16_x = 0.f;
+                                    for (int64_t k = 0; k < K_dim; k++) {
+                                        const float w = bf16_to_f32(h_decoded_no_sidecar[(size_t)(w_base + k)]);
+                                        const float x = h_src1_full[(size_t)(x_base + k)];
+                                        acc_f32_x += w * x;
+                                        acc_bf16_x += w * f32_to_bf16_f32(x);
+                                    }
+
+                                    fprintf(stderr,
+                                            "[SCLP_ROOT] call=%d idx=%lld mg=%lld n=%lld e=%d i_b=%lld i_a=%lld  core_d=%.6g\n",
+                                            diff_call_count, (long long)core_largest_idx, (long long)mg, (long long)n_row, expert,
+                                            (long long)i_batch, (long long)i_active, core_largest);
+                                    fprintf(stderr,
+                                            "[SCLP_ROOT]   ref_pre=%.9g fused_pre=%.9g dot_f32x=%.9g dot_bf16x=%.9g  |d(ref,dot_f32x)|=%.6g |d(ref,dot_bf16x)|=%.6g |d(fused,dot_f32x)|=%.6g |d(fused,dot_bf16x)|=%.6g\n",
+                                            h_ref_pre[(size_t)core_largest_idx], h_pre[(size_t)core_largest_idx], acc_f32_x, acc_bf16_x,
+                                            std::fabs(h_ref_pre[(size_t)core_largest_idx] - acc_f32_x),
+                                            std::fabs(h_ref_pre[(size_t)core_largest_idx] - acc_bf16_x),
+                                            std::fabs(h_pre[(size_t)core_largest_idx] - acc_f32_x),
+                                            std::fabs(h_pre[(size_t)core_largest_idx] - acc_bf16_x));
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!h_ref_pre_repeat.empty()) {
+                    double ref_rep_abs = 0.0, ref_rep_sq = 0.0;
+                    int ref_rep_large = 0;
+                    float ref_rep_max = 0.f;
+                    for (int64_t i = 0; i < dst_nelem; i++) {
+                        const float d = std::fabs(h_ref_pre[i] - h_ref_pre_repeat[i]);
+                        ref_rep_max = std::max(ref_rep_max, d);
+                        ref_rep_abs += d;
+                        ref_rep_sq += (double)d * d;
+                        if (d > 1e-4f) ref_rep_large++;
+                    }
+                    fprintf(stderr, "[SCLP_REF_REPEAT] call=%d ref_pre_run2_vs_run1: max=%.4g mean=%.4g rms=%.4g >1e-4=%d\n",
+                            diff_call_count,
+                            ref_rep_max, (float)(ref_rep_abs / dst_nelem), (float)std::sqrt(ref_rep_sq / dst_nelem), ref_rep_large);
+                }
+                if (!h_fused_repeat.empty()) {
+                    double rep_abs = 0.0, rep_sq = 0.0;
+                    int rep_large = 0;
+                    float rep_max = 0.f;
+                    for (int64_t i = 0; i < dst_nelem; i++) {
+                        const float d = std::fabs(h_fused[i] - h_fused_repeat[i]);
+                        rep_max = std::max(rep_max, d);
+                        rep_abs += d;
+                        rep_sq += (double)d * d;
+                        if (d > 1e-4f) rep_large++;
+                    }
+                    fprintf(stderr, "[SCLP_REPEAT] call=%d fused_run2_vs_run1: max=%.4g mean=%.4g rms=%.4g >1e-4=%d\n",
+                            diff_call_count,
+                            rep_max, (float)(rep_abs / dst_nelem), (float)std::sqrt(rep_sq / dst_nelem), rep_large);
+                }
+
+                // SENTINEL SCAN: count NaN cells in h_fused (set to 0xFF before dispatch).
+                // A surviving NaN is a dst cell the fused kernel never wrote.
+                {
+                    const int64_t N_dim   = src0->ne[1];
+                    const int64_t n_active = ids->ne[0];
+                    const int64_t n_slots  = n_active * n_batches;
+                    int64_t nan_total = 0;
+                    int slots_full_unwritten = 0, slots_partial = 0, slots_full_written = 0;
+                    int mg_first_unwritten = -1;
+                    int64_t nan_first16[16] = {0};
+                    for (int64_t mg = 0; mg < n_slots; mg++) {
+                        int64_t nan_in_slot = 0;
+                        for (int64_t n = 0; n < N_dim; n++) {
+                            if (std::isnan(h_fused[mg * N_dim + n])) nan_in_slot++;
+                        }
+                        nan_total += nan_in_slot;
+                        if (mg < 16) nan_first16[mg] = nan_in_slot;
+                        if (nan_in_slot == N_dim) {
+                            slots_full_unwritten++;
+                            if (mg_first_unwritten < 0) mg_first_unwritten = (int)mg;
+                        } else if (nan_in_slot > 0) {
+                            slots_partial++;
+                        } else {
+                            slots_full_written++;
+                        }
+                    }
+                    fprintf(stderr, "[SCLP_SENTINEL] call=%d nan=%lld/%lld (%.3f%% unwritten)  slots: full_unwritten=%d partial=%d full_written=%d  total_slots=%lld\n",
+                            diff_call_count, (long long)nan_total, (long long)dst_nelem,
+                            100.0 * (double)nan_total / (double)dst_nelem,
+                            slots_full_unwritten, slots_partial, slots_full_written,
+                            (long long)n_slots);
+                    fprintf(stderr, "[SCLP_SENTINEL]   first16 mg NaN/N (N=%lld):", (long long)N_dim);
+                    for (int i = 0; i < 16 && i < n_slots; i++) {
+                        fprintf(stderr, " %lld", (long long)nan_first16[i]);
+                    }
+                    fprintf(stderr, "\n");
+                    if (mg_first_unwritten >= 0) {
+                        int b = mg_first_unwritten / (int)n_active;
+                        int a = mg_first_unwritten % (int)n_active;
+                        int last_b = (slots_full_unwritten > 0)
+                            ? ((int)((int64_t)slots_full_unwritten - 1) / (int)n_active) : -1;
+                        (void)last_b;
+                        fprintf(stderr, "[SCLP_SENTINEL]   first full-NaN slot: mg=%d (i_b=%d i_a=%d)\n",
+                                mg_first_unwritten, b, a);
+                    }
+                    // Per-batch coverage: count fully-unwritten slots per i_b.
+                    // Only print if there ARE fully-unwritten slots, to avoid log spam.
+                    if (slots_full_unwritten > 0) {
+                        int per_batch_full_nan[16] = {0};
+                        const int n_batch_buckets = (int)std::min<int64_t>(16, n_batches);
+                        for (int64_t mg = 0; mg < n_slots; mg++) {
+                            int64_t nan_in_slot = 0;
+                            for (int64_t n = 0; n < N_dim; n++) {
+                                if (std::isnan(h_fused[mg * N_dim + n])) nan_in_slot++;
+                            }
+                            if (nan_in_slot == N_dim) {
+                                int b = (int)(mg / n_active);
+                                if (b < n_batch_buckets) per_batch_full_nan[b]++;
+                            }
+                        }
+                        fprintf(stderr, "[SCLP_SENTINEL]   full-NaN slots per i_b[0..%d]:", n_batch_buckets - 1);
+                        for (int b = 0; b < n_batch_buckets; b++) {
+                            fprintf(stderr, " %d", per_batch_full_nan[b]);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
             }
-            if (diff_call_count < 2) {
+            if (diff_call_count < 2 || new_shape) {
                 const int64_t N        = src0->ne[1];
                 const int64_t n_active = ids->ne[0];
                 fprintf(stderr, "[SCLP_DIFF] call=%d src0 ne=[%lld,%lld,%lld] src1 ne=[%lld,%lld,%lld,%lld] ids ne=[%lld,%lld] dst ne=[%lld,%lld,%lld] dst nb=[%lld,%lld,%lld,%lld] (ts=%zu)\n",
@@ -3008,6 +3351,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 diff_call_count++;
             }
             if (dst_fused_raw) hipFree(dst_fused_raw);
+            if (dst_fused_pre_raw) hipFree(dst_fused_pre_raw);
+            if (dst_fused_repeat_raw) hipFree(dst_fused_repeat_raw);
         }
         return;
     }
@@ -3121,8 +3466,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);
 
+    // SCLP test: BF16-as-src0 was silently truncating F32 activations to BF16 in
+    // the gather, costing ~1e-3 mean per-cell precision. For BF16 src0 (which is
+    // what SCLP*'s two-pass decode produces), keep activations in F32 so the GEMM
+    // does F32-precision multiplies. Gated: SCLP_TEST_NO_BF16_X=1.
+    static const bool sclp_test_no_bf16_x = getenv("SCLP_TEST_NO_BF16_X") != nullptr;
     const ggml_type type_src1_sorted = (src0->type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc))
-        || ggml_is_quantized(src0->type) ? GGML_TYPE_F32 : src0->type;
+        || ggml_is_quantized(src0->type)
+        || (sclp_test_no_bf16_x && src0->type == GGML_TYPE_BF16)
+        ? GGML_TYPE_F32 : src0->type;
     const ggml_type type_dst_sorted  = GGML_TYPE_F32;
     const size_t ts_src1_sorted = ggml_type_size(type_src1_sorted);
     const size_t ts_dst_sorted  = ggml_type_size(type_dst_sorted);

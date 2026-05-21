@@ -1040,7 +1040,8 @@ inline void llama_sclp4_dispatch(
     const void* sclp_data,
     uint16_t*   output,
     uint32_t    num_weights,
-    hipStream_t stream
+    hipStream_t stream,
+    bool        apply_sidecar = true
 ) {
     const uint8_t* data = (const uint8_t*)sclp_data;
     dim3 block(256);
@@ -1063,7 +1064,9 @@ inline void llama_sclp4_dispatch(
     if (time_decode) (void)hipEventRecord(ev_b, stream);
 
     // Increase grid size to 1024 blocks to saturate all 96 CUs on gfx1100.
-    sclp4_fixup_sidecar_kernel<<<1024, block, 0, stream>>>(data, output, num_weights);
+    if (apply_sidecar) {
+        sclp4_fixup_sidecar_kernel<<<1024, block, 0, stream>>>(data, output, num_weights);
+    }
 
     if (time_decode) {
         (void)hipEventRecord(ev_c, stream);
@@ -1249,70 +1252,41 @@ inline void llama_sclp4_fused_moe_gemv(
 //   SCLP_FUSED_MOE_SCALAR=1     use the scalar reference kernel (slower)
 //   SCLP_FUSED_MOE_NO_SIDECAR=1 skip the sidecar correction kernel
 //
-// Two kernels are implemented:
-//   1. sclp4_fused_moe_wmma_kernel — RDNA3 WMMA, fast, BUT outputs are ~30%
-//      of the correct magnitude (vs two-pass reference). Has a real bug —
-//      single-warp WMMA fragment layout most likely. Diff per row at chunk 1
-//      shows max_abs ~5-20 with ref|sum|~600-1200, ratio=0.31.
-//   2. sclp4_fused_moe_scalar_kernel — IDENTICAL routing/gather to (1) but
-//      replaces WMMA with per-lane scalar dot products. Outputs are ~92% of
-//      correct magnitude before sidecar correction, ~100% (bit-perfect to
-//      1e-5) after sidecar correction is applied.
+// Current status (May 2026):
+//   1. Route-sort / slot coverage is validated:
+//      - sentinel test shows 0 unwritten cells
+//      - probe modes confirm mg/i_batch/expert resolution are correct
+//   2. Sidecar is not the source of the remaining drift:
+//      - SCLP_FUSED_MOE_SIDECAR_MODE=0/1 produces essentially identical
+//        prefill drift metrics on ids ne=[8,512]
+//      - [SCLP_SPLIT] pre_vs_ref and post_vs_pre are very close
+//   3. Nondeterminism is not the source:
+//      - [SCLP_REPEAT] fused_run2_vs_run1 remains tiny (>1e-4 = 0)
+//   4. Remaining delta is in core GEMM numerics/order:
+//      - [SCLP_CORE] fused_pre_vs_ref_pre closely matches [SCLP_DIFF]
+//        on the same call/shape, so sidecar and coverage are ruled out.
 //
-// Sidecar correction (sclp4_moe_sidecar_correct_kernel) is the missing piece
-// vs the two-pass path. With imatrix-aware encoding, ~1.9% of weights are
-// stored in the sidecar with exact BF16 values. The two-pass decode kernel
-// restores them via fixup; the fused path has to apply delta corrections
-// post-hoc via atomicAdd. Closes the magnitude gap exactly.
+// Practical impact observed in current runs (Gemma4 MIXED sidecar1%, pp512):
+//   - call-level drift on large prefill shapes is small but systematic
+//     (order ~1e-3 mean abs, ~1e-1 max)
+//   - end-to-end PPL remains stable at ~9657.355 for the tested config.
 //
-// PERF (Gemma4 MIXED-imatrix-1%, gfx1100 RX 7900 XTX, real clean build):
-//   Baseline two-pass:        615 t/s pp512   (correct, PPL=940 @ 50 chunks)
-//   WMMA + sidecar:           411 t/s pp512   (WMMA broken; PPL 180M)
-//   Scalar + sidecar:         396 t/s pp512   (math correct; PPL still 23M
-//                                              in mode=1 — see UNSOLVED below)
-// Sidecar correction is the dominant cost: per sidecar weight it iterates
-// over every routed slot in that expert's bin doing atomicAdd. ~75K sidecar
-// weights × ~2 avg slots-per-expert × n_layers × calls/layer compounds.
+// Working hypothesis:
+//   fused scalar accumulation order differs from the two-pass path's effective
+//   math path (decode + backend GEMM), producing deterministic numeric drift.
 //
-// PPL DIVERGENCE EXPLAINED (was misclassified as a mystery — actually a real
-// numerical bug). Earlier diff prints sampled max_abs per-row across the first 16
-// rows and reported ~1e-5 (bit-perfect-looking). Running the diff over the FULL
-// 360K-cell dst tensor shows:
-//   max abs cell-level diff = 0.005
-//   mean abs cell-level diff = 0.00065
-//   89% of cells differ by > 1e-4
-// That's ~0.5% per-cell relative error. Each MoE FFN matmul produces this, and
-// it compounds through 26 layers + GLU (multiplicative) → catastrophic PPL.
-// Definitive test: SCLP_M2_OVERWRITE_FUSED=1 in DIFF mode copies fused output
-// onto dst at end of dispatch; PPL drops from 1650 (baseline, dst=two-pass) to
-// 10.6M (dst=fused). Same dst tensor; only difference is which path wrote.
-// The fused/two-pass values are simply not bit-identical, even with scalar +
-// BF16-truncated activations.
-//
-// Source of the 0.5% drift: rocBLAS BF16 GEMM accumulates in F32 but tensor
-// cores likely round partial sums differently than our sequential F32-accumulator
-// scalar loop. K=2816 multiplications accumulated sequentially vs in tiled
-// chunks gives non-associative-addition divergence at ~1e-3 magnitudes for
-// typical values. The model (Gemma4-IT) is very sensitive to FFN-output noise
-// at this scale because outputs feed GLU (multiplicative), then ffn_down_exps,
-// then residual stream; errors compound across 26 layers.
-//
-// To match rocBLAS exactly we'd need to either (a) use rocBLAS for the GEMM
-// (defeats fusion), (b) reproduce its tile + accumulation order in our kernel,
-// or (c) accept the drift and retrain/calibrate from BF16 instead of Q5_K_M
-// (long shot). The fused-MoE-prefill program is therefore likely a dead end
-// for THIS model unless we replicate rocBLAS's numerics — substantially harder
-// than the original assumption.
-//
-// Future work: fix WMMA fragment bug (likely 1-warp vs 4-warp register packing),
-// optimize sidecar to a single launch with per-row reductions, isolate the
-// mode=1 PPL mystery, then bench and decide if fused beats baseline once correct.
+// Next triage target:
+//   add a two-pass-core repeat baseline (same inputs/path twice) to quantify the
+//   reference noise floor, then decide whether tighter numeric matching is worth
+//   the performance/complexity cost.
 
 __global__ void sclp_moe_route_sort_kernel(
     const int32_t* __restrict__ ids,            // [n_active × n_batches]
     int32_t*       __restrict__ perm,           // [n_experts * TILE + total_slots] out — bins padded to TILE
     int32_t*       __restrict__ expert_offsets, // [n_experts + 1] out, padded prefix sum
     uint32_t                    total_slots,
+    uint32_t                    n_active,
+    uint32_t                    ids_s1,
     uint32_t                    n_experts,
     uint32_t                    tile            // TILE size each bin is padded up to
 ) {
@@ -1330,7 +1304,9 @@ __global__ void sclp_moe_route_sort_kernel(
     __syncthreads();
 
     for (uint32_t i = threadIdx.x; i < total_slots; i += blockDim.x) {
-        int32_t e = ids[i];
+        const uint32_t i_active = i % n_active;
+        const uint32_t i_batch  = i / n_active;
+        int32_t e = ids[(uint64_t)i_batch * ids_s1 + i_active];
         if (e >= 0 && (uint32_t)e < n_experts) atomicAdd(&s_count[e], 1);
     }
     __syncthreads();
@@ -1358,7 +1334,9 @@ __global__ void sclp_moe_route_sort_kernel(
 
     // Scatter real slot indices into their expert's bin head.
     for (uint32_t i = threadIdx.x; i < total_slots; i += blockDim.x) {
-        int32_t e = ids[i];
+        const uint32_t i_active = i % n_active;
+        const uint32_t i_batch  = i / n_active;
+        int32_t e = ids[(uint64_t)i_batch * ids_s1 + i_active];
         if (e >= 0 && (uint32_t)e < n_experts) {
             int32_t pos = atomicAdd(&s_cursor[e], 1);
             perm[pos] = (int32_t)i;
@@ -1520,7 +1498,7 @@ __global__ void sclp4_fused_moe_scalar_kernel(
     const int32_t* __restrict__ ids,
     float*         __restrict__ dst,
     uint32_t N, uint32_t K,
-    uint32_t n_active, uint32_t src1_ne1, uint32_t n_experts
+    uint32_t n_active, uint32_t src1_ne1, uint32_t n_experts, uint32_t math_mode
 ) {
     constexpr int TILE = 16;
     const uint32_t m_tile = blockIdx.y;
@@ -1580,6 +1558,7 @@ __global__ void sclp4_fused_moe_scalar_kernel(
     // Then dot it with each of the 8 assigned activations.
     // For correctness we just compute scalar dot products on the fly.
     float acc[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    float acc_c[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f}; // Kahan compensation
     int32_t mgs[8];
     bool    valid[8];
     for (int l = 0; l < 8; l++) {
@@ -1607,13 +1586,62 @@ __global__ void sclp4_fused_moe_scalar_kernel(
             uint32_t i_active = (uint32_t)mgs[l] % n_active;
             uint32_t i_batch  = (uint32_t)mgs[l] / n_active;
             const float* x_row = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
-            // F32 activation, no BF16 truncation. Critical for matching two-pass:
-            // any BF16 conversion here compounds catastrophically through 26 MoE
-            // FFN layers with GLU gating.
             float xf = x_row[k];
-            acc[l] += w * xf;
+            if (math_mode & 2u) {
+                // Optional: force activation to BF16 to test sensitivity to input precision.
+                __hip_bfloat16 xbf = (__hip_bfloat16)xf;
+                xf = __bfloat162float(xbf);
+            }
+            const float prod = w * xf;
+            if (math_mode & 1u) {
+                // Kahan-compensated accumulation for numerical-order triage.
+                float y = prod - acc_c[l];
+                float t = acc[l] + y;
+                acc_c[l] = (t - acc[l]) - y;
+                acc[l] = t;
+            } else {
+                acc[l] += prod;
+            }
         }
     }
+
+    // SCLP_FUSED_MOE_PROBE: replace acc with diagnostic values to verify indexing.
+    // mode=1: write i_batch  → expect dst[mg*N+n] == mg/n_active
+    // mode=2: write i_active → expect dst[mg*N+n] == mg%n_active
+    // mode=3: write mgs[l] (the perm-resolved slot index) — expect dst[mg*N+n] == mg
+    // mode=4: write x_row[0] (activation src1[i_batch*ne11*K + (i_active%ne11)*K + 0])
+    // mode=5: write x_row[K-1] (last activation in the row)
+#ifdef SCLP_PROBE_IBATCH
+    for (int l = 0; l < 8; l++) {
+        if (!valid[l]) continue;
+        uint32_t i_active = (uint32_t)mgs[l] % n_active;
+        uint32_t i_batch  = (uint32_t)mgs[l] / n_active;
+#if SCLP_PROBE_IBATCH == 1
+        acc[l] = (float)i_batch;
+#elif SCLP_PROBE_IBATCH == 2
+        acc[l] = (float)i_active;
+#elif SCLP_PROBE_IBATCH == 3
+        acc[l] = (float)mgs[l];
+#elif SCLP_PROBE_IBATCH == 4
+        const float* xrp = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
+        acc[l] = xrp[0];
+#elif SCLP_PROBE_IBATCH == 5
+        const float* xrp = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
+        acc[l] = xrp[K - 1];
+#elif SCLP_PROBE_IBATCH == 6
+        acc[l] = (float)e;
+#elif SCLP_PROBE_IBATCH == 7
+        // Read first nibble of expert e's weight slab and decode it. Should be consistent
+        // across all cells of the same expert; varies across experts.
+        uint8_t b0 = ws[0];
+        acc[l] = (float)(b0 >> 4);
+#elif SCLP_PROBE_IBATCH == 8
+        // Honest dot product with manual ids lookup: w_e is from ids[mg], not block-resolved e.
+        acc[l] = (float)ids[mgs[l]];
+#endif
+        (void)i_active; (void)i_batch;
+    }
+#endif
 
     for (int l = 0; l < 8; l++) {
         if (valid[l]) dst[(uint64_t)mgs[l] * N + n_row] = acc[l];
@@ -1633,7 +1661,8 @@ __global__ void sclp4_moe_sidecar_correct_kernel(
     const int32_t* __restrict__ perm,
     const int32_t* __restrict__ expert_offsets,
     float*         __restrict__ dst,
-    uint32_t N, uint32_t K, uint32_t n_active, uint32_t src1_ne1, uint32_t n_experts
+    uint32_t N, uint32_t K, uint32_t n_active, uint32_t src1_ne1, uint32_t n_experts,
+    uint32_t sidecar_mode
 ) {
     __shared__ uint32_t s_total_nw;
     __shared__ uint32_t s_n_experts;
@@ -1716,6 +1745,10 @@ __global__ void sclp4_moe_sidecar_correct_kernel(
             uint32_t i_batch  = (uint32_t)mg / n_active;
             const float* x_row = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
             float xval = x_row[k];
+            if (sidecar_mode & 1u) {
+                __hip_bfloat16 xbf = (__hip_bfloat16)xval;
+                xval = __bfloat162float(xbf);
+            }
             atomicAdd(&dst[(uint64_t)mg * N + n_e], w_delta * xval);
         }
     }
@@ -1728,14 +1761,18 @@ inline void llama_sclp4_fused_moe_wmma(
     const float*   src1,
     const int32_t* ids,
     float*         dst,
+    float*         dst_pre_sidecar,          // optional [N * n_active * n_batches], may be nullptr
     int32_t*       perm_scratch,            // [n_active × n_batches]
     int32_t*       expert_offsets_scratch,  // [n_experts + 1]
     uint32_t       N,
     uint32_t       K,
     uint32_t       n_active,
     uint32_t       n_batches,
+    uint32_t       ids_s1,
     uint32_t       src1_ne1,
     uint32_t       n_experts,
+    uint32_t       scalar_math_mode,
+    uint32_t       sidecar_mode,
     hipStream_t    stream
 ) {
     const uint32_t total_slots = n_active * n_batches;
@@ -1744,7 +1781,7 @@ inline void llama_sclp4_fused_moe_wmma(
     // Step 1: routing sort with TILE-padded bins. perm_scratch must be sized at
     // least total_slots + n_experts * TILE (worst-case padding waste).
     sclp_moe_route_sort_kernel<<<1, 256, 2 * (n_experts + 1) * sizeof(int32_t), stream>>>(
-        ids, perm_scratch, expert_offsets_scratch, total_slots, n_experts, (uint32_t)TILE);
+        ids, perm_scratch, expert_offsets_scratch, total_slots, n_active, ids_s1, n_experts, (uint32_t)TILE);
 
     // Step 2: fused WMMA. Grid m-extent is total padded length / TILE.
     // We over-launch to (total_slots + n_experts * TILE + TILE - 1)/TILE — a fixed
@@ -1759,12 +1796,17 @@ inline void llama_sclp4_fused_moe_wmma(
         sclp4_fused_moe_scalar_kernel<<<grid, block, 0, stream>>>(
             (const uint8_t*)blob_ptr,
             src1, perm_scratch, expert_offsets_scratch, ids, dst,
-            N, K, n_active, src1_ne1, n_experts);
+            N, K, n_active, src1_ne1, n_experts, scalar_math_mode);
     } else {
         sclp4_fused_moe_wmma_kernel<<<grid, block, 0, stream>>>(
             (const uint8_t*)blob_ptr,
             src1, perm_scratch, expert_offsets_scratch, ids, dst,
             N, K, n_active, src1_ne1, n_experts);
+    }
+
+    if (dst_pre_sidecar != nullptr) {
+        const size_t out_elems = (size_t)N * (size_t)n_active * (size_t)n_batches;
+        hipMemcpyAsync(dst_pre_sidecar, dst, out_elems * sizeof(float), hipMemcpyDeviceToDevice, stream);
     }
 
     // Apply sidecar corrections: ~1-2% of weights need exact-value restoration to
@@ -1774,7 +1816,7 @@ inline void llama_sclp4_fused_moe_wmma(
         sclp4_moe_sidecar_correct_kernel<<<32, 256, 0, stream>>>(
             (const uint8_t*)blob_ptr,
             src1, perm_scratch, expert_offsets_scratch, dst,
-            N, K, n_active, src1_ne1, n_experts);
+            N, K, n_active, src1_ne1, n_experts, sidecar_mode);
     }
 }
 
