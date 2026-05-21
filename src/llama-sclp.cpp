@@ -46,6 +46,37 @@ static uint16_t float_to_bf16(float f) {
     return (uint16_t)((i + bias) >> 16);
 }
 
+// Stochastic rounding of BF16 mantissa LSBs. Replaces deterministic truncation
+// (which produces systematic per-weight bias in the same direction for every
+// positive weight) with unbiased noise. The expected value of each rounded
+// weight equals the original, so per-token errors no longer compound across
+// autoregressive generation steps.
+//
+// drop_bits = number of mantissa LSBs that will be discarded by the encoder:
+//   SCLP4 keeps 1 mantissa bit -> drop_bits = 6
+//   SCLP6 keeps 2 mantissa bits -> drop_bits = 5
+//   SCLP8 keeps 3 mantissa bits -> drop_bits = 4
+//
+// If rounding overflows the kept mantissa region the carry naturally propagates
+// into the exponent (BF16 bit layout: sign(1) exp(8) mant(7)). The downstream
+// palette/sidecar steps then see the rounded exponent, which is the correct
+// behavior — keeps expected value exact.
+static void stochastic_mantissa_round(uint16_t * w, int64_t n, int drop_bits) {
+    const uint16_t drop_mask  = (uint16_t)((1u << drop_bits) - 1);
+    const uint16_t round_unit = (uint16_t)(1u << drop_bits);
+    for (int64_t i = 0; i < n; i++) {
+        uint16_t v = w[i];
+        uint16_t discarded = v & drop_mask;
+        if (discarded == 0) { w[i] = v; continue; }
+        uint32_t rng = (uint32_t)((uint64_t)i * 2654435761ULL + 0x9E3779B9u);
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        uint16_t threshold = (uint16_t)(rng & drop_mask);
+        v &= (uint16_t)~drop_mask;
+        if (threshold < discarded) v = (uint16_t)(v + round_unit);
+        w[i] = v;
+    }
+}
+
 // Soft exponent clipping, matching Python soft_exponent_clip().
 //   exponent > threshold+1  → hard-clip to threshold
 //   exponent == threshold+1 → 50% survive (flat stochastic)
@@ -272,6 +303,21 @@ static sclp_expert_encoded encode_sclp_expert(
         std::vector<uint16_t> clipped(n);
         soft_exponent_clip(bf16_weights.data(), clipped.data(), n, clip_threshold);
         bf16_weights.swap(clipped);
+    }
+
+    // 2b. Stochastic mantissa rounding (default on; set SCLP_STOCHASTIC_ROUND=0
+    // to disable for A/B comparison). Eliminates per-tensor bias that accumulates
+    // across autoregressive steps and triggers mode collapse on sensitive tensors
+    // (e.g., ffn_down_exps in MoE IT models).
+    {
+        static const char * env = std::getenv("SCLP_STOCHASTIC_ROUND");
+        const bool enabled = !(env && env[0] == '0');
+        if (enabled) {
+            int drop_bits = (type == GGML_TYPE_SCLP4) ? 6
+                          : (type == GGML_TYPE_SCLP6) ? 5
+                          : 4; // SCLP8
+            stochastic_mantissa_round(bf16_weights.data(), n, drop_bits);
+        }
     }
 
     // 3. Collect exponent frequencies from clipped weights
