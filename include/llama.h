@@ -398,6 +398,14 @@ extern "C" {
         enum ggml_type type;
     };
 
+    // Per-tensor override for SCLP sidecar imatrix budget (fraction in [0, 1]).
+    // Tensors matching pattern get this budget instead of the global default (0.01).
+    // First match wins. Only used for SCLP4/6/8 quantization.
+    struct llama_model_sidecar_budget_override {
+        const char * pattern;
+        float        budget;
+    };
+
     struct llama_model_imatrix_data {
         const char * name;
         const float * data;
@@ -419,6 +427,7 @@ extern "C" {
         const struct llama_model_imatrix_data * imatrix;            // pointer to importance matrix data
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
+        const struct llama_model_sidecar_budget_override * sb_overrides; // per-tensor SCLP sidecar budget overrides (nullable, terminated by entry with pattern=nullptr)
         const int32_t * prune_layers;                               // pointer to layer indices to prune
     } llama_model_quantize_params;
 

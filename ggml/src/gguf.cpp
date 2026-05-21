@@ -734,7 +734,7 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
             const bool is_compact_eligible =
                 ti.t.type == GGML_TYPE_SCLP4 ||
                 ti.t.type == GGML_TYPE_SCLP6 ||
-                ti.t.type == GGML_TYPE_SCLP8;
+                ti.t.type == GGML_TYPE_SCLP;
             size_t actual_size = GGML_PAD(ggml_nbytes(&ti.t), ctx->alignment);
             if (is_compact_eligible && i + 1 < ctx->info.size()) {
                 size_t next_off = ctx->info[i + 1].offset;

@@ -183,6 +183,8 @@ struct quantize_state_impl {
 
     // tensor type override patterns (compiled once, used twice)
     std::vector<std::pair<std::regex, ggml_type>> tensor_type_patterns;
+    // sidecar budget override patterns (compiled once)
+    std::vector<std::pair<std::regex, float>> sidecar_budget_patterns;
 
     quantize_state_impl(const llama_model & model, const llama_model_quantize_params * params):
         model(model), params(params)
@@ -193,6 +195,19 @@ struct quantize_state_impl {
                 tensor_type_patterns.emplace_back(std::regex(p->pattern), p->type);
             }
         }
+        if (params->sb_overrides) {
+            for (const auto * p = params->sb_overrides; p->pattern != nullptr; p++) {
+                sidecar_budget_patterns.emplace_back(std::regex(p->pattern), p->budget);
+            }
+        }
+    }
+
+    // Returns the override budget if the tensor name matches a pattern, else -1.0f (use caller default).
+    float sidecar_budget_for(const std::string & name) const {
+        for (const auto & [re, b] : sidecar_budget_patterns) {
+            if (std::regex_search(name, re)) return b;
+        }
+        return -1.0f;
     }
 };
 
@@ -1232,7 +1247,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     if (work.size() < (size_t)nelements * 8 + 65536) {
                         work.resize(nelements * 8 + 65536);
                     }
-                    new_size = llama_tensor_quantize_sclp(new_type, f32_data, work.data(), nelements, tensor->ne[2], tensor->ne[0], imatrix);
+                    // Per-tensor sidecar budget override (--sidecar-budget). -1 means "use default".
+                    float sb = qs.sidecar_budget_for(tensor->name);
+                    if (sb < 0.0f) sb = 0.01f;
+                    new_size = llama_tensor_quantize_sclp(new_type, f32_data, work.data(), nelements, tensor->ne[2], tensor->ne[0], imatrix, /*clip_threshold=*/0, /*sidecar_imatrix_budget=*/sb);
                 } else {
                     if (work.size() < (size_t)nelements * 4) {
                         work.resize(nelements * 4); // upper bound on size
@@ -1317,6 +1335,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
+        /*.sb_overrides                =*/ nullptr,
         /*.prune_layers                =*/ nullptr
     };
 

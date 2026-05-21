@@ -115,13 +115,14 @@ static void soft_exponent_clip(
 }
 
 // 1-D weighted k-means over BF16 exponent values (0-255).
-// Matches Python _kmeans_palette().
-static void kmeans_palette(const uint32_t counts[256], uint8_t * palette, int k) {
+// Matches Python _kmeans_palette(), but accepts arbitrary float weights so
+// callers can mix raw frequency with imatrix-importance per exponent bucket.
+static void kmeans_palette(const float counts[256], uint8_t * palette, int k) {
     // Collect unique exponents and their weights
     std::vector<uint8_t> unique;
-    std::vector<uint32_t> weights;
+    std::vector<float>   weights;
     for (int i = 0; i < 256; i++) {
-        if (counts[i] > 0) {
+        if (counts[i] > 0.0f) {
             unique.push_back((uint8_t)i);
             weights.push_back(counts[i]);
         }
@@ -134,7 +135,7 @@ static void kmeans_palette(const uint32_t counts[256], uint8_t * palette, int k)
     }
 
     float total_w = 0.0f;
-    for (int i = 0; i < u; i++) total_w += (float)weights[i];
+    for (int i = 0; i < u; i++) total_w += weights[i];
 
     // k-means++ initialization with deterministic seed 42
     xorshift32 rng(42);
@@ -145,7 +146,7 @@ static void kmeans_palette(const uint32_t counts[256], uint8_t * palette, int k)
     float cum = 0.0f;
     int first = 0;
     for (int i = 0; i < u; i++) {
-        cum += (float)weights[i];
+        cum += weights[i];
         if (cum >= r) { first = i; break; }
     }
     centers[0] = (float)unique[first];
@@ -161,7 +162,7 @@ static void kmeans_palette(const uint32_t counts[256], uint8_t * palette, int k)
                 d = d * d;
                 if (d < min_d) min_d = d;
             }
-            d2[i] = min_d * (float)weights[i];
+            d2[i] = min_d * weights[i];
             d2_sum += d2[i];
         }
         if (d2_sum <= 0.0f) {
@@ -198,7 +199,7 @@ static void kmeans_palette(const uint32_t counts[256], uint8_t * palette, int k)
             float num = 0.0f, den = 0.0f;
             for (int i = 0; i < u; i++) {
                 if (labels[i] == j) {
-                    float w = (float)weights[i];
+                    float w = weights[i];
                     num += (float)unique[i] * w;
                     den += w;
                 }
@@ -216,7 +217,7 @@ static void kmeans_palette(const uint32_t counts[256], uint8_t * palette, int k)
                     }
                 }
                 int best_u = -1;
-                uint32_t best_cnt = 0;
+                float best_cnt = 0.0f;
                 for (int i = 0; i < u; i++) {
                     if (represented.find(unique[i]) == represented.end() && weights[i] > best_cnt) {
                         best_cnt = weights[i];
@@ -320,28 +321,38 @@ static sclp_expert_encoded encode_sclp_expert(
         }
     }
 
-    // 3. Collect exponent frequencies from clipped weights
+    // 3. Collect exponent frequencies (and imatrix-weighted counts if available).
+    // Imatrix-weighted: each weight contributes its column's imatrix importance
+    // instead of 1.0. Causes k-means palette centers to cluster around exponent
+    // bands that the actual activations care about, rather than just numeric
+    // frequency. Stochastic rounding (step 2b above) makes this safe to use —
+    // the previous attempt at imatrix-weighted palette regressed PPL 5× because
+    // deterministic truncation converted reduced quant-error into systematic
+    // bias; with stoch round the residual is zero-mean.
     uint32_t counts[256] = {0};
+    float    wcounts[256] = {0.0f};
+    // Imatrix-weighted palette is opt-in via SCLP_IMATRIX_PALETTE=1. Default is
+    // raw-frequency k-means because a naive imatrix-weighted palette regressed
+    // PPL 5× in earlier experiments — the palette centers move toward bands
+    // that activate often but lose coverage of rare exponents that the sidecar
+    // would otherwise rescue. Better to keep frequency-based here and let the
+    // sidecar do imatrix-aware outlier promotion (see step 6).
+    static const char * env_imp = std::getenv("SCLP_IMATRIX_PALETTE");
+    const bool weight_with_imatrix = (env_imp && env_imp[0] == '1') && (imatrix != nullptr) && (K > 0);
     for (int64_t i = 0; i < n; i++) {
         uint8_t exp = (bf16_weights[i] >> 7) & 0xFF;
         counts[exp]++;
+        wcounts[exp] += weight_with_imatrix ? imatrix[i % K] : 1.0f;
     }
 
-    // 4. Select palette
-    if (type == GGML_TYPE_SCLP) {
-        std::vector<std::pair<uint32_t, uint8_t>> freq;
-        for (int i = 0; i < 256; i++) {
-            if (counts[i] > 0) freq.push_back({counts[i], (uint8_t)i});
-        }
-        std::sort(freq.rbegin(), freq.rend());
-        enc.palette_size = std::min((int)freq.size(), p_max);
-        for (int i = 0; i < enc.palette_size; i++) {
-            enc.palette[i] = freq[i].second;
-        }
-    } else {
-        kmeans_palette(counts, enc.palette, p_max);
-        enc.palette_size = p_max;
-    }
+    // 4. Select palette — all SCLP variants use k-means (formerly SCLP8 used
+    // frequency + "all out-of-palette goes to sidecar", but the MoE GEMV kernel
+    // omits sidecar correction for speed, which made distant-exponent weights
+    // decode with catastrophic scale error on residual-feeder tensors. K-means
+    // + "distance > 1" sidecar (below) keeps every weight within at most a 2×
+    // scale error from its true value, making sidecar omission safe).
+    kmeans_palette(wcounts, enc.palette, p_max);
+    enc.palette_size = p_max;
 
     // 5. Build exponent-to-palette mapping and distances
     uint8_t exp_to_idx[256];
@@ -384,12 +395,8 @@ static sclp_expert_encoded encode_sclp_expert(
         sm_nibbles[i] = (sign << (sm_bits - 1)) | mant;
 
         if (!in_palette[exp]) {
-            if (type == GGML_TYPE_SCLP) {
-                // SCLP8: all non-palette exponents -> mandatory sidecar
-                enc.sc_indices.push_back(expert_offset + (uint32_t)i);
-                enc.sc_values.push_back(w);
-            } else {
-                // SCLP4/6 (k-means): only sidecar if distance > 1
+            {
+                // All SCLP types: only sidecar if distance > 1.
                 // Distance=1 means exponent off by 1 — BF16 scale factor of 2x,
                 // negligible error that's cheaper to keep than sidecar.
                 if (exp_distance[exp] > 1) {
