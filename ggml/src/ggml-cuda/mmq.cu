@@ -5,7 +5,7 @@
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
-        case GGML_TYPE_SCLP:
+        case GGML_TYPE_SCLP8:
             printf("DEBUG: SCLP dispatched!\n");
             break;
         case GGML_TYPE_Q1_0:

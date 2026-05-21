@@ -285,7 +285,7 @@ static sclp_expert_encoded encode_sclp_expert(
 
     int p_bits, sm_bits;
     int p_max;
-    if (type == GGML_TYPE_SCLP) {
+    if (type == GGML_TYPE_SCLP8) {
         p_bits = 4; sm_bits = 4; p_max = 16;
     } else if (type == GGML_TYPE_SCLP4) {
         p_bits = 2; sm_bits = 2; p_max = 4;
@@ -388,7 +388,7 @@ static sclp_expert_encoded encode_sclp_expert(
 
         uint8_t sign = (w >> 15) & 1;
         uint8_t mant;
-        if (type == GGML_TYPE_SCLP)       mant = (w >> 4) & 0x7;
+        if (type == GGML_TYPE_SCLP8)       mant = (w >> 4) & 0x7;
         else if (type == GGML_TYPE_SCLP4) mant = (w >> 6) & 0x1;
         else                              mant = (w >> 5) & 0x3;
 
@@ -439,7 +439,7 @@ static sclp_expert_encoded encode_sclp_expert(
     }
 
     // 8. Pack WS stream
-    if (type == GGML_TYPE_SCLP) {
+    if (type == GGML_TYPE_SCLP8) {
         enc.ws_stream.resize(n);
         for (int64_t i = 0; i < n; i++) {
             enc.ws_stream[i] = (indices[i] << 4) | (sm_nibbles[i] & 0xF);

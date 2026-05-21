@@ -804,7 +804,13 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     size_t size = ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
-    if (tensor->type == GGML_TYPE_SCLP  ||
+    // TQ4_1S → q8_0 load-time conversion: allocate q8_0-sized space if opted in
+    if (ggml_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S) {
+        // q8_0 block: 34 bytes per 32 elements. TQ4_1S block: 20 bytes per 32 elements.
+        const int64_t n_blocks = ggml_nelements(tensor) / QK_TQ4_1S;
+        size = n_blocks * sizeof(block_q8_0);
+    }
+    if (tensor->type == GGML_TYPE_SCLP8  ||
         tensor->type == GGML_TYPE_SCLP4 ||
         tensor->type == GGML_TYPE_SCLP6) {
         // Prefer an exact per-tensor hint stashed by the model loader (op_params[13..15]
@@ -2536,7 +2542,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    if (src0->type == GGML_TYPE_SCLP) return false;
+    if (src0->type == GGML_TYPE_SCLP8) return false;
     if (src0->type == GGML_TYPE_SCLP4) return false;
     if (src0->type == GGML_TYPE_SCLP6) return false;
 
@@ -2575,7 +2581,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // SCLP: fused decode-GEMV for M=1 (single-token inference), two-pass otherwise.
-    if (src0->type == GGML_TYPE_SCLP) {
+    if (src0->type == GGML_TYPE_SCLP8) {
         cudaStream_t stream = ctx.stream();
 
         // src0 shape: [K, N] (ne[0]=K, ne[1]=N) — weight matrix
@@ -3400,7 +3406,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     // SCLP MoE: fused decode+GEMV for M=1 (token generation).
-    if (src0->type == GGML_TYPE_SCLP) {
+    if (src0->type == GGML_TYPE_SCLP8) {
         // src0: [K, N, n_experts],  src1: [K, 1, n_tokens] (broadcast across experts),
         // ids:  [n_expert_used, n_tokens],  dst: [N, n_expert_used, n_tokens]
         const int64_t K         = src0->ne[0];
@@ -5971,7 +5977,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
-                    case GGML_TYPE_SCLP:
+                    case GGML_TYPE_TQ4_1S:
+                    case GGML_TYPE_TQ3_1S:
+                    case GGML_TYPE_SCLP8:
                     case GGML_TYPE_SCLP4:
                     case GGML_TYPE_SCLP6:
                         return true;

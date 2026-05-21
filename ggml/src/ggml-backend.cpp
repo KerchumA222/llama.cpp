@@ -2336,7 +2336,7 @@ static size_t ggml_backend_cpu_buffer_type_get_alignment(ggml_backend_buffer_typ
 static size_t ggml_backend_cpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     // SCLP type_size=1 means ggml_nbytes=N, but the blob has a small header+sidecar.
     // Reserve 5% + 64 KB so the full blob fits in host memory for CPU decode.
-    if (tensor->type == GGML_TYPE_SCLP) {
+    if (tensor->type == GGML_TYPE_SCLP8) {
         size_t n = ggml_nbytes(tensor);
         return n + n / 20 + 65536;
     }

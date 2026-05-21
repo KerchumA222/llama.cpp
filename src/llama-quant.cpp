@@ -813,7 +813,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q5_0: return GGML_TYPE_Q5_0;
         case LLAMA_FTYPE_MOSTLY_Q5_1: return GGML_TYPE_Q5_1;
         case LLAMA_FTYPE_MOSTLY_Q8_0: return GGML_TYPE_Q8_0;
-        case LLAMA_FTYPE_MOSTLY_SCLP:  return GGML_TYPE_SCLP;
+        case LLAMA_FTYPE_MOSTLY_SCLP8:  return GGML_TYPE_SCLP8;
         case LLAMA_FTYPE_MOSTLY_SCLP4: return GGML_TYPE_SCLP4;
         case LLAMA_FTYPE_MOSTLY_SCLP6: return GGML_TYPE_SCLP6;
         case LLAMA_FTYPE_MOSTLY_F16:  return GGML_TYPE_F16;
@@ -1242,7 +1242,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
                 fflush(stdout);
 
-                if (new_type == GGML_TYPE_SCLP || new_type == GGML_TYPE_SCLP4 || new_type == GGML_TYPE_SCLP6) {
+                if (new_type == GGML_TYPE_SCLP8 || new_type == GGML_TYPE_SCLP4 || new_type == GGML_TYPE_SCLP6) {
                     // Upper bound: SCLP blob can exceed F32 in worst case (all weights sidecarred)
                     if (work.size() < (size_t)nelements * 8 + 65536) {
                         work.resize(nelements * 8 + 65536);
@@ -1285,7 +1285,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
             // update the gguf meta data as we go
             gguf_set_tensor_type(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_type);
-            if (new_type == GGML_TYPE_SCLP || new_type == GGML_TYPE_SCLP4 || new_type == GGML_TYPE_SCLP6) {
+            if (new_type == GGML_TYPE_SCLP8 || new_type == GGML_TYPE_SCLP4 || new_type == GGML_TYPE_SCLP6) {
                 gguf_set_tensor_disk_size(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_size);
             }
             GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), metadata[i].name.c_str())) == new_size);

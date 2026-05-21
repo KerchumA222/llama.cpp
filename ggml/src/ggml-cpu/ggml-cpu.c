@@ -405,7 +405,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     // SCLP variants: CPU mul_mat intercepts before vec_dot is called; vec_dot_type=BF16
     // ensures wdata is sized for F32→BF16 conversion of src1 in recursive BF16 mul_mat call.
-    [GGML_TYPE_SCLP] = {
+    [GGML_TYPE_SCLP8] = {
         .vec_dot_type             = GGML_TYPE_BF16,
         .nrows                    = 1,
     },
@@ -1282,7 +1282,7 @@ static void sclp_decode_to_bf16_cpu(
     ws_offsets[0] = (uint32_t)(p - blob);
     int64_t weights_per_expert = num_weights / n_experts;
 
-    if (type == GGML_TYPE_SCLP) {
+    if (type == GGML_TYPE_SCLP8) {
         for (uint32_t e = 0; e < n_experts; e++) {
             ws_offsets[e + 1] = ws_offsets[e] + (uint32_t)weights_per_expert;
         }
@@ -1304,7 +1304,7 @@ static void sclp_decode_to_bf16_cpu(
         int64_t base_idx = (int64_t)e * weights_per_expert;
         int64_t nw_e = weights_per_expert; // uniform; last expert may differ but shapes are uniform
 
-        if (type == GGML_TYPE_SCLP) {
+        if (type == GGML_TYPE_SCLP8) {
             // 1 byte/weight: idx(7:4) | smn(3:0)
             for (int64_t j = 0; j < nw_e; j++) {
                 uint8_t b    = ws_e[j];
@@ -1379,7 +1379,7 @@ void ggml_compute_forward_mul_mat(
     }
 
     // CPU fallback for SCLP: single-threaded (thread 0 only) to avoid barrier deadlocks.
-    if (src0->type == GGML_TYPE_SCLP || src0->type == GGML_TYPE_SCLP4 || src0->type == GGML_TYPE_SCLP6) {
+    if (src0->type == GGML_TYPE_SCLP8 || src0->type == GGML_TYPE_SCLP4 || src0->type == GGML_TYPE_SCLP6) {
         if (params->ith != 0) return;
 
         struct ggml_tensor * src0_nc = (struct ggml_tensor *)(uintptr_t)src0;
@@ -1704,7 +1704,7 @@ static void ggml_compute_forward_mul_mat_id(
     // CPU SCLP MoE: decode blob to BF16 once (cached in src0->extra) then recurse.
     // The decoded BF16 buffer persists for the model's lifetime, amortizing decode
     // cost across all forward passes (sched_reserve, warmup, and generation).
-    if (src0->type == GGML_TYPE_SCLP || src0->type == GGML_TYPE_SCLP4 || src0->type == GGML_TYPE_SCLP6) {
+    if (src0->type == GGML_TYPE_SCLP8 || src0->type == GGML_TYPE_SCLP4 || src0->type == GGML_TYPE_SCLP6) {
         // Only thread 0 handles SCLP MoE — avoids barrier count mismatch with threadpool.
         // Other threads return immediately; thread 0 does the full GEMV.
         // For bs=1 (generation): ~30ms. For bs=512 (sched_reserve): ~200ms. Acceptable.
