@@ -403,9 +403,17 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
-    // SCLP: CPU mul_mat intercepts before vec_dot is called; vec_dot_type=BF16 ensures
-    // wdata is sized for F32→BF16 conversion of src1 in the recursive BF16 mul_mat call.
+    // SCLP variants: CPU mul_mat intercepts before vec_dot is called; vec_dot_type=BF16
+    // ensures wdata is sized for F32→BF16 conversion of src1 in recursive BF16 mul_mat call.
     [GGML_TYPE_SCLP] = {
+        .vec_dot_type             = GGML_TYPE_BF16,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_SCLP4] = {
+        .vec_dot_type             = GGML_TYPE_BF16,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_SCLP6] = {
         .vec_dot_type             = GGML_TYPE_BF16,
         .nrows                    = 1,
     },
@@ -1248,14 +1256,21 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
-// Decode a CPU-hosted SCLP blob to BF16 (uint16_t). Called only by thread 0.
-static void sclp_decode_to_bf16_cpu(const uint8_t * blob, uint16_t * output, int64_t num_weights) {
+// Decode a CPU-hosted SCLP blob to BF16 (uint16_t). Supports SCLP8/4/6.
+// Called only by thread 0.
+static void sclp_decode_to_bf16_cpu(
+    enum ggml_type type,
+    const uint8_t * blob,
+    uint16_t * output,
+    int64_t num_weights
+) {
     uint32_t n_experts;
     memcpy(&n_experts, blob + 4, 4);
 
     const uint8_t * p = blob + 8;
     uint8_t palettes[128][16];
     uint8_t palette_lens[128];
+    uint32_t ws_offsets[129]; // per-expert ws byte offset relative to blob start
 
     for (uint32_t e = 0; e < n_experts; e++) {
         palette_lens[e] = p[0];
@@ -1263,19 +1278,84 @@ static void sclp_decode_to_bf16_cpu(const uint8_t * blob, uint16_t * output, int
         p += 1 + p[0];
     }
 
-    const uint8_t * ws = p;
+    // Build per-expert ws offsets from the palette header boundary
+    ws_offsets[0] = (uint32_t)(p - blob);
     int64_t weights_per_expert = num_weights / n_experts;
 
-    for (int64_t i = 0; i < num_weights; i++) {
-        uint32_t e = (uint32_t)(i / weights_per_expert);
-        uint8_t b    = ws[i];
-        uint8_t pidx = b >> 4;
-        uint8_t smn  = b & 0xF;
-        uint8_t exp  = pidx < palette_lens[e] ? palettes[e][pidx] : 0;
-        output[i]    = (uint16_t)(((smn >> 3) & 1) << 15) | ((uint16_t)exp << 7) | ((uint16_t)(smn & 0x7) << 4);
+    if (type == GGML_TYPE_SCLP) {
+        for (uint32_t e = 0; e < n_experts; e++) {
+            ws_offsets[e + 1] = ws_offsets[e] + (uint32_t)weights_per_expert;
+        }
+    } else if (type == GGML_TYPE_SCLP4) {
+        uint32_t nb = (uint32_t)((weights_per_expert + 1) / 2);
+        for (uint32_t e = 0; e < n_experts; e++) {
+            ws_offsets[e + 1] = ws_offsets[e] + nb;
+        }
+    } else { // SCLP6
+        uint32_t ng = (uint32_t)((weights_per_expert + 3) / 4);
+        for (uint32_t e = 0; e < n_experts; e++) {
+            ws_offsets[e + 1] = ws_offsets[e] + ng * 3;
+        }
     }
 
-    const uint8_t * sc_base = ws + num_weights;
+    // Decode per-expert
+    for (uint32_t e = 0; e < n_experts; e++) {
+        const uint8_t * ws_e = blob + ws_offsets[e];
+        int64_t base_idx = (int64_t)e * weights_per_expert;
+        int64_t nw_e = weights_per_expert; // uniform; last expert may differ but shapes are uniform
+
+        if (type == GGML_TYPE_SCLP) {
+            // 1 byte/weight: idx(7:4) | smn(3:0)
+            for (int64_t j = 0; j < nw_e; j++) {
+                uint8_t b    = ws_e[j];
+                uint8_t pidx = b >> 4;
+                uint8_t smn  = b & 0xF;
+                uint8_t exp  = pidx < palette_lens[e] ? palettes[e][pidx] : 0;
+                output[base_idx + j] =
+                    (uint16_t)(((smn >> 3) & 1) << 15) |
+                    ((uint16_t)exp << 7) |
+                    ((uint16_t)(smn & 0x7) << 4);
+            }
+        } else if (type == GGML_TYPE_SCLP4) {
+            // 2 weights/byte, nibble: bits[3:2]=idx, bit[1]=sign, bit[0]=mant_top1
+            for (int64_t j = 0; j < nw_e; j++) {
+                uint8_t byte   = ws_e[j / 2];
+                uint8_t nibble = (j & 1) ? (byte & 0xF) : (byte >> 4);
+                uint8_t pidx   = nibble >> 2;
+                uint8_t smn    = nibble & 0x3;
+                uint8_t exp    = pidx < palette_lens[e] ? palettes[e][pidx] : 0;
+                output[base_idx + j] =
+                    (uint16_t)(((smn >> 1) & 1) << 15) |
+                    ((uint16_t)exp << 7) |
+                    ((uint16_t)(smn & 1) << 6);
+            }
+        } else { // SCLP6
+            // 4 weights per 3 bytes, sixbit: bits[5:3]=idx, bit[2]=sign, bits[1:0]=mant_top2
+            for (int64_t j = 0; j < nw_e; j += 4) {
+                uint32_t group = (uint32_t)(j / 4);
+                const uint8_t * g = ws_e + group * 3;
+                uint8_t sixbits[4];
+                sixbits[0] = g[0] >> 2;
+                sixbits[1] = ((g[0] & 0x3) << 4) | (g[1] >> 4);
+                sixbits[2] = ((g[1] & 0xF) << 2) | (g[2] >> 6);
+                sixbits[3] = g[2] & 0x3F;
+                int64_t remaining = nw_e - j;
+                for (int k = 0; k < 4 && k < remaining; k++) {
+                    uint8_t pidx = sixbits[k] >> 3;
+                    uint8_t smn  = sixbits[k] & 0x7;
+                    uint8_t exp  = pidx < palette_lens[e] ? palettes[e][pidx] : 0;
+                    output[base_idx + j + k] =
+                        (uint16_t)(((smn >> 2) & 1) << 15) |
+                        ((uint16_t)exp << 7) |
+                        ((uint16_t)(smn & 0x3) << 5);
+                }
+            }
+        }
+    }
+
+    // Sidecar fixup (same layout for all three types)
+    uint64_t ws_total = (uint64_t)(ws_offsets[n_experts] - ws_offsets[0]);
+    const uint8_t * sc_base = blob + ws_offsets[0] + ws_total;
     uint32_t sc_count;
     memcpy(&sc_count, sc_base, 4);
     const uint32_t * sc_idx = (const uint32_t *)(sc_base + 4);
@@ -1299,7 +1379,7 @@ void ggml_compute_forward_mul_mat(
     }
 
     // CPU fallback for SCLP: single-threaded (thread 0 only) to avoid barrier deadlocks.
-    if (src0->type == GGML_TYPE_SCLP) {
+    if (src0->type == GGML_TYPE_SCLP || src0->type == GGML_TYPE_SCLP4 || src0->type == GGML_TYPE_SCLP6) {
         if (params->ith != 0) return;
 
         struct ggml_tensor * src0_nc = (struct ggml_tensor *)(uintptr_t)src0;
@@ -1307,7 +1387,7 @@ void ggml_compute_forward_mul_mat(
             int64_t nw = ggml_nelements(src0);
             uint16_t * bf16 = (uint16_t *)malloc((size_t)nw * sizeof(uint16_t));
             GGML_ASSERT(bf16 != NULL && "sclp cpu decode: out of memory");
-            sclp_decode_to_bf16_cpu((const uint8_t *)src0->data, bf16, nw);
+            sclp_decode_to_bf16_cpu(src0->type, (const uint8_t *)src0->data, bf16, nw);
             src0_nc->extra = bf16;
         }
 
@@ -1624,7 +1704,7 @@ static void ggml_compute_forward_mul_mat_id(
     // CPU SCLP MoE: decode blob to BF16 once (cached in src0->extra) then recurse.
     // The decoded BF16 buffer persists for the model's lifetime, amortizing decode
     // cost across all forward passes (sched_reserve, warmup, and generation).
-    if (src0->type == GGML_TYPE_SCLP) {
+    if (src0->type == GGML_TYPE_SCLP || src0->type == GGML_TYPE_SCLP4 || src0->type == GGML_TYPE_SCLP6) {
         // Only thread 0 handles SCLP MoE — avoids barrier count mismatch with threadpool.
         // Other threads return immediately; thread 0 does the full GEMV.
         // For bs=1 (generation): ~30ms. For bs=512 (sched_reserve): ~200ms. Acceptable.
@@ -1637,7 +1717,7 @@ static void ggml_compute_forward_mul_mat_id(
             int64_t nw = ggml_nelements(src0);
             uint16_t * bf16 = (uint16_t *)malloc((size_t)nw * sizeof(uint16_t));
             GGML_ASSERT(bf16 != NULL && "sclp mul_mat_id cpu: out of memory");
-            sclp_decode_to_bf16_cpu((const uint8_t *)src0->data, bf16, nw);
+            sclp_decode_to_bf16_cpu(src0->type, (const uint8_t *)src0->data, bf16, nw);
             src0_nc->extra = bf16;
         }
 

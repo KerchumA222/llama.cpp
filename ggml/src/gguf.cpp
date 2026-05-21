@@ -1074,7 +1074,7 @@ enum ggml_type gguf_get_tensor_type(const struct gguf_context * ctx, int64_t ten
 
 size_t gguf_get_tensor_size(const struct gguf_context * ctx, int64_t tensor_id) {
     GGML_ASSERT(tensor_id >= 0 && tensor_id < gguf_get_n_tensors(ctx));
-    return ggml_nbytes(&ctx->info[tensor_id].t);
+    return gguf_ti_nbytes(ctx->info[tensor_id]);
 }
 
 int64_t gguf_remove_key(struct gguf_context * ctx, const char * key) {
