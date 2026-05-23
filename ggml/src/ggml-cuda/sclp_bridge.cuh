@@ -74,13 +74,13 @@ inline int _sclp_tg_atexit_register = sclp_tg::register_atexit();
 
 // SCLP decode bridge for llama.cpp HIP backend.
 //
-// Wire format (SCLP blob stored in VRAM):
-//   [uint32 num_weights][uint8 palette_size][palette (palette_size bytes)]
+// Wire format (SCLP blob stored in VRAM, all types share the same header):
+//   [uint32 num_weights][uint32 n_experts]
+//   [per-expert: uint8 palette_size, uint8 × palette_size palette] ...
 //   [ws_stream (num_weights bytes): palette_idx(7:4) | smn(3:0)]
 //   [uint32 sidecar_count]
 //   [uint32 × sidecar_count sidecar_indices]
 //   [uint16 × sidecar_count sidecar_values]
-//   [zero padding to fill num_weights*2 bytes total]
 //
 // Weights whose exponent falls outside the top-16 palette are stored verbatim in
 // the sidecar section and restored exactly by sclp_fixup_sidecar_kernel.
