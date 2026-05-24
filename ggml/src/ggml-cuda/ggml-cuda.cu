@@ -2580,6 +2580,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Max shared memory for fused GEMV kernels (RDNA3 LDS limit = 64 KB).
+    constexpr size_t SCLP_MAX_SMEM = 65536;
+
     // SCLP: fused decode-GEMV for M=1 (single-token inference), two-pass otherwise.
     if (src0->type == GGML_TYPE_SCLP8) {
         cudaStream_t stream = ctx.stream();
@@ -2590,7 +2593,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t N = src0->ne[1];
         const int64_t M = src1->ne[1];  // batch / sequence dimension
 
-        if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        // Fused GEMV broadcasts activations into shared memory (1024 + K*4 bytes).
+        // Skip when K exceeds LDS limit (e.g. ffn_down on Gemma4-31B, K=21504).
+        if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+                && (1024 + (size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
             llama_sclp_fused_gemv(
                 src0->data,
                 (const float*)src1->data,
@@ -2642,7 +2648,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t N = src0->ne[1];
         const int64_t M = src1->ne[1];
 
-        if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+                && (64 + (size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
             llama_sclp4_fused_gemv(
                 src0->data,
                 (const float*)src1->data,
@@ -2678,7 +2685,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t N = src0->ne[1];
         const int64_t M = src1->ne[1];
 
-        if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        // SCLP6 fused GEMV disabled: kernel produces numerical errors on Gemma4-31B
+        // dense attention tensors. Two-pass (decode→BF16→rocBLAS) is correct.
+        // TODO: debug sclp6_fused_gemv_kernel accumulation/decode logic.
+        if (false && M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+                && (264 + (size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
             llama_sclp6_fused_gemv(
                 src0->data,
                 (const float*)src1->data,

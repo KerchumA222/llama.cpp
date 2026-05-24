@@ -4,6 +4,8 @@
 #include <vector>
 #include <cstdint>
 
+#define QK_SCLP 32
+
 // Quantize a whole tensor (possibly with multiple experts) to SCLP format.
 //
 // nelements   = total weight count (ne[0] * ne[1] * ne[2])
@@ -13,6 +15,13 @@
 // clip_threshold: 0 = no soft clipping, 125 = recommended default for BF16.
 // sidecar_imatrix_budget: fraction of weights to add to sidecar via imatrix
 //   ranking (0.0 = disabled, 0.01 = recommended default when imatrix is present).
+//
+// Layout: [header][scales][ws_stream][sidecar]
+//   header: [uint32 num_weights][uint32 n_experts][per-expert: palette_size, palette]
+//   scales: [uint16 scale_fp16] x (num_weights / QK_SCLP)
+//   ws_stream: packed indices + SM bits
+//   sidecar: [uint32 count][uint32 indices][uint16 bf16_bits]
+//
 // Returns the total size of the quantized blob.
 size_t llama_tensor_quantize_sclp(
     ggml_type type,
@@ -24,4 +33,13 @@ size_t llama_tensor_quantize_sclp(
     const float * imatrix,
     uint8_t  clip_threshold = 0,
     float    sidecar_imatrix_budget = 0.01f
+);
+
+// Dequantize a SCLP blob back to F32.
+// Mostly for testing and CPU fallback.
+void llama_tensor_dequantize_sclp(
+    ggml_type type,
+    const void * data,
+    float * f32_data,
+    int64_t nelements
 );
