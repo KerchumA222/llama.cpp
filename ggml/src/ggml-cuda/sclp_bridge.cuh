@@ -1087,6 +1087,8 @@ __global__ void sclp4_fused_gemv_kernel(
     extern __shared__ char smem[];
     __shared__ uint32_t s_bpal_start;
     __shared__ uint32_t s_ws_start;
+    __shared__ uint32_t s_sc_base;
+    __shared__ uint32_t s_sc_count;
     float* s_x = (float*)smem;   // K floats (no LUT needed)
 
     if (threadIdx.x == 0) {
@@ -1094,7 +1096,12 @@ __global__ void sclp4_fused_gemv_kernel(
         const uint8_t* p = blob + 8;
         for (uint32_t ei = 0; ei < ne; ei++) p += 1 + p[0];
         s_bpal_start = (uint32_t)(p - blob);
-        s_ws_start = s_bpal_start + (((uint64_t)N * K) / QK_SCLP4) * 4;
+        uint64_t nw = (uint64_t)N * K;
+        s_ws_start = s_bpal_start + (uint32_t)((nw / QK_SCLP4) * 4);
+        uint32_t enw = (uint32_t)(nw / ne);
+        uint64_t ws_total = (uint64_t)ne * ((enw + 1) / 2);
+        s_sc_base = s_ws_start + (uint32_t)ws_total;
+        __builtin_memcpy(&s_sc_count, blob + s_sc_base, sizeof(uint32_t));
     }
 
     for (uint32_t k = threadIdx.x; k < K; k += blockDim.x) {
@@ -1141,6 +1148,35 @@ __global__ void sclp4_fused_gemv_kernel(
             uint16_t bits_lo = ((uint16_t)sign_lo << 15) | ((uint16_t)exp_lo << 7) | ((uint16_t)mant_lo << 6);
             float w_lo = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&bits_lo));
             acc += w_lo * s_x[k0 + 1];
+        }
+    }
+
+    // Fold sidecar (sorted-index → contiguous per-row range). Previously SCLP4 fused
+    // GEMV omitted sidecar entirely; correcting it improves token-gen quality.
+    uint32_t sc_count = s_sc_count;
+    if (sc_count > 0) {
+        const uint32_t* sc_idx = (const uint32_t*)(blob + s_sc_base + 4);
+        const uint16_t* sc_val = (const uint16_t*)(blob + s_sc_base + 4 + (uint64_t)sc_count * 4);
+        uint32_t lo = 0, hi = 0;
+        if (lane == 0) {
+            uint32_t t0 = (uint32_t)row_weight_base, t1 = t0 + K, a = 0, b2 = sc_count;
+            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t0) a = m + 1; else b2 = m; }
+            lo = a; b2 = sc_count;
+            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t1) a = m + 1; else b2 = m; }
+            hi = a;
+        }
+        lo = __shfl(lo, 0); hi = __shfl(hi, 0);
+        for (uint32_t e = lo + lane; e < hi; e += 32) {
+            uint32_t gidx = sc_idx[e];
+            uint32_t col  = gidx - (uint32_t)row_weight_base;
+            uint8_t byte  = ws[(uint64_t)gidx >> 1];
+            uint8_t nib   = (gidx & 1) ? (byte & 0xF) : (byte >> 4);
+            const uint8_t* bp = bpal_base + (uint64_t)(gidx / QK_SCLP4) * 4;
+            uint16_t ab = ((uint16_t)((nib >> 1) & 1) << 15) | ((uint16_t)bp[nib >> 2] << 7) | ((uint16_t)(nib & 1) << 6);
+            float approx = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&ab));
+            uint16_t tb = sc_val[e];
+            float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
+            acc += (trueval - approx) * s_x[col];
         }
     }
 
