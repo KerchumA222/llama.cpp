@@ -159,6 +159,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_SCLP8         = 45, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_SCLP6         = 46, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_SCLP4         = 47, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_SCLP5         = 48, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

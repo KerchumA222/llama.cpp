@@ -8,7 +8,7 @@
 #define QK_SCLP4 256
 
 static inline int qk_for_type(ggml_type type) {
-    return (type == GGML_TYPE_SCLP4) ? QK_SCLP4 : QK_SCLP;
+    return (type == GGML_TYPE_SCLP4 || type == GGML_TYPE_SCLP5) ? QK_SCLP4 : QK_SCLP;
 }
 
 // Quantize a whole tensor (possibly with multiple experts) to SCLP format.

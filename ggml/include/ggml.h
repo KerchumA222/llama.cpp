@@ -437,7 +437,8 @@ extern "C" {
         GGML_TYPE_SCLP8   = 47,
         GGML_TYPE_SCLP6   = 48,
         GGML_TYPE_SCLP4   = 49,
-        GGML_TYPE_COUNT   = 50,
+        GGML_TYPE_SCLP5   = 50,
+        GGML_TYPE_COUNT   = 51,
     };
 
     // precision

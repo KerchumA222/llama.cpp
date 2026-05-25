@@ -69,6 +69,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "SCLP8",    LLAMA_FTYPE_MOSTLY_SCLP8,    " 8-bit SCLP (2.0x, lossless-first)",},
     { "SCLP6",    LLAMA_FTYPE_MOSTLY_SCLP6,    " 6-bit SCLP (2.7x, lossless-first)",},
     { "SCLP4",    LLAMA_FTYPE_MOSTLY_SCLP4,    " 4-bit SCLP (4.0x, lossless-first)",},
+    { "SCLP5",    LLAMA_FTYPE_MOSTLY_SCLP5,    " 5-bit SCLP (idx2|sign1|mant2, per-block palette)",},
     { "F16",      LLAMA_FTYPE_MOSTLY_F16,      "14.00G, +0.0020 ppl @ Mistral-7B",  },
     { "BF16",     LLAMA_FTYPE_MOSTLY_BF16,     "14.00G, -0.0050 ppl @ Mistral-7B",  },
     { "F32",      LLAMA_FTYPE_ALL_F32,         "26.00G              @ 7B",          },

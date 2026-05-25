@@ -1198,6 +1198,136 @@ inline void llama_sclp4_dispatch(
     }
 }
 
+// ===================== SCLP5 (5-bit: idx2|sign1|mant2) =====================
+// Per-block palette identical to SCLP4 (4 exponent entries per QK_SCLP4=256 block,
+// 4 bytes/block, palette_size=0 header). ws_stream packs 8 weights into 5 bytes:
+// 8 five-bit codes MSB-first into a 40-bit big-endian field. Per weight:
+// code = idx(4:3) | sign(2) | mant(1:0); bits = sign<<15 | exp<<7 | mant<<5.
+__global__ void sclp5_decode_blob_kernel(
+    const uint8_t* __restrict__ blob,
+    uint16_t*      __restrict__ output,
+    uint32_t                    num_weights
+) {
+    __shared__ uint32_t s_n_experts;
+    __shared__ uint32_t s_bpal_start;
+    __shared__ uint32_t s_ws_start;
+    __shared__ uint32_t s_expert_nw;
+    __shared__ uint32_t s_expert_ws_bytes;
+    __shared__ uint32_t s_blocks_per_expert;
+    __shared__ uint32_t s_groups_per_expert;
+
+    if (threadIdx.x == 0) {
+        uint32_t ne;
+        __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
+        s_n_experts = ne;
+        const uint8_t* p = blob + 8;
+        for (uint32_t e = 0; e < ne; e++) { p += 1 + p[0]; }
+        s_bpal_start = (uint32_t)(p - blob);
+        uint32_t enw = num_weights / ne;
+        s_expert_nw = enw;
+        s_blocks_per_expert = enw / QK_SCLP4;
+        s_groups_per_expert = (enw + 7) / 8;
+        s_ws_start = s_bpal_start + (num_weights / QK_SCLP4) * 4;
+        s_expert_ws_bytes = ((enw + 7) / 8) * 5;
+    }
+    __syncthreads();
+
+    const uint8_t* bpal_base = blob + s_bpal_start;
+    const uint8_t* ws        = blob + s_ws_start;
+    const uint32_t enw       = s_expert_nw;
+    const uint32_t gpe       = s_groups_per_expert;
+    const uint32_t total_groups = gpe * s_n_experts;
+
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x; gid < total_groups; gid += stride) {
+        uint32_t e          = gid / gpe;
+        uint32_t g_local    = gid % gpe;
+        uint32_t local_base = g_local * 8;
+        uint32_t base_idx   = e * enw + local_base;
+
+        uint32_t block_idx = e * s_blocks_per_expert + local_base / QK_SCLP4;
+        const uint8_t* bp  = bpal_base + (uint64_t)block_idx * 4;
+
+        const uint8_t* g = ws + (uint64_t)e * s_expert_ws_bytes + (uint64_t)g_local * 5;
+        uint64_t v = ((uint64_t)g[0] << 32) | ((uint64_t)g[1] << 24) |
+                     ((uint64_t)g[2] << 16) | ((uint64_t)g[3] << 8)  | (uint64_t)g[4];
+
+        uint32_t n_this = min(8u, enw - local_base);
+        for (uint32_t i = 0; i < n_this; i++) {
+            uint8_t code = (uint8_t)((v >> (5 * (7 - i))) & 0x1F);
+            uint8_t idx  = code >> 3;
+            uint8_t sign = (code >> 2) & 1;
+            uint8_t mant = code & 0x3;
+            uint8_t exp_ = bp[idx];
+            uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 5);
+            output[base_idx + i] = bits;
+        }
+    }
+}
+
+__global__ void sclp5_fixup_sidecar_kernel(
+    const uint8_t* __restrict__ blob,
+    uint16_t*      __restrict__ output,
+    uint32_t                    num_weights
+) {
+    __shared__ uint32_t s_ws_start;
+    __shared__ uint32_t s_n_experts;
+    __shared__ uint32_t sidecar_count_s;
+
+    if (threadIdx.x == 0) {
+        uint32_t ne;
+        __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
+        s_n_experts = ne;
+        const uint8_t* p = blob + 8;
+        for (uint32_t e = 0; e < ne; e++) { p += 1 + p[0]; }
+        uint32_t bpal_start = (uint32_t)(p - blob);
+        s_ws_start = bpal_start + (num_weights / QK_SCLP4) * 4;
+    }
+    __syncthreads();
+
+    const uint8_t* ws  = blob + s_ws_start;
+    uint32_t expert_nw = num_weights / s_n_experts;
+    uint64_t total_ws_bytes = (uint64_t)s_n_experts * (((expert_nw + 7) / 8) * 5);
+    const uint8_t* sidecar_base = ws + total_ws_bytes;
+
+    if (threadIdx.x == 0) {
+        uint32_t sc;
+        __builtin_memcpy(&sc, sidecar_base, sizeof(uint32_t));
+        sidecar_count_s = sc;
+    }
+    __syncthreads();
+    if (sidecar_count_s == 0) return;
+
+    const uint8_t* idx_base = sidecar_base + 4;
+    const uint8_t* val_base = sidecar_base + 4 + (uint64_t)sidecar_count_s * sizeof(uint32_t);
+
+    uint32_t stride = gridDim.x * blockDim.x;
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    for (uint32_t si = tid; si < sidecar_count_s; si += stride) {
+        uint32_t idx; uint16_t val;
+        __builtin_memcpy(&idx, idx_base + (uint64_t)si * sizeof(uint32_t), sizeof(uint32_t));
+        __builtin_memcpy(&val, val_base + (uint64_t)si * sizeof(uint16_t), sizeof(uint16_t));
+        output[idx] = val;
+    }
+}
+
+inline void llama_sclp5_dispatch(
+    const void* sclp_data,
+    uint16_t*   output,
+    uint32_t    num_weights,
+    hipStream_t stream,
+    bool        apply_sidecar = true
+) {
+    const uint8_t* data = (const uint8_t*)sclp_data;
+    dim3 block(256);
+    uint32_t groups = (num_weights + 7) / 8;
+    dim3 decode_grid((groups + 255) / 256);
+    sclp5_decode_blob_kernel<<<decode_grid, block, 0, stream>>>(data, output, num_weights);
+    if (apply_sidecar) {
+        sclp5_fixup_sidecar_kernel<<<1024, block, 0, stream>>>(data, output, num_weights);
+    }
+}
+
 inline void llama_sclp4_fused_gemv(
     const void*   blob_ptr,
     const float*  src_f32,
