@@ -73,6 +73,7 @@ namespace sclp_tg {
 inline int _sclp_tg_atexit_register = sclp_tg::register_atexit();
 
 #define QK_SCLP 32
+#define QK_SCLP4 256
 
 static __device__ __forceinline__ uint16_t float_to_bf16_dev(float f) {
     union { float f; uint32_t u; } x;
@@ -909,33 +910,29 @@ __global__ void sclp4_decode_blob_kernel(
     uint32_t                    num_weights
 ) {
     __shared__ uint32_t s_n_experts;
-    __shared__ uint32_t s_scales_start;
+    __shared__ uint32_t s_bpal_start;
     __shared__ uint32_t s_ws_start;
-    __shared__ uint8_t  s_palette_sizes[256];
-    __shared__ uint8_t  s_palettes[256][4];
     __shared__ uint32_t s_expert_nw;
     __shared__ uint32_t s_expert_nibble_bytes;
+    __shared__ uint32_t s_blocks_per_expert;
 
     if (threadIdx.x == 0) {
         uint32_t ne;
         __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
         s_n_experts = ne;
         const uint8_t* p = blob + 8;
-        for (uint32_t e = 0; e < ne && e < 256; e++) {
-            s_palette_sizes[e] = p[0];
-            for (int i = 0; i < (int)s_palette_sizes[e]; i++) s_palettes[e][i] = p[1 + i];
-            p += 1 + p[0];
-        }
-        s_scales_start = (uint32_t)(p - blob);
-        s_ws_start = s_scales_start + (num_weights / QK_SCLP) * sizeof(uint16_t);
+        for (uint32_t e = 0; e < ne; e++) { p += 1 + p[0]; }
+        s_bpal_start = (uint32_t)(p - blob);
         uint32_t enw = num_weights / ne;
         s_expert_nw = enw;
+        s_blocks_per_expert = enw / QK_SCLP4;
+        s_ws_start = s_bpal_start + (num_weights / QK_SCLP4) * 4;
         s_expert_nibble_bytes = (enw + 1) / 2;
     }
     __syncthreads();
 
-    const uint8_t* scales = blob + s_scales_start;
-    const uint8_t* ws     = blob + s_ws_start;
+    const uint8_t* bpal_base = blob + s_bpal_start;
+    const uint8_t* ws        = blob + s_ws_start;
     uint32_t expert_nw = s_expert_nw;
 
     const uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -948,21 +945,17 @@ __global__ void sclp4_decode_blob_kernel(
     const uint32_t local_base = base_idx - e * expert_nw;
     if (e >= s_n_experts) return;
 
-    const uint8_t pal0 = s_palettes[e][0];
-    const uint8_t pal1 = s_palettes[e][1];
-    const uint8_t pal2 = s_palettes[e][2];
-    const uint8_t pal3 = s_palettes[e][3];
-    const uint8_t pal_size = s_palette_sizes[e];
+    // Per-block palette: read 4 palette bytes for this block
+    uint32_t block_idx = e * s_blocks_per_expert + (local_base / QK_SCLP4);
+    const uint8_t* bp = bpal_base + block_idx * 4;
+    const uint8_t bp0 = bp[0], bp1 = bp[1], bp2 = bp[2], bp3 = bp[3];
 
     const uint8_t* ws_p = ws + (uint64_t)e * s_expert_nibble_bytes + local_base / 2;
-    const uint16_t* s_ptr = (const uint16_t*)(scales + (uint64_t)e * (expert_nw / QK_SCLP) * sizeof(uint16_t));
     uint32_t remaining_expert = expert_nw - local_base;
     uint32_t n_this = min(W_PER_THREAD, remaining_expert);
 
     uint16_t out[32];
     if (n_this == 32) {
-        // Handle 32 weights (one QK_SCLP block) using 2x 64-bit vectorized loads
-        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(s_ptr + (local_base / QK_SCLP)));
         for (int q = 0; q < 2; q++) {
             uint64_t ws8;
             __builtin_memcpy(&ws8, ws_p + q * 8, 8);
@@ -974,20 +967,17 @@ __global__ void sclp4_decode_blob_kernel(
                     uint8_t nibble = (j == 0) ? (byte >> 4) : (byte & 0xF);
                     uint8_t pidx = nibble >> 2;
                     uint8_t smn  = nibble & 0x3;
-                    uint8_t exp_ = 0;
-                    if (pidx < pal_size) {
-                        switch(pidx) {
-                            case 0: exp_ = pal0; break;
-                            case 1: exp_ = pal1; break;
-                            case 2: exp_ = pal2; break;
-                            case 3: exp_ = pal3; break;
-                        }
+                    uint8_t exp_;
+                    switch(pidx) {
+                        case 0: exp_ = bp0; break;
+                        case 1: exp_ = bp1; break;
+                        case 2: exp_ = bp2; break;
+                        default: exp_ = bp3; break;
                     }
                     uint8_t sign = (smn >> 1) & 1;
                     uint8_t mant = smn & 1;
                     uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 6);
-                    float w = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&bits)) * scale;
-                    out[q * 16 + i * 2 + j] = float_to_bf16_dev(w);
+                    out[q * 16 + i * 2 + j] = *reinterpret_cast<uint16_t*>(&bits);
                 }
             }
         }
@@ -999,25 +989,21 @@ __global__ void sclp4_decode_blob_kernel(
         }
     } else {
         for (uint32_t i = 0; i < n_this; ++i) {
-            float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(s_ptr + ((local_base + i) / QK_SCLP)));
             uint8_t byte = ws_p[i / 2];
             uint8_t nibble = (i % 2 == 0) ? (byte >> 4) : (byte & 0xF);
             uint8_t pidx = nibble >> 2;
             uint8_t smn  = nibble & 0x3;
-            uint8_t exp_ = 0;
-            if (pidx < pal_size) {
-                switch(pidx) {
-                    case 0: exp_ = pal0; break;
-                    case 1: exp_ = pal1; break;
-                    case 2: exp_ = pal2; break;
-                    case 3: exp_ = pal3; break;
-                }
+            uint8_t exp_;
+            switch(pidx) {
+                case 0: exp_ = bp0; break;
+                case 1: exp_ = bp1; break;
+                case 2: exp_ = bp2; break;
+                default: exp_ = bp3; break;
             }
             uint8_t sign = (smn >> 1) & 1;
             uint8_t mant = smn & 1;
             uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 6);
-            float w = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&bits)) * scale;
-            output[base_idx + i] = float_to_bf16_dev(w);
+            output[base_idx + i] = bits;
         }
     }
 }
@@ -1037,8 +1023,8 @@ __global__ void sclp4_fixup_sidecar_kernel(
         s_n_experts = ne;
         const uint8_t* p = blob + 8;
         for (uint32_t e = 0; e < ne; e++) { p += 1 + p[0]; }
-        uint32_t scales_start = (uint32_t)(p - blob);
-        s_ws_start = scales_start + (num_weights / QK_SCLP) * sizeof(uint16_t);
+        uint32_t bpal_start = (uint32_t)(p - blob);
+        s_ws_start = bpal_start + (num_weights / QK_SCLP4) * 4;
     }
     __syncthreads();
 
@@ -1099,41 +1085,25 @@ __global__ void sclp4_fused_gemv_kernel(
     uint32_t K
 ) {
     extern __shared__ char smem[];
-    __shared__ uint32_t s_scales_start;
+    __shared__ uint32_t s_bpal_start;
     __shared__ uint32_t s_ws_start;
-    float* s_lut = (float*)smem;          // 16 floats = 64 bytes
-    float* s_x   = (float*)(smem + 64);   // K floats
+    float* s_x = (float*)smem;   // K floats (no LUT needed)
 
-    // Thread 0: parse header (n_experts=1 for dense), build 4×4 decode LUT.
     if (threadIdx.x == 0) {
         uint32_t ne; __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
         const uint8_t* p = blob + 8;
-        uint8_t pal_size = p[0];
-        uint8_t pal[4];
-        for (int i = 0; i < (int)pal_size; i++) pal[i] = p[1 + i];
-        for (int pidx = 0; pidx < 4; pidx++) {
-            uint8_t exp_ = (pidx < (int)pal_size) ? pal[pidx] : 0;
-            for (int smn = 0; smn < 4; smn++) {
-                uint8_t sign = (smn >> 1) & 1;
-                uint8_t mant = smn & 1;
-                uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 6);
-                s_lut[pidx * 4 + smn] = __bfloat162float(*(__hip_bfloat16*)&bits);
-            }
-        }
         for (uint32_t ei = 0; ei < ne; ei++) p += 1 + p[0];
-        s_scales_start = (uint32_t)(p - blob);
-        s_ws_start = s_scales_start + (((uint64_t)N * K) / QK_SCLP) * sizeof(uint16_t);
+        s_bpal_start = (uint32_t)(p - blob);
+        s_ws_start = s_bpal_start + (((uint64_t)N * K) / QK_SCLP4) * 4;
     }
 
-    // Cooperative LDS load of x[K]. One global read per element across the whole block,
-    // not per warp — saves (warps_per_block - 1) × K × 4 bytes per block of redundant traffic.
     for (uint32_t k = threadIdx.x; k < K; k += blockDim.x) {
         s_x[k] = x[k];
     }
     __syncthreads();
 
-    const uint16_t* scales = (const uint16_t*)(blob + s_scales_start);
-    const uint8_t*  ws     = blob + s_ws_start;
+    const uint8_t*  bpal_base = blob + s_bpal_start;
+    const uint8_t*  ws        = blob + s_ws_start;
 
     const int warps_per_block = blockDim.x / 32;
     const int warp_id  = threadIdx.x / 32;
@@ -1150,10 +1120,27 @@ __global__ void sclp4_fused_gemv_kernel(
     for (uint32_t b = lane; b < n_bytes_row; b += 32) {
         uint8_t byte = ws[row_byte_base + b];
         uint32_t k0  = b * 2;
-        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (row_weight_base + k0) / QK_SCLP));
-        acc += (s_lut[byte >> 4] * scale) * s_x[k0];
+        uint32_t block_idx = (row_weight_base + k0) / QK_SCLP4;
+        const uint8_t* bp = bpal_base + block_idx * 4;
+
+        uint8_t pidx_hi = byte >> 6;
+        uint8_t smn_hi  = (byte >> 4) & 0x3;
+        uint8_t exp_hi  = bp[pidx_hi];
+        uint8_t sign_hi = (smn_hi >> 1) & 1;
+        uint8_t mant_hi = smn_hi & 1;
+        uint16_t bits_hi = ((uint16_t)sign_hi << 15) | ((uint16_t)exp_hi << 7) | ((uint16_t)mant_hi << 6);
+        float w_hi = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&bits_hi));
+        acc += w_hi * s_x[k0];
+
         if (k0 + 1 < K) {
-            acc += (s_lut[byte & 0xF] * scale) * s_x[k0 + 1];
+            uint8_t pidx_lo = (byte >> 2) & 0x3;
+            uint8_t smn_lo  = byte & 0x3;
+            uint8_t exp_lo  = bp[pidx_lo];
+            uint8_t sign_lo = (smn_lo >> 1) & 1;
+            uint8_t mant_lo = smn_lo & 1;
+            uint16_t bits_lo = ((uint16_t)sign_lo << 15) | ((uint16_t)exp_lo << 7) | ((uint16_t)mant_lo << 6);
+            float w_lo = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&bits_lo));
+            acc += w_lo * s_x[k0 + 1];
         }
     }
 
@@ -1219,12 +1206,10 @@ inline void llama_sclp4_fused_gemv(
     uint32_t      K,
     hipStream_t   stream
 ) {
-    // 16 warps/block matches the MoE variant. Dynamic shared mem: 64 (LUT) + K*4 (activations).
-    // Max K for RDNA3 LDS (64 KB): ~16000. Llama-3 ffn K=14336 fits with headroom.
     constexpr int WARPS_PER_BLOCK = 16;
     dim3 gemv_block(WARPS_PER_BLOCK * 32);
     dim3 gemv_grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
-    size_t smem_bytes = 64 + (size_t)K * sizeof(float);
+    size_t smem_bytes = (size_t)K * sizeof(float);
     SCLP_TG_TIME_BEGIN(sclp_tg::CAT_SCLP4_DENSE);
     sclp4_fused_gemv_kernel<<<gemv_grid, gemv_block, smem_bytes, stream>>>(
         (const uint8_t*)blob_ptr,
@@ -1246,64 +1231,41 @@ __global__ void sclp4_fused_moe_gemv_kernel(
     float*         __restrict__ dst,      // [N × n_active × n_batches]
     uint32_t N, uint32_t K, uint32_t n_active, uint32_t src1_ne1
 ) {
-    // Shared memory layout:
-    //   [0..63]  s_lut[16]   (float, 64 bytes) — decoded float for each (pidx, smn) pair
-    //   [64..]   s_x[K]      (float, K*4 bytes) — activation vector
     extern __shared__ char smem[];
-    __shared__ uint32_t s_scales_offset;
+    __shared__ uint32_t s_bpal_offset;
     __shared__ uint32_t s_ws_offset;
-    float*    s_lut       = (float*)smem;          // 16 floats = 64 bytes
-    float*    s_x         = (float*)(smem + 64);   // K floats
+    __shared__ uint32_t s_blocks_per_expert;
+    float*    s_x = (float*)smem;   // K floats
 
     const uint32_t flat     = blockIdx.y;
     const int32_t  e        = ids[flat];
     const uint32_t i_active = flat % n_active;
     const uint32_t i_batch  = flat / n_active;
 
-    // Thread 0: parse blob header, locate this expert's ws, build 4×4 decode LUT.
     if (threadIdx.x == 0) {
         uint32_t total_nw, n_experts;
         __builtin_memcpy(&total_nw,  blob,     sizeof(uint32_t));
         __builtin_memcpy(&n_experts, blob + 4, sizeof(uint32_t));
         const uint8_t* p = blob + 8;
-        uint8_t pal[4];
-        uint8_t pal_size = 0;
-        for (uint32_t ei = 0; ei < n_experts; ei++) {
-            if (ei == (uint32_t)e) {
-                pal_size = p[0];
-                for (int i = 0; i < (int)p[0]; i++) pal[i] = p[1 + i];
-            }
-            p += 1 + p[0];
-        }
+        for (uint32_t ei = 0; ei < n_experts; ei++) { p += 1 + p[0]; }
         uint32_t expert_nw = total_nw / n_experts;
-        uint32_t scales_start = (uint32_t)(p - blob);
-        s_scales_offset = scales_start + (uint32_t)e * (expert_nw / QK_SCLP) * sizeof(uint16_t);
+        uint32_t bpal_start = (uint32_t)(p - blob);
+        uint32_t bpe = expert_nw / QK_SCLP4;
+        s_blocks_per_expert = bpe;
+        s_bpal_offset = bpal_start + (uint32_t)e * bpe * 4;
 
-        uint32_t ws_start  = scales_start + (total_nw / QK_SCLP) * sizeof(uint16_t);
+        uint32_t ws_start = bpal_start + (total_nw / QK_SCLP4) * 4;
         uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
         s_ws_offset = ws_start + (uint32_t)e * expert_nibble_bytes;
-
-        // 4×4 LUT: s_lut[pidx*4 + smn] = decoded float
-        // SCLP4 nibble: pidx in bits[3:2], smn in bits[1:0]; smn = sign(1)|mant_top1(0)
-        for (int pidx = 0; pidx < 4; pidx++) {
-            uint8_t exp = (pidx < (int)pal_size) ? pal[pidx] : 0;
-            for (int smn = 0; smn < 4; smn++) {
-                uint8_t sign = (smn >> 1) & 1;
-                uint8_t mant = smn & 1;
-                uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp << 7) | ((uint16_t)mant << 6);
-                s_lut[pidx * 4 + smn] = __bfloat162float(*(__hip_bfloat16*)&bits);
-            }
-        }
     }
 
-    // Cooperatively load activation vector into shared memory.
     const float* x = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
     for (uint32_t k = threadIdx.x; k < K; k += blockDim.x) {
         s_x[k] = x[k];
     }
     __syncthreads();
 
-    const uint16_t* scales = (const uint16_t*)(blob + s_scales_offset);
+    const uint8_t* bpal_base = blob + s_bpal_offset;
     const uint8_t* ws = blob + s_ws_offset;
     const int warps_per_block = blockDim.x / 32;
     const int warp_id = threadIdx.x / 32;
@@ -1313,8 +1275,6 @@ __global__ void sclp4_fused_moe_gemv_kernel(
     if (row >= N) return;
 
     float acc = 0.0f;
-    // Each row has K nibbles → (K+1)/2 bytes. We iterate one byte per lane per step
-    // (2 weights per byte). For typical K=2816 that's 1408 bytes/row, 44 iterations/warp.
     const uint32_t n_bytes_row = (K + 1) / 2;
     const uint64_t row_byte_base = (uint64_t)row * n_bytes_row;
     const uint64_t row_weight_base = (uint64_t)row * K;
@@ -1322,10 +1282,25 @@ __global__ void sclp4_fused_moe_gemv_kernel(
     for (uint32_t b = lane; b < n_bytes_row; b += 32) {
         uint8_t byte = ws[row_byte_base + b];
         uint32_t k0  = b * 2;
-        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (row_weight_base + k0) / QK_SCLP));
-        acc += (s_lut[byte >> 4] * scale) * s_x[k0];
+        uint32_t block_idx = (row_weight_base + k0) / QK_SCLP4;
+        const uint8_t* bp = bpal_base + block_idx * 4;
+
+        uint8_t pidx_hi = byte >> 6;
+        uint8_t smn_hi  = (byte >> 4) & 0x3;
+        uint8_t exp_hi  = bp[pidx_hi];
+        uint8_t sign_hi = (smn_hi >> 1) & 1;
+        uint8_t mant_hi = smn_hi & 1;
+        uint16_t bits_hi = ((uint16_t)sign_hi << 15) | ((uint16_t)exp_hi << 7) | ((uint16_t)mant_hi << 6);
+        acc += __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&bits_hi)) * s_x[k0];
+
         if (k0 + 1 < K) {
-            acc += (s_lut[byte & 0xF] * scale) * s_x[k0 + 1];
+            uint8_t pidx_lo = (byte >> 2) & 0x3;
+            uint8_t smn_lo  = byte & 0x3;
+            uint8_t exp_lo  = bp[pidx_lo];
+            uint8_t sign_lo = (smn_lo >> 1) & 1;
+            uint8_t mant_lo = smn_lo & 1;
+            uint16_t bits_lo = ((uint16_t)sign_lo << 15) | ((uint16_t)exp_lo << 7) | ((uint16_t)mant_lo << 6);
+            acc += __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&bits_lo)) * s_x[k0 + 1];
         }
     }
 
@@ -1347,8 +1322,7 @@ inline void llama_sclp4_fused_moe_gemv(
 ) {
     constexpr int WARPS_PER_BLOCK = 16;
     dim3 block(WARPS_PER_BLOCK * 32);
-    // Dynamic shared memory: 64 (lut) + K*4 (activations)
-    size_t smem_bytes = 64 + (size_t)K * sizeof(float);
+    size_t smem_bytes = (size_t)K * sizeof(float);
     dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, n_active * n_batches);
     SCLP_TG_TIME_BEGIN(sclp_tg::CAT_SCLP4_MOE);
     sclp4_fused_moe_gemv_kernel<<<grid, block, smem_bytes, stream>>>(
@@ -1506,10 +1480,7 @@ __global__ void sclp4_fused_moe_wmma_kernel(
     }
     if (e < 0) return;  // m_base past end of sorted list
 
-    // Parse blob header on-device to find this expert's ws section + palette.
-    __shared__ uint8_t s_palette[4];
-    __shared__ uint8_t s_palette_size;
-    __shared__ uint32_t s_scales_offset;
+    __shared__ uint32_t s_bpal_offset;
     __shared__ uint32_t s_ws_offset;
     __shared__ int32_t  s_m_global[TILE];
 
@@ -1518,21 +1489,12 @@ __global__ void sclp4_fused_moe_wmma_kernel(
         __builtin_memcpy(&total_nw, blob,     sizeof(uint32_t));
         __builtin_memcpy(&ne,       blob + 4, sizeof(uint32_t));
         const uint8_t* p = blob + 8;
-        uint8_t pal[4] = {0,0,0,0};
-        uint8_t psz = 0;
-        for (uint32_t ei = 0; ei < ne; ei++) {
-            if (ei == (uint32_t)e) {
-                psz = p[0];
-                for (int i = 0; i < (int)p[0]; i++) pal[i] = p[1 + i];
-            }
-            p += 1 + p[0];
-        }
-        s_palette_size = psz;
-        for (int i = 0; i < 4; i++) s_palette[i] = pal[i];
+        for (uint32_t ei = 0; ei < ne; ei++) { p += 1 + p[0]; }
         uint32_t expert_nw = total_nw / ne;
-        uint32_t scales_start = (uint32_t)(p - blob);
-        s_scales_offset = scales_start + (uint32_t)e * (expert_nw / QK_SCLP) * sizeof(uint16_t);
-        uint32_t ws_start = scales_start + (total_nw / QK_SCLP) * sizeof(uint16_t);
+        uint32_t bpal_start = (uint32_t)(p - blob);
+        uint32_t bpe = expert_nw / QK_SCLP4;
+        s_bpal_offset = bpal_start + (uint32_t)e * bpe * 4;
+        uint32_t ws_start = bpal_start + (total_nw / QK_SCLP4) * 4;
         uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
         s_ws_offset = ws_start + (uint32_t)e * expert_nibble_bytes;
     }
@@ -1546,7 +1508,7 @@ __global__ void sclp4_fused_moe_wmma_kernel(
     }
     __syncthreads();
 
-    const uint16_t* scales = (const uint16_t*)(blob + s_scales_offset);
+    const uint8_t* bpal_base = blob + s_bpal_offset;
     const uint8_t* ws = blob + s_ws_offset;
     const uint32_t n_bytes_row = (K + 1) / 2;
 
@@ -1560,24 +1522,23 @@ __global__ void sclp4_fused_moe_wmma_kernel(
     floatx8_t acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
     for (uint32_t k16 = 0; k16 < K; k16 += TILE) {
-        // ── A fragment: 16 BF16 weights from row n_row, columns k16..k16+15.
         bf16x16_t a_frag;
         #pragma unroll
         for (int j = 0; j < TILE; j++) {
             const uint32_t kg = k16 + j;
             if (n_row < N && kg < K) {
                 uint64_t w_idx = (uint64_t)n_row * K + kg;
-                float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + w_idx / QK_SCLP));
+                uint32_t block_idx = w_idx / QK_SCLP4;
+                const uint8_t* bp = bpal_base + block_idx * 4;
                 uint8_t byte  = ws[w_idx >> 1];
                 uint8_t nib   = (w_idx & 1) ? (byte & 0xF) : (byte >> 4);
                 uint8_t pidx  = nib >> 2;
                 uint8_t smn   = nib & 0x3;
-                uint8_t exp_  = (pidx < s_palette_size) ? s_palette[pidx] : 0;
+                uint8_t exp_  = bp[pidx];
                 uint8_t sign  = (smn >> 1) & 1;
                 uint8_t mant  = smn & 1;
                 uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 6);
-                float w = __bfloat162float(*(__hip_bfloat16*)&bits) * scale;
-                a_frag[j] = __float2bfloat16(w);
+                a_frag[j] = *(__bf16*)&bits;
             } else {
                 a_frag[j] = (__bf16)0.f;
             }
@@ -1650,9 +1611,7 @@ __global__ void sclp4_fused_moe_scalar_kernel(
     }
     if (e < 0) return;
 
-    __shared__ uint8_t  s_palette[4];
-    __shared__ uint8_t  s_palette_size;
-    __shared__ uint32_t s_scales_offset;
+    __shared__ uint32_t s_bpal_offset;
     __shared__ uint32_t s_ws_offset;
     __shared__ int32_t  s_m_global[TILE];
 
@@ -1661,21 +1620,12 @@ __global__ void sclp4_fused_moe_scalar_kernel(
         __builtin_memcpy(&total_nw, blob,     sizeof(uint32_t));
         __builtin_memcpy(&ne,       blob + 4, sizeof(uint32_t));
         const uint8_t* p = blob + 8;
-        uint8_t pal[4] = {0,0,0,0};
-        uint8_t psz = 0;
-        for (uint32_t ei = 0; ei < ne; ei++) {
-            if (ei == (uint32_t)e) {
-                psz = p[0];
-                for (int i = 0; i < (int)p[0]; i++) pal[i] = p[1 + i];
-            }
-            p += 1 + p[0];
-        }
-        s_palette_size = psz;
-        for (int i = 0; i < 4; i++) s_palette[i] = pal[i];
+        for (uint32_t ei = 0; ei < ne; ei++) { p += 1 + p[0]; }
         uint32_t expert_nw = total_nw / ne;
-        uint32_t scales_start = (uint32_t)(p - blob);
-        s_scales_offset = scales_start + (uint32_t)e * (expert_nw / QK_SCLP) * sizeof(uint16_t);
-        uint32_t ws_start = scales_start + (total_nw / QK_SCLP) * sizeof(uint16_t);
+        uint32_t bpal_start = (uint32_t)(p - blob);
+        uint32_t bpe = expert_nw / QK_SCLP4;
+        s_bpal_offset = bpal_start + (uint32_t)e * bpe * 4;
+        uint32_t ws_start = bpal_start + (total_nw / QK_SCLP4) * 4;
         uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
         s_ws_offset = ws_start + (uint32_t)e * expert_nibble_bytes;
     }
@@ -1685,7 +1635,7 @@ __global__ void sclp4_fused_moe_scalar_kernel(
     }
     __syncthreads();
 
-    const uint16_t* scales = (const uint16_t*)(blob + s_scales_offset);
+    const uint8_t* bpal_base = blob + s_bpal_offset;
     const uint8_t* ws = blob + s_ws_offset;
     const int lane = threadIdx.x;
 
@@ -1714,16 +1664,17 @@ __global__ void sclp4_fused_moe_scalar_kernel(
     // rules out any caching/aliasing in x_rows[] as a cause of the prefill-shape bug.
     for (uint32_t k = 0; k < K; k++) {
         uint64_t w_idx = (uint64_t)n_row * K + k;
-        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + w_idx / QK_SCLP));
+        uint32_t block_idx = w_idx / QK_SCLP4;
+        const uint8_t* bp = bpal_base + block_idx * 4;
         uint8_t byte  = ws[w_idx >> 1];
         uint8_t nib   = (w_idx & 1) ? (byte & 0xF) : (byte >> 4);
         uint8_t pidx  = nib >> 2;
         uint8_t smn   = nib & 0x3;
-        uint8_t exp_  = (pidx < s_palette_size) ? s_palette[pidx] : 0;
+        uint8_t exp_  = bp[pidx];
         uint8_t sign  = (smn >> 1) & 1;
         uint8_t mant  = smn & 1;
         uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 6);
-        float w = __bfloat162float(*(__hip_bfloat16*)&bits) * scale;
+        float w = __bfloat162float(*(__hip_bfloat16*)&bits);
 
         for (int l = 0; l < 8; l++) {
             if (!valid[l]) continue;
@@ -1810,10 +1761,9 @@ __global__ void sclp4_moe_sidecar_correct_kernel(
 ) {
     __shared__ uint32_t s_total_nw;
     __shared__ uint32_t s_n_experts;
-    __shared__ uint32_t s_scales_start;
+    __shared__ uint32_t s_bpal_start;
     __shared__ uint32_t s_ws_start;
     __shared__ uint32_t s_sidecar_count;
-    // Per-expert palette (cached for first 4 experts in shared mem if needed).
     if (threadIdx.x == 0) {
         uint32_t total_nw, ne;
         __builtin_memcpy(&total_nw, blob,     sizeof(uint32_t));
@@ -1822,9 +1772,9 @@ __global__ void sclp4_moe_sidecar_correct_kernel(
         s_n_experts = ne;
         const uint8_t* p = blob + 8;
         for (uint32_t e = 0; e < ne; e++) p += 1 + p[0];
-        uint32_t scales_start = (uint32_t)(p - blob);
-        s_scales_start = scales_start;
-        uint32_t ws_start = scales_start + (total_nw / QK_SCLP) * sizeof(uint16_t);
+        uint32_t bpal_start = (uint32_t)(p - blob);
+        s_bpal_start = bpal_start;
+        uint32_t ws_start = bpal_start + (total_nw / QK_SCLP4) * 4;
         s_ws_start = ws_start;
         uint32_t expert_nw = total_nw / ne;
         uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
@@ -1843,7 +1793,7 @@ __global__ void sclp4_moe_sidecar_correct_kernel(
     const uint8_t* sidecar_base = blob + s_ws_start + total_ws_bytes;
     const uint8_t* idx_base = sidecar_base + 4;
     const uint8_t* val_base = idx_base + (uint64_t)s_sidecar_count * sizeof(uint32_t);
-    const uint16_t* scales = (const uint16_t*)(blob + s_scales_start);
+    const uint8_t* bpal_base = blob + s_bpal_start;
 
     const uint32_t stride = gridDim.x * blockDim.x;
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1858,29 +1808,21 @@ __global__ void sclp4_moe_sidecar_correct_kernel(
         uint32_t n_e      = local / K;
         uint32_t k        = local % K;
 
-        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + global_idx / QK_SCLP));
-
-        // Re-parse this expert's palette and the approximate nibble value at (n_e, k).
-        const uint8_t* p = blob + 8;
-        for (uint32_t ei = 0; ei < e; ei++) p += 1 + p[0];
-        uint8_t pal_size = p[0];
-        // SCLP4 palette is <=4 bytes; read inline.
-        uint8_t pal[4] = {0,0,0,0};
-        for (int j = 0; j < (int)pal_size && j < 4; j++) pal[j] = p[1 + j];
-
         const uint8_t* ws_e = blob + s_ws_start + (uint64_t)e * expert_nibble_bytes;
         uint64_t w_idx = (uint64_t)n_e * K + k;
+        uint32_t block_idx = e * (expert_nw / QK_SCLP4) + (uint32_t)(w_idx / QK_SCLP4);
+        const uint8_t* bp = bpal_base + block_idx * 4;
         uint8_t byte = ws_e[w_idx >> 1];
         uint8_t nib  = (w_idx & 1) ? (byte & 0xF) : (byte >> 4);
         uint8_t pidx = nib >> 2;
         uint8_t smn  = nib & 0x3;
-        uint8_t exp_a = (pidx < pal_size) ? pal[pidx] : 0;
+        uint8_t exp_a = bp[pidx];
         uint8_t sign_a = (smn >> 1) & 1;
         uint8_t mant_a = smn & 1;
         uint16_t approx_bits = ((uint16_t)sign_a << 15) | ((uint16_t)exp_a << 7) | ((uint16_t)mant_a << 6);
 
         float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
-        float w_approx  = __bfloat162float(*(__hip_bfloat16*)&approx_bits) * scale;
+        float w_approx  = __bfloat162float(*(__hip_bfloat16*)&approx_bits);
         float w_delta   = w_correct - w_approx;
         if (w_delta == 0.f) continue;
 
@@ -1939,10 +1881,8 @@ __global__ void sclp4_moe_sidecar_correct_blocked_kernel(
 
     __shared__ uint32_t s_total_nw;
     __shared__ uint32_t s_ne;
-    __shared__ uint32_t s_scales_start;
+    __shared__ uint32_t s_bpal_start;
     __shared__ uint32_t s_ws_start;
-    __shared__ uint8_t  s_palette[4];
-    __shared__ uint8_t  s_palette_size;
     __shared__ uint32_t s_ws_offset_e;
     __shared__ int32_t  s_m_global[TILE];
     __shared__ uint32_t s_sc_n_e[MAX_SC_PER_BLOCK];
@@ -1959,16 +1899,10 @@ __global__ void sclp4_moe_sidecar_correct_blocked_kernel(
         s_total_nw = total_nw;
         s_ne = ne;
         const uint8_t* p = blob + 8;
-        for (uint32_t ei = 0; ei < ne; ei++) {
-            if (ei == (uint32_t)e) {
-                s_palette_size = p[0];
-                for (int i = 0; i < (int)p[0] && i < 4; i++) s_palette[i] = p[1 + i];
-            }
-            p += 1 + p[0];
-        }
-        uint32_t scales_start = (uint32_t)(p - blob);
-        s_scales_start = scales_start;
-        uint32_t ws_start = scales_start + (total_nw / QK_SCLP) * sizeof(uint16_t);
+        for (uint32_t ei = 0; ei < ne; ei++) { p += 1 + p[0]; }
+        uint32_t bpal_start = (uint32_t)(p - blob);
+        s_bpal_start = bpal_start;
+        uint32_t ws_start = bpal_start + (total_nw / QK_SCLP4) * 4;
         s_ws_start = ws_start;
         uint32_t expert_nw = total_nw / ne;
         uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
@@ -2024,12 +1958,11 @@ __global__ void sclp4_moe_sidecar_correct_blocked_kernel(
     const uint8_t* sc_idx_base = sidecar_base + 4;
     const uint8_t* sc_val_base = sc_idx_base + (uint64_t)sc_total * sizeof(uint32_t);
     const uint8_t* ws_e = blob + s_ws_offset_e;
-    const uint16_t* scales = (const uint16_t*)(blob + s_scales_start);
+    const uint8_t* bpal_base = blob + s_bpal_start;
 
     const uint32_t n_base = (uint32_t)blockIdx.x * TILE;
     const uint32_t n_end  = min(n_base + (uint32_t)TILE, N);
 
-    // Only scan this expert's sidecar range (not the full sidecar list).
     const uint32_t range_size = sc_end - sc_begin;
     for (uint32_t ri = threadIdx.x; ri < range_size; ri += blockDim.x) {
         uint32_t i = sc_begin + ri;
@@ -2044,20 +1977,20 @@ __global__ void sclp4_moe_sidecar_correct_blocked_kernel(
         uint16_t correct_bits;
         __builtin_memcpy(&correct_bits, sc_val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint16_t));
 
-        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + global_idx / QK_SCLP));
-
         uint64_t w_idx = (uint64_t)n_e * K + k;
+        uint32_t block_idx = (uint32_t)e * (expert_nw / QK_SCLP4) + (uint32_t)(w_idx / QK_SCLP4);
+        const uint8_t* bp = bpal_base + block_idx * 4;
         uint8_t byte = ws_e[w_idx >> 1];
         uint8_t nib  = (w_idx & 1) ? (byte & 0xF) : (byte >> 4);
         uint8_t pidx = nib >> 2;
         uint8_t smn  = nib & 0x3;
-        uint8_t exp_a = (pidx < s_palette_size) ? s_palette[pidx] : 0;
+        uint8_t exp_a = bp[pidx];
         uint8_t sign_a = (smn >> 1) & 1;
         uint8_t mant_a = smn & 1;
         uint16_t approx_bits = ((uint16_t)sign_a << 15) | ((uint16_t)exp_a << 7) | ((uint16_t)mant_a << 6);
 
         float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
-        float w_approx  = __bfloat162float(*(__hip_bfloat16*)&approx_bits) * scale;
+        float w_approx  = __bfloat162float(*(__hip_bfloat16*)&approx_bits);
         float w_delta   = w_correct - w_approx;
         if (w_delta == 0.f) continue;
 

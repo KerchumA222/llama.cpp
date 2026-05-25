@@ -1258,104 +1258,137 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
 // Decode a CPU-hosted SCLP blob to BF16 (uint16_t). Supports SCLP8/4/6.
 // Called only by thread 0.
+// bf16 (top 16 bits of f32) <-> f32 helpers, matching the GPU kernels which
+// truncate (x.u >> 16) rather than round.
+static inline float sclp_bf16_to_f32(uint16_t b) {
+    uint32_t u = (uint32_t)b << 16;
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+static inline uint16_t sclp_f32_to_bf16(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    return (uint16_t)(u >> 16);
+}
+
+// Mirrors the on-device decode kernels in ggml-cuda/sclp_bridge.cuh:
+//   SCLP6/SCLP8 — per-block scaling (PBS): BF16 scale per QK_SCLP=32 weights,
+//     stored between the palette headers and the ws_stream. Decoded value is
+//     bf16(bits) * scale.
+//   SCLP4 — per-block palette: palette_size=0 header, then 4 palette bytes per
+//     QK_SCLP4=256 weights; no scale multiply.
+// QK_SCLP=32, QK_SCLP4=256 (see ggml-cuda/sclp_bridge.cuh / src/llama-sclp.h).
 static void sclp_decode_to_bf16_cpu(
     enum ggml_type type,
     const uint8_t * blob,
     uint16_t * output,
     int64_t num_weights
 ) {
+    enum { QK_SCLP_CPU = 32, QK_SCLP4_CPU = 256, SCLP_MAX_EXPERTS = 256 };
+
     uint32_t n_experts;
     memcpy(&n_experts, blob + 4, 4);
+    if (n_experts == 0) n_experts = 1;
+    GGML_ASSERT(n_experts <= SCLP_MAX_EXPERTS && "sclp cpu decode: too many experts");
 
+    // Parse per-expert palette headers. SCLP4 per-block-palette uses size 0.
     const uint8_t * p = blob + 8;
-    uint8_t palettes[128][16];
-    uint8_t palette_lens[128];
-    uint32_t ws_offsets[129]; // per-expert ws byte offset relative to blob start
-
+    uint8_t  palettes[SCLP_MAX_EXPERTS][16];
+    uint8_t  palette_lens[SCLP_MAX_EXPERTS];
     for (uint32_t e = 0; e < n_experts; e++) {
         palette_lens[e] = p[0];
         memcpy(palettes[e], p + 1, p[0]);
         p += 1 + p[0];
     }
 
-    // Build per-expert ws offsets from the palette header boundary
-    ws_offsets[0] = (uint32_t)(p - blob);
-    int64_t weights_per_expert = num_weights / n_experts;
+    const int64_t enw = num_weights / n_experts; // uniform per-expert weight count
 
-    if (type == GGML_TYPE_SCLP8) {
-        for (uint32_t e = 0; e < n_experts; e++) {
-            ws_offsets[e + 1] = ws_offsets[e] + (uint32_t)weights_per_expert;
-        }
-    } else if (type == GGML_TYPE_SCLP4) {
-        uint32_t nb = (uint32_t)((weights_per_expert + 1) / 2);
-        for (uint32_t e = 0; e < n_experts; e++) {
-            ws_offsets[e + 1] = ws_offsets[e] + nb;
-        }
-    } else { // SCLP6
-        uint32_t ng = (uint32_t)((weights_per_expert + 3) / 4);
-        for (uint32_t e = 0; e < n_experts; e++) {
-            ws_offsets[e + 1] = ws_offsets[e] + ng * 3;
-        }
+    // Section after the palette headers: scales (SCLP6/8) or block palettes (SCLP4).
+    const uint32_t section_start = (uint32_t)(p - blob);
+    uint32_t ws_start;
+    uint64_t expert_ws_bytes;
+    if (type == GGML_TYPE_SCLP4) {
+        const uint64_t n_blocks = (uint64_t)num_weights / QK_SCLP4_CPU;
+        ws_start = section_start + (uint32_t)(n_blocks * 4);
+        expert_ws_bytes = (uint64_t)((enw + 1) / 2);
+    } else if (type == GGML_TYPE_SCLP6) {
+        const uint64_t n_scales = (uint64_t)num_weights / QK_SCLP_CPU;
+        ws_start = section_start + (uint32_t)(n_scales * sizeof(uint16_t));
+        expert_ws_bytes = (uint64_t)(((enw + 3) / 4) * 3);
+    } else { // SCLP8
+        const uint64_t n_scales = (uint64_t)num_weights / QK_SCLP_CPU;
+        ws_start = section_start + (uint32_t)(n_scales * sizeof(uint16_t));
+        expert_ws_bytes = (uint64_t)enw;
     }
 
-    // Decode per-expert
+    const uint16_t * scales      = (const uint16_t *)(blob + section_start);    // SCLP6/8
+    const uint8_t  * block_pals  = blob + section_start;                        // SCLP4
+    const uint8_t  * ws_base     = blob + ws_start;
+    const int64_t blocks_per_expert = enw / QK_SCLP4_CPU;                       // SCLP4
+
     for (uint32_t e = 0; e < n_experts; e++) {
-        const uint8_t * ws_e = blob + ws_offsets[e];
-        int64_t base_idx = (int64_t)e * weights_per_expert;
-        int64_t nw_e = weights_per_expert; // uniform; last expert may differ but shapes are uniform
+        const uint8_t * ws_e   = ws_base + (uint64_t)e * expert_ws_bytes;
+        const int64_t   base_idx = (int64_t)e * enw;
 
         if (type == GGML_TYPE_SCLP8) {
-            // 1 byte/weight: idx(7:4) | smn(3:0)
-            for (int64_t j = 0; j < nw_e; j++) {
+            // 1 byte/weight: idx(7:4) | smn(3:0); value = bf16(bits) * scale.
+            for (int64_t j = 0; j < enw; j++) {
                 uint8_t b    = ws_e[j];
                 uint8_t pidx = b >> 4;
                 uint8_t smn  = b & 0xF;
                 uint8_t exp  = pidx < palette_lens[e] ? palettes[e][pidx] : 0;
-                output[base_idx + j] =
-                    (uint16_t)(((smn >> 3) & 1) << 15) |
-                    ((uint16_t)exp << 7) |
-                    ((uint16_t)(smn & 0x7) << 4);
+                uint16_t bits = (uint16_t)(((smn >> 3) & 1) << 15) |
+                                ((uint16_t)exp << 7) |
+                                ((uint16_t)(smn & 0x7) << 4);
+                float scale = sclp_bf16_to_f32(scales[(base_idx + j) / QK_SCLP_CPU]);
+                output[base_idx + j] = sclp_f32_to_bf16(sclp_bf16_to_f32(bits) * scale);
             }
         } else if (type == GGML_TYPE_SCLP4) {
-            // 2 weights/byte, nibble: bits[3:2]=idx, bit[1]=sign, bit[0]=mant_top1
-            for (int64_t j = 0; j < nw_e; j++) {
+            // 2 weights/byte; per-block palette (4 entries per QK_SCLP4 block); no scale.
+            for (int64_t j = 0; j < enw; j++) {
+                int64_t block_idx = (int64_t)e * blocks_per_expert + j / QK_SCLP4_CPU;
+                const uint8_t * bp = block_pals + block_idx * 4;
                 uint8_t byte   = ws_e[j / 2];
                 uint8_t nibble = (j & 1) ? (byte & 0xF) : (byte >> 4);
                 uint8_t pidx   = nibble >> 2;
                 uint8_t smn    = nibble & 0x3;
-                uint8_t exp    = pidx < palette_lens[e] ? palettes[e][pidx] : 0;
+                uint8_t exp    = bp[pidx];
                 output[base_idx + j] =
                     (uint16_t)(((smn >> 1) & 1) << 15) |
                     ((uint16_t)exp << 7) |
                     ((uint16_t)(smn & 1) << 6);
             }
         } else { // SCLP6
-            // 4 weights per 3 bytes, sixbit: bits[5:3]=idx, bit[2]=sign, bits[1:0]=mant_top2
-            for (int64_t j = 0; j < nw_e; j += 4) {
-                uint32_t group = (uint32_t)(j / 4);
+            // 4 weights per 3 bytes; value = bf16(bits) * scale.
+            const int64_t groups = (enw + 3) / 4;
+            for (int64_t group = 0; group < groups; group++) {
                 const uint8_t * g = ws_e + group * 3;
                 uint8_t sixbits[4];
                 sixbits[0] = g[0] >> 2;
                 sixbits[1] = ((g[0] & 0x3) << 4) | (g[1] >> 4);
                 sixbits[2] = ((g[1] & 0xF) << 2) | (g[2] >> 6);
                 sixbits[3] = g[2] & 0x3F;
-                int64_t remaining = nw_e - j;
+                int64_t j = group * 4;
+                int64_t remaining = enw - j;
                 for (int k = 0; k < 4 && k < remaining; k++) {
                     uint8_t pidx = sixbits[k] >> 3;
                     uint8_t smn  = sixbits[k] & 0x7;
                     uint8_t exp  = pidx < palette_lens[e] ? palettes[e][pidx] : 0;
-                    output[base_idx + j + k] =
-                        (uint16_t)(((smn >> 2) & 1) << 15) |
-                        ((uint16_t)exp << 7) |
-                        ((uint16_t)(smn & 0x3) << 5);
+                    uint16_t bits = (uint16_t)(((smn >> 2) & 1) << 15) |
+                                    ((uint16_t)exp << 7) |
+                                    ((uint16_t)(smn & 0x3) << 5);
+                    float scale = sclp_bf16_to_f32(scales[(base_idx + j + k) / QK_SCLP_CPU]);
+                    output[base_idx + j + k] = sclp_f32_to_bf16(sclp_bf16_to_f32(bits) * scale);
                 }
             }
         }
     }
 
-    // Sidecar fixup (same layout for all three types)
-    uint64_t ws_total = (uint64_t)(ws_offsets[n_experts] - ws_offsets[0]);
-    const uint8_t * sc_base = blob + ws_offsets[0] + ws_total;
+    // Sidecar fixup (same layout for all three types): raw BF16 originals, written
+    // directly (no scale multiply), restoring outliers exactly.
+    const uint64_t ws_total = (uint64_t)n_experts * expert_ws_bytes;
+    const uint8_t * sc_base = blob + ws_start + ws_total;
     uint32_t sc_count;
     memcpy(&sc_count, sc_base, 4);
     const uint32_t * sc_idx = (const uint32_t *)(sc_base + 4);

@@ -5,6 +5,11 @@
 #include <cstdint>
 
 #define QK_SCLP 32
+#define QK_SCLP4 256
+
+static inline int qk_for_type(ggml_type type) {
+    return (type == GGML_TYPE_SCLP4) ? QK_SCLP4 : QK_SCLP;
+}
 
 // Quantize a whole tensor (possibly with multiple experts) to SCLP format.
 //
@@ -16,9 +21,15 @@
 // sidecar_imatrix_budget: fraction of weights to add to sidecar via imatrix
 //   ranking (0.0 = disabled, 0.01 = recommended default when imatrix is present).
 //
-// Layout: [header][scales][ws_stream][sidecar]
+// Layout (SCLP6/SCLP8): [header][scales][ws_stream][sidecar]
 //   header: [uint32 num_weights][uint32 n_experts][per-expert: palette_size, palette]
-//   scales: [uint16 scale_fp16] x (num_weights / QK_SCLP)
+//   scales: [uint16 scale_bf16] x (num_weights / QK_SCLP)
+//   ws_stream: packed indices + SM bits
+//   sidecar: [uint32 count][uint32 indices][uint16 bf16_bits]
+//
+// Layout (SCLP4, per-block palette): [header][block_palettes][ws_stream][sidecar]
+//   header: [uint32 num_weights][uint32 n_experts][per-expert: palette_size=0]
+//   block_palettes: [4 x uint8] x (num_weights / QK_SCLP4)
 //   ws_stream: packed indices + SM bits
 //   sidecar: [uint32 count][uint32 indices][uint16 bf16_bits]
 //
