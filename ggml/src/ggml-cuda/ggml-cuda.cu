@@ -2680,9 +2680,26 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
-    // SCLP5: two-pass decode → BF16 → recurse (fused gemv deferred).
+    // SCLP5: fused decode-GEMV for M=1, two-pass decode otherwise.
     if (src0->type == GGML_TYPE_SCLP5) {
         cudaStream_t stream = ctx.stream();
+        const int64_t K = src0->ne[0];
+        const int64_t N = src0->ne[1];
+        const int64_t M = src1->ne[1];
+        // Fused decode-GEMV needs sidecar correction for SCLP5 (4-entry palette pushes
+        // high-magnitude outliers to the sidecar), and that correction (~1M scattered
+        // atomicAdds) costs more than the two-pass decode saves — so two-pass is the
+        // default. The fused path (correct, sidecar-corrected) is kept behind
+        // SCLP5_FUSED_GEMV=1 for future optimization. (Mirrors the disabled SCLP6 fused GEMV.)
+        static const bool sclp5_fused = getenv("SCLP5_FUSED_GEMV") != nullptr;
+        if (sclp5_fused && M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+                && (K % 8 == 0)
+                && ((size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
+            llama_sclp5_fused_gemv(
+                src0->data, (const float*)src1->data, (float*)dst->data,
+                (uint32_t)N, (uint32_t)K, stream);
+            return;
+        }
         const int64_t num_weights = ggml_nelements(src0);
         ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
         llama_sclp5_dispatch(src0->data, decoded.get(), (uint32_t)num_weights, stream);

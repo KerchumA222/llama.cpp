@@ -1328,6 +1328,153 @@ inline void llama_sclp5_dispatch(
     }
 }
 
+// Fused decode-GEMV for SCLP5, M=1 (single-token gen). One warp per output row;
+// each lane streams 5-byte groups (8 weights) of its row, decodes inline against the
+// per-block palette, and accumulates w*x. Assumes K % 8 == 0 (true for LLM dims) so
+// rows align to group boundaries (see K-alignment note for SCLP4/6 fused GEMV).
+// Sidecar omitted per SCLP fused-GEMV convention.
+__global__ void sclp5_fused_gemv_kernel(
+    const uint8_t* __restrict__ blob,
+    const float*   __restrict__ x,
+    float*         __restrict__ y,
+    uint32_t N,
+    uint32_t K
+) {
+    extern __shared__ char smem[];
+    __shared__ uint32_t s_bpal_start;
+    __shared__ uint32_t s_ws_start;
+    float* s_x = (float*)smem;   // K floats
+
+    if (threadIdx.x == 0) {
+        uint32_t ne; __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
+        const uint8_t* p = blob + 8;
+        for (uint32_t ei = 0; ei < ne; ei++) p += 1 + p[0];
+        s_bpal_start = (uint32_t)(p - blob);
+        s_ws_start = s_bpal_start + (((uint64_t)N * K) / QK_SCLP4) * 4;
+    }
+    for (uint32_t k = threadIdx.x; k < K; k += blockDim.x) s_x[k] = x[k];
+    __syncthreads();
+
+    const uint8_t* bpal_base = blob + s_bpal_start;
+    const uint8_t* ws        = blob + s_ws_start;
+
+    const int warps_per_block = blockDim.x / 32;
+    const int warp_id = threadIdx.x / 32;
+    const int lane    = threadIdx.x & 31;
+    const uint32_t row = (uint32_t)blockIdx.x * warps_per_block + warp_id;
+    if (row >= N) return;
+
+    float acc = 0.0f;
+    const uint32_t groups_per_row  = (K + 7) / 8;
+    const uint64_t row_group_base  = (uint64_t)row * groups_per_row;
+    const uint64_t row_weight_base = (uint64_t)row * K;
+
+    for (uint32_t g = lane; g < groups_per_row; g += 32) {
+        const uint8_t* gp = ws + (row_group_base + g) * 5;
+        uint64_t v = ((uint64_t)gp[0] << 32) | ((uint64_t)gp[1] << 24) |
+                     ((uint64_t)gp[2] << 16) | ((uint64_t)gp[3] << 8) | (uint64_t)gp[4];
+        uint32_t k0 = g * 8;
+        uint32_t block_idx = (uint32_t)((row_weight_base + k0) / QK_SCLP4);
+        const uint8_t* bp = bpal_base + (uint64_t)block_idx * 4;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            uint32_t k = k0 + j;
+            if (k >= K) break;
+            uint8_t code = (uint8_t)((v >> (5 * (7 - j))) & 0x1F);
+            uint8_t idx  = code >> 3;
+            uint8_t sign = (code >> 2) & 1;
+            uint8_t mant = code & 0x3;
+            uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)bp[idx] << 7) | ((uint16_t)mant << 5);
+            float w = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&bits));
+            acc += w * s_x[k];
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
+    if (lane == 0) y[row] = acc;
+}
+
+// Sidecar correction for the SCLP5 fused GEMV. For each sidecar entry (an outlier
+// weight stored verbatim), add (true - palette_approx) * x[col] to y[row]. Unlike
+// SCLP4/6 fused GEMV (which omit sidecar), SCLP5's 4-entry palette pushes high-magnitude
+// outliers to the sidecar, so this correction is required for correctness. Grid-strided
+// over sidecar entries; scattered atomicAdd — cheap since sidecar is ~1% of weights.
+__global__ void sclp5_sidecar_correct_gemv_kernel(
+    const uint8_t* __restrict__ blob,
+    const float*   __restrict__ x,
+    float*         __restrict__ y,
+    uint32_t N, uint32_t K
+) {
+    __shared__ uint32_t s_bpal_start;
+    __shared__ uint32_t s_ws_start;
+    __shared__ uint32_t s_sc_count;
+    __shared__ uint32_t s_sc_base;
+    if (threadIdx.x == 0) {
+        uint32_t ne; __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
+        const uint8_t* p = blob + 8;
+        for (uint32_t e = 0; e < ne; e++) p += 1 + p[0];
+        s_bpal_start = (uint32_t)(p - blob);
+        uint64_t nw = (uint64_t)N * K;
+        s_ws_start = s_bpal_start + (uint32_t)((nw / QK_SCLP4) * 4);
+        uint32_t enw = (uint32_t)(nw / ne);
+        uint64_t ws_total = (uint64_t)ne * (((enw + 7) / 8) * 5);
+        uint32_t sc_base = s_ws_start + (uint32_t)ws_total;
+        s_sc_base = sc_base;
+        __builtin_memcpy(&s_sc_count, blob + sc_base, sizeof(uint32_t));
+    }
+    __syncthreads();
+
+    uint32_t sc_count = s_sc_count;
+    if (sc_count == 0) return;
+    const uint8_t*  bpal_base = blob + s_bpal_start;
+    const uint8_t*  ws        = blob + s_ws_start;
+    const uint32_t* sc_idx    = (const uint32_t*)(blob + s_sc_base + 4);
+    const uint16_t* sc_val    = (const uint16_t*)(blob + s_sc_base + 4 + (uint64_t)sc_count * 4);
+
+    uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < sc_count; i += stride) {
+        uint32_t gidx = sc_idx[i];
+        uint32_t row = gidx / K;
+        uint32_t col = gidx - row * K;
+
+        // palette-approx value the fused GEMV used for this weight
+        uint32_t g   = gidx / 8;
+        uint32_t sub = gidx & 7;
+        const uint8_t* gp = ws + (uint64_t)g * 5;
+        uint64_t v = ((uint64_t)gp[0] << 32) | ((uint64_t)gp[1] << 24) |
+                     ((uint64_t)gp[2] << 16) | ((uint64_t)gp[3] << 8) | (uint64_t)gp[4];
+        uint8_t code = (uint8_t)((v >> (5 * (7 - sub))) & 0x1F);
+        const uint8_t* bp = bpal_base + (uint64_t)(gidx / QK_SCLP4) * 4;
+        uint16_t approx_bits = ((uint16_t)((code >> 2) & 1) << 15) |
+                               ((uint16_t)bp[code >> 3] << 7) |
+                               ((uint16_t)(code & 0x3) << 5);
+        float approx = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&approx_bits));
+        uint16_t tb = sc_val[i];
+        float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
+
+        atomicAdd(&y[row], (trueval - approx) * x[col]);
+    }
+}
+
+inline void llama_sclp5_fused_gemv(
+    const void*   blob_ptr,
+    const float*  src_f32,
+    float*        dst_f32,
+    uint32_t      N,
+    uint32_t      K,
+    hipStream_t   stream
+) {
+    constexpr int WARPS_PER_BLOCK = 16;
+    dim3 gemv_block(WARPS_PER_BLOCK * 32);
+    dim3 gemv_grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+    size_t smem_bytes = (size_t)K * sizeof(float);
+    sclp5_fused_gemv_kernel<<<gemv_grid, gemv_block, smem_bytes, stream>>>(
+        (const uint8_t*)blob_ptr, src_f32, dst_f32, N, K);
+    // Apply sidecar correction (required for SCLP5 — outliers carry large magnitude).
+    sclp5_sidecar_correct_gemv_kernel<<<256, 256, 0, stream>>>(
+        (const uint8_t*)blob_ptr, src_f32, dst_f32, N, K);
+}
+
 inline void llama_sclp4_fused_gemv(
     const void*   blob_ptr,
     const float*  src_f32,
