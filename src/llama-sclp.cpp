@@ -370,11 +370,25 @@ static sclp_expert_encoded encode_sclp_expert(
             for (int64_t i = b_start; i < b_end; i++) {
                 uint16_t w = bf16_weights[i];
                 uint8_t exp = (w >> 7) & 0xFF;
-                indices[i] = bexp_to_idx[exp];
-
                 uint8_t sign = (w >> 15) & 1;
-                uint8_t mant = (w >> 6) & 0x1;
-                sm_nibbles[i] = (sign << 1) | mant;
+
+                // Pick the (palette idx, mantissa bit) pair that minimizes
+                // reconstruction error against the original value. Beats nearest-
+                // exponent + top-mantissa-bit: a neighbouring palette exponent often
+                // reconstructs closer (e.g. 1.8*2^e -> 1.0*2^(e+1) beats 1.5*2^e).
+                // Pure encoder change — wire format and decoders are unchanged.
+                float orig = data[i];
+                float best_err = FLT_MAX;
+                uint8_t best_idx = bexp_to_idx[exp], best_mant = (w >> 6) & 0x1;
+                for (int j = 0; j < 4; j++) {
+                    for (int m = 0; m < 2; m++) {
+                        uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)bpal[j] << 7) | ((uint16_t)m << 6);
+                        float err = std::fabs(bf16_to_float(bits) - orig);
+                        if (err < best_err) { best_err = err; best_idx = (uint8_t)j; best_mant = (uint8_t)m; }
+                    }
+                }
+                indices[i] = best_idx;
+                sm_nibbles[i] = (sign << 1) | best_mant;
 
                 if (!bin_pal[exp]) {
                     if (bexp_distance[exp] > 1) {
