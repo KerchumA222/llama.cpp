@@ -2721,11 +2721,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t N = src0->ne[1];
         const int64_t M = src1->ne[1];
 
-        // SCLP6 fused GEMV disabled: kernel produces numerical errors on Gemma4-31B
-        // dense attention tensors. Two-pass (decode→BF16→rocBLAS) is correct.
-        // TODO: debug sclp6_fused_gemv_kernel accumulation/decode logic.
-        if (false && M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-                && (264 + (size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
+        // SCLP6 fused GEMV re-enabled: the earlier "numerical errors" were sidecar
+        // omission (8-entry palette → large outlier population), now folded in via the
+        // sorted-sidecar binary-search correction. SCLP6_NO_FUSED=1 forces two-pass.
+        static const bool sclp6_no_fused = getenv("SCLP6_NO_FUSED") != nullptr;
+        if (!sclp6_no_fused && M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+                && (272 + (size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
             llama_sclp6_fused_gemv(
                 src0->data,
                 (const float*)src1->data,

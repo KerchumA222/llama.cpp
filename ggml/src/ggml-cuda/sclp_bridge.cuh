@@ -275,6 +275,8 @@ __global__ void sclp_fused_gemv_kernel(
     // For GEMV, we assume n_experts=1 since it's the dense kernel.
     __shared__ uint32_t s_scales_start;
     __shared__ uint32_t s_ws_start;
+    __shared__ uint32_t s_sc_base;
+    __shared__ uint32_t s_sc_count;
     if (threadIdx.x < 16) {
         uint32_t ne;
         __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
@@ -293,6 +295,8 @@ __global__ void sclp_fused_gemv_kernel(
             for (uint32_t ei = 0; ei < ne; ei++) p_p += 1 + p_p[0];
             s_scales_start = (uint32_t)(p_p - blob);
             s_ws_start = s_scales_start + ((uint64_t)N * K / QK_SCLP) * sizeof(uint16_t);
+            s_sc_base  = s_ws_start + (uint32_t)((uint64_t)N * K);   // 1 byte/weight
+            __builtin_memcpy(&s_sc_count, blob + s_sc_base, sizeof(uint32_t));
         }
     }
 
@@ -327,10 +331,33 @@ __global__ void sclp_fused_gemv_kernel(
         acc += (s_lut[ws[row_base + k]] * scale) * s_x[k];
     }
 
+    // Fold sidecar (sorted-index → contiguous per-row range): add (true - approx*scale)*x[col].
+    uint32_t sc_count = s_sc_count;
+    if (sc_count > 0) {
+        const uint32_t* sc_idx = (const uint32_t*)(blob + s_sc_base + 4);
+        const uint16_t* sc_val = (const uint16_t*)(blob + s_sc_base + 4 + (uint64_t)sc_count * 4);
+        uint32_t lo = 0, hi = 0;
+        if (lane == 0) {
+            uint32_t t0 = (uint32_t)row_base, t1 = t0 + K, a = 0, b = sc_count;
+            while (a < b) { uint32_t m = (a + b) >> 1; if (sc_idx[m] < t0) a = m + 1; else b = m; }
+            lo = a; b = sc_count;
+            while (a < b) { uint32_t m = (a + b) >> 1; if (sc_idx[m] < t1) a = m + 1; else b = m; }
+            hi = a;
+        }
+        lo = __shfl(lo, 0); hi = __shfl(hi, 0);
+        for (uint32_t e = lo + lane; e < hi; e += 32) {
+            uint32_t gidx = sc_idx[e];
+            uint32_t col  = gidx - (uint32_t)row_base;
+            float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + gidx / QK_SCLP));
+            float approx = s_lut[ws[gidx]] * scale;
+            uint16_t tb = sc_val[e];
+            float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
+            acc += (trueval - approx) * s_x[col];
+        }
+    }
+
     for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
     if (lane == 0) y[row] = acc;
-    // Sidecar omitted per SCLP convention (~0.02% of weights; block-scoped scan
-    // empirically regresses throughput ~37%).
 }
 
 // Sidecar correction kernel for fused GEMM (M>1).
@@ -2626,8 +2653,10 @@ __global__ void sclp6_fused_gemv_kernel(
     extern __shared__ char smem[];
     uint32_t* s_scales_offset = (uint32_t*)smem;
     uint32_t* s_ws_offset     = (uint32_t*)(smem + 4);
-    float*    s_lut           = (float*)(smem + 8);
-    float*    s_x             = (float*)(smem + 264);
+    uint32_t* s_sc_base       = (uint32_t*)(smem + 8);
+    uint32_t* s_sc_count      = (uint32_t*)(smem + 12);
+    float*    s_lut           = (float*)(smem + 16);
+    float*    s_x             = (float*)(smem + 272);
 
     // Thread 0: walk header, locate ws_offset, build the 64-entry LUT in one pass.
     if (threadIdx.x == 0) {
@@ -2651,6 +2680,10 @@ __global__ void sclp6_fused_gemv_kernel(
         uint32_t ws_start = scales_start + (total_nw / QK_SCLP) * sizeof(uint16_t);
         uint32_t expert_groups = (expert_nw + 3) / 4;
         *s_ws_offset = ws_start + expert_idx * expert_groups * 3;
+
+        uint32_t ws_total = n_experts * expert_groups * 3;
+        *s_sc_base = ws_start + ws_total;
+        __builtin_memcpy(s_sc_count, blob + *s_sc_base, sizeof(uint32_t));
 
         for (int pidx = 0; pidx < 8; pidx++) {
             uint8_t exp_ = (pidx < (int)pal_size) ? pal[pidx] : 0;
@@ -2697,6 +2730,41 @@ __global__ void sclp6_fused_gemv_kernel(
         float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (row_weight_base + base_k) / QK_SCLP));
         for (uint32_t j = 0; j < n_k; j++) {
             acc += (s_lut[sixbits[j]] * scale) * s_x[base_k + j];
+        }
+    }
+
+    // Fold sidecar (dense only; sidecar indices are global gidx = row*K + col, sorted).
+    uint32_t sc_count = (expert_idx == 0) ? *s_sc_count : 0;
+    if (sc_count > 0) {
+        uint32_t sc_base = *s_sc_base;
+        const uint32_t* sc_idx = (const uint32_t*)(blob + sc_base + 4);
+        const uint16_t* sc_val = (const uint16_t*)(blob + sc_base + 4 + (uint64_t)sc_count * 4);
+        uint32_t lo = 0, hi = 0;
+        if (lane == 0) {
+            uint32_t t0 = (uint32_t)row_weight_base, t1 = t0 + K, a = 0, b = sc_count;
+            while (a < b) { uint32_t m = (a + b) >> 1; if (sc_idx[m] < t0) a = m + 1; else b = m; }
+            lo = a; b = sc_count;
+            while (a < b) { uint32_t m = (a + b) >> 1; if (sc_idx[m] < t1) a = m + 1; else b = m; }
+            hi = a;
+        }
+        lo = __shfl(lo, 0); hi = __shfl(hi, 0);
+        for (uint32_t e = lo + lane; e < hi; e += 32) {
+            uint32_t gidx = sc_idx[e];
+            uint32_t col  = gidx - (uint32_t)row_weight_base;
+            uint64_t byte_off = (uint64_t)(gidx / 4) * 3;
+            uint8_t b0 = ws[byte_off + 0], b1 = ws[byte_off + 1], b2 = ws[byte_off + 2];
+            uint8_t six;
+            switch (gidx & 3) {
+                case 0:  six = b0 >> 2; break;
+                case 1:  six = ((b0 & 0x3) << 4) | (b1 >> 4); break;
+                case 2:  six = ((b1 & 0xF) << 2) | (b2 >> 6); break;
+                default: six = b2 & 0x3F; break;
+            }
+            float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + gidx / QK_SCLP));
+            float approx = s_lut[six] * scale;
+            uint16_t tb = sc_val[e];
+            float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
+            acc += (trueval - approx) * s_x[col];
         }
     }
 
@@ -2760,7 +2828,7 @@ inline void llama_sclp6_fused_gemv(
     constexpr int WARPS_PER_BLOCK = 16;
     dim3 gemv_block(WARPS_PER_BLOCK * 32);
     dim3 gemv_grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
-    size_t smem_bytes = 264 + (size_t)K * sizeof(float);
+    size_t smem_bytes = 272 + (size_t)K * sizeof(float);  // +8 for sidecar base/count
     SCLP_TG_TIME_BEGIN(sclp_tg::CAT_SCLP6_DENSE);
     sclp6_fused_gemv_kernel<<<gemv_grid, gemv_block, smem_bytes, stream>>>(
         (const uint8_t*)blob_ptr,
