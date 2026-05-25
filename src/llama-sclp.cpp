@@ -490,6 +490,23 @@ static sclp_expert_encoded encode_sclp_expert(
         }
     }
 
+    // Sort sidecar by index. Mandatory entries are already in index order but the
+    // discretionary imatrix entries were appended by priority. A sorted sidecar lets the
+    // fused-GEMV sidecar correction find each row's entries as one contiguous range
+    // (gidx = row*K + col), enabling a warp-per-row, atomic-free correction. The two-pass
+    // fixup and CPU decode scatter by index, so order is irrelevant to them.
+    if (enc.sc_indices.size() > 1) {
+        std::vector<uint32_t> order(enc.sc_indices.size());
+        for (size_t i = 0; i < order.size(); i++) order[i] = (uint32_t)i;
+        std::sort(order.begin(), order.end(),
+            [&](uint32_t a, uint32_t b) { return enc.sc_indices[a] < enc.sc_indices[b]; });
+        std::vector<uint32_t> si(enc.sc_indices.size());
+        std::vector<uint16_t> sv(enc.sc_values.size());
+        for (size_t i = 0; i < order.size(); i++) { si[i] = enc.sc_indices[order[i]]; sv[i] = enc.sc_values[order[i]]; }
+        enc.sc_indices.swap(si);
+        enc.sc_values.swap(sv);
+    }
+
     if (type == GGML_TYPE_SCLP8) {
         enc.ws_stream.resize(n);
         for (int64_t i = 0; i < n; i++) {

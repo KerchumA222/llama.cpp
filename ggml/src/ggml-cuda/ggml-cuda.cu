@@ -2686,13 +2686,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t K = src0->ne[0];
         const int64_t N = src0->ne[1];
         const int64_t M = src1->ne[1];
-        // Fused decode-GEMV needs sidecar correction for SCLP5 (4-entry palette pushes
-        // high-magnitude outliers to the sidecar), and that correction (~1M scattered
-        // atomicAdds) costs more than the two-pass decode saves — so two-pass is the
-        // default. The fused path (correct, sidecar-corrected) is kept behind
-        // SCLP5_FUSED_GEMV=1 for future optimization. (Mirrors the disabled SCLP6 fused GEMV.)
-        static const bool sclp5_fused = getenv("SCLP5_FUSED_GEMV") != nullptr;
-        if (sclp5_fused && M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+        // Fused decode-GEMV with folded sidecar correction (sorted-sidecar binary search,
+        // warp-per-row, smem x — no atomics). Correct AND ~2x faster than two-pass.
+        // SCLP5_NO_FUSED=1 forces the two-pass fallback.
+        static const bool sclp5_no_fused = getenv("SCLP5_NO_FUSED") != nullptr;
+        if (!sclp5_no_fused && M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
                 && (K % 8 == 0)
                 && ((size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
             llama_sclp5_fused_gemv(
