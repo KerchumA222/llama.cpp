@@ -122,7 +122,7 @@ Benchmarks rerun on 2026-05-26 with the current build on RX 7900 XTX after a low
 |---|---:|---:|---:|---:|---|
 | SCLP4 | 26.50 | 34.01 | 2647.49 | 2641.46 | Packed palette + cached block palette in fused GEMV / sidecar path |
 | SCLP5 | 29.00 | 40.02 | 2654.01 | 2645.11 | Same palette cache pattern applied cleanly |
-| SCLP6 | 33.66 | 33.72 | 2768.62 | 2778.42 | Dense path already used a LUT; no meaningful gain from the cleanup |
+| SCLP6 | 33.73 | 37.75 | 2783.03 | 2783.03 | Replaced the 64-entry shared LUT with direct palette decode in the hot loop |
 | SCLP8 | 42.75 | 42.84 | 2690.12 | 2648.51 | Palette-cache rewrite was effectively flat on tg and noisy on pp |
 
-Takeaway: the repeated-palette read pattern was a real win in SCLP4/SCLP5, but SCLP6 was already mostly optimized in the dense path, and SCLP8 did not show a reliable throughput improvement from the same approach.
+Takeaway: the repeated-palette read pattern was a real win in SCLP4/SCLP5, but SCLP6 needed a different cleanup. Removing the shared LUT from the hot loop recovered most of the tg gap; SCLP8 still did not show a reliable throughput improvement from the same approach.
