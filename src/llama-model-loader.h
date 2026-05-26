@@ -53,7 +53,10 @@ struct llama_model_loader {
                 size_t this_off = gguf_get_tensor_offset(gguf_ctx, tensor_idx);
                 disk_size = next_off - this_off; // padded to alignment
             } else {
-                disk_size = ggml_nbytes(tensor);
+                // Last tensor: derive disk_size from file boundary.
+                size_t file_data_end = file->size() - data_offset;
+                size_t this_off = gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+                disk_size = file_data_end - this_off;
             }
 
             if (offs + disk_size < offs || offs + disk_size > file->size()) {

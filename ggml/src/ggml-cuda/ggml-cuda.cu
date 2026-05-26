@@ -820,13 +820,23 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
         const int32_t * p = tensor->op_params;
         if (p[13] == (int32_t) 0x504C4353) {
             uint64_t ds = (uint32_t) p[14] | ((uint64_t)(uint32_t) p[15] << 32);
-            // Round up to 256B (covers CUDA/ROCm buffer alignment); +64 KB for safety.
             return ((size_t) ds + 255u) & ~((size_t) 255u);
         }
         // Heuristic fallback. SCLP4 worst case observed = 2.34× nbytes on Llama-3-8B
-        // attn_q; SCLP6 max ~1.05×; SCLP max ~1.05×. Use 3× for SCLP4 and 1.25× for the
-        // others to keep headroom across all models we've tested.
-        if (tensor->type == GGML_TYPE_SCLP4) return 3 * size + 65536;
+        // attn_q; SCLP6 max ~1.05×; SCLP max ~1.05×. Default to 2.5× for SCLP4 to
+        // reduce VRAM pressure while keeping safety headroom. Override with
+        // SCLP4_ALLOC_FALLBACK_MULT=<float> when tuning memory behavior.
+        if (tensor->type == GGML_TYPE_SCLP4) {
+            static const float sclp4_fallback_mult = [] {
+                const char * env = getenv("SCLP4_ALLOC_FALLBACK_MULT");
+                if (!env || !env[0]) {
+                    return 2.5f;
+                }
+                const float v = strtof(env, nullptr);
+                return v > 0.0f ? v : 2.5f;
+            }();
+            return (size_t) (sclp4_fallback_mult * (float) size) + 65536;
+        }
         if (tensor->type == GGML_TYPE_SCLP5) return 2 * size + 65536;
         return size + size / 4 + 65536;
     }
@@ -2671,7 +2681,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_tensor src0_bf16 = *src0;
         src0_bf16.type  = GGML_TYPE_BF16;
         src0_bf16.data  = decoded.get();
-        // SCLP4 blck_size=2,type_size=1 → nb[0]=1 for a 2-weight block; BF16 needs nb[0]=2.
         src0_bf16.nb[0] = sizeof(ggml_bf16_t);
         for (int i = 1; i < GGML_MAX_DIMS; i++) {
             src0_bf16.nb[i] = src0_bf16.nb[i-1] * src0_bf16.ne[i-1];
