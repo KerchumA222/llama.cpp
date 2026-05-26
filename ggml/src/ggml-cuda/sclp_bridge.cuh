@@ -81,6 +81,10 @@ static __device__ __forceinline__ uint16_t float_to_bf16_dev(float f) {
     return (uint16_t)(x.u >> 16);
 }
 
+static __device__ __forceinline__ uint8_t sclp4_palette_pick(uint32_t packed_palette, uint8_t pidx) {
+    return (uint8_t)(packed_palette >> ((uint32_t)pidx << 3));
+}
+
 // SCLP decode bridge for llama.cpp HIP backend.
 //
 // Wire format (SCLP blob stored in VRAM, all types share the same header):
@@ -1150,16 +1154,21 @@ __global__ void sclp4_fused_gemv_kernel(
     const uint32_t n_bytes_row    = (K + 1) / 2;
     const uint64_t row_byte_base  = (uint64_t)row * n_bytes_row;
     const uint64_t row_weight_base = (uint64_t)row * K;
+    uint32_t cached_block_idx = UINT32_MAX;
+    uint32_t pal = 0;
 
     for (uint32_t b = lane; b < n_bytes_row; b += 32) {
         uint8_t byte = ws[row_byte_base + b];
         uint32_t k0  = b * 2;
-        uint32_t block_idx = (row_weight_base + k0) / QK_SCLP4;
-        const uint8_t* bp = bpal_base + block_idx * 4;
+        uint32_t block_idx = (uint32_t)((row_weight_base + k0) >> 8);
+        if (block_idx != cached_block_idx) {
+            cached_block_idx = block_idx;
+            __builtin_memcpy(&pal, bpal_base + block_idx * 4, sizeof(pal));
+        }
 
         uint8_t pidx_hi = byte >> 6;
         uint8_t smn_hi  = (byte >> 4) & 0x3;
-        uint8_t exp_hi  = bp[pidx_hi];
+        uint8_t exp_hi  = sclp4_palette_pick(pal, pidx_hi);
         uint8_t sign_hi = (smn_hi >> 1) & 1;
         uint8_t mant_hi = smn_hi & 1;
         uint16_t bits_hi = ((uint16_t)sign_hi << 15) | ((uint16_t)exp_hi << 7) | ((uint16_t)mant_hi << 6);
@@ -1169,7 +1178,7 @@ __global__ void sclp4_fused_gemv_kernel(
         if (k0 + 1 < K) {
             uint8_t pidx_lo = (byte >> 2) & 0x3;
             uint8_t smn_lo  = byte & 0x3;
-            uint8_t exp_lo  = bp[pidx_lo];
+            uint8_t exp_lo  = sclp4_palette_pick(pal, pidx_lo);
             uint8_t sign_lo = (smn_lo >> 1) & 1;
             uint8_t mant_lo = smn_lo & 1;
             uint16_t bits_lo = ((uint16_t)sign_lo << 15) | ((uint16_t)exp_lo << 7) | ((uint16_t)mant_lo << 6);
@@ -1198,8 +1207,9 @@ __global__ void sclp4_fused_gemv_kernel(
             uint32_t col  = gidx - (uint32_t)row_weight_base;
             uint8_t byte  = ws[(uint64_t)gidx >> 1];
             uint8_t nib   = (gidx & 1) ? (byte & 0xF) : (byte >> 4);
-            const uint8_t* bp = bpal_base + (uint64_t)(gidx / QK_SCLP4) * 4;
-            uint16_t ab = ((uint16_t)((nib >> 1) & 1) << 15) | ((uint16_t)bp[nib >> 2] << 7) | ((uint16_t)(nib & 1) << 6);
+            uint32_t pal;
+            __builtin_memcpy(&pal, bpal_base + ((uint64_t)gidx >> 8) * 4, sizeof(pal));
+            uint16_t ab = ((uint16_t)((nib >> 1) & 1) << 15) | ((uint16_t)sclp4_palette_pick(pal, nib >> 2) << 7) | ((uint16_t)(nib & 1) << 6);
             float approx = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&ab));
             uint16_t tb = sc_val[e];
             float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
@@ -1602,16 +1612,21 @@ __global__ void sclp4_fused_moe_gemv_kernel(
     const uint32_t n_bytes_row = (K + 1) / 2;
     const uint64_t row_byte_base = (uint64_t)row * n_bytes_row;
     const uint64_t row_weight_base = (uint64_t)row * K;
+    uint32_t cached_block_idx = UINT32_MAX;
+    uint32_t pal = 0;
 
     for (uint32_t b = lane; b < n_bytes_row; b += 32) {
         uint8_t byte = ws[row_byte_base + b];
         uint32_t k0  = b * 2;
-        uint32_t block_idx = (row_weight_base + k0) / QK_SCLP4;
-        const uint8_t* bp = bpal_base + block_idx * 4;
+        uint32_t block_idx = (uint32_t)((row_weight_base + k0) >> 8);
+        if (block_idx != cached_block_idx) {
+            cached_block_idx = block_idx;
+            __builtin_memcpy(&pal, bpal_base + block_idx * 4, sizeof(pal));
+        }
 
         uint8_t pidx_hi = byte >> 6;
         uint8_t smn_hi  = (byte >> 4) & 0x3;
-        uint8_t exp_hi  = bp[pidx_hi];
+        uint8_t exp_hi  = sclp4_palette_pick(pal, pidx_hi);
         uint8_t sign_hi = (smn_hi >> 1) & 1;
         uint8_t mant_hi = smn_hi & 1;
         uint16_t bits_hi = ((uint16_t)sign_hi << 15) | ((uint16_t)exp_hi << 7) | ((uint16_t)mant_hi << 6);
@@ -1620,7 +1635,7 @@ __global__ void sclp4_fused_moe_gemv_kernel(
         if (k0 + 1 < K) {
             uint8_t pidx_lo = (byte >> 2) & 0x3;
             uint8_t smn_lo  = byte & 0x3;
-            uint8_t exp_lo  = bp[pidx_lo];
+            uint8_t exp_lo  = sclp4_palette_pick(pal, pidx_lo);
             uint8_t sign_lo = (smn_lo >> 1) & 1;
             uint8_t mant_lo = smn_lo & 1;
             uint16_t bits_lo = ((uint16_t)sign_lo << 15) | ((uint16_t)exp_lo << 7) | ((uint16_t)mant_lo << 6);
