@@ -85,6 +85,21 @@ static __device__ __forceinline__ uint8_t sclp4_palette_pick(uint32_t packed_pal
     return (uint8_t)(packed_palette >> ((uint32_t)pidx << 3));
 }
 
+static __device__ __forceinline__ uint8_t sclp8_palette_pick(
+    uint32_t pal0,
+    uint32_t pal1,
+    uint32_t pal2,
+    uint32_t pal3,
+    uint8_t  pidx
+) {
+    switch (pidx >> 2) {
+        case 0: return (uint8_t)(pal0 >> ((uint32_t)(pidx & 3) << 3));
+        case 1: return (uint8_t)(pal1 >> ((uint32_t)(pidx & 3) << 3));
+        case 2: return (uint8_t)(pal2 >> ((uint32_t)(pidx & 3) << 3));
+        default:return (uint8_t)(pal3 >> ((uint32_t)(pidx & 3) << 3));
+    }
+}
+
 // SCLP decode bridge for llama.cpp HIP backend.
 //
 // Wire format (SCLP blob stored in VRAM, all types share the same header):
@@ -324,14 +339,14 @@ __global__ void sclp_fused_gemv_kernel(
     // 8 weights per uint64 load.
     for (uint32_t k8 = lane * 8; k8 < K8; k8 += 32 * 8) {
         uint64_t ws8; __builtin_memcpy(&ws8, ws + row_base + k8, sizeof(uint64_t));
-        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (row_base + k8) / QK_SCLP));
+        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((row_base + k8) >> 5)));
         #pragma unroll
         for (int j = 0; j < 8; j++) {
             acc += (s_lut[(uint8_t)(ws8 >> (j * 8))] * scale) * s_x[k8 + j];
         }
     }
     for (uint32_t k = K8 + lane; k < K; k += 32) {
-        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (row_base + k) / QK_SCLP));
+        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((row_base + k) >> 5)));
         acc += (s_lut[ws[row_base + k]] * scale) * s_x[k];
     }
 
@@ -352,7 +367,7 @@ __global__ void sclp_fused_gemv_kernel(
         for (uint32_t e = lo + lane; e < hi; e += 32) {
             uint32_t gidx = sc_idx[e];
             uint32_t col  = gidx - (uint32_t)row_base;
-            float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + gidx / QK_SCLP));
+            float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (gidx >> 5)));
             float approx = s_lut[ws[gidx]] * scale;
             uint16_t tb = sc_val[e];
             float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
@@ -390,6 +405,12 @@ __global__ void sclp_sidecar_correct_gemm_kernel(
     }
     __syncthreads();
 
+    uint32_t pal0, pal1, pal2, pal3;
+    __builtin_memcpy(&pal0, s_palette + 0,  sizeof(uint32_t));
+    __builtin_memcpy(&pal1, s_palette + 4,  sizeof(uint32_t));
+    __builtin_memcpy(&pal2, s_palette + 8,  sizeof(uint32_t));
+    __builtin_memcpy(&pal3, s_palette + 12, sizeof(uint32_t));
+
     const uint8_t* ws = blob + s_ws_start;
     const uint8_t* sidecar_base = ws + (uint64_t)N * K;  // ws_stream is N*K bytes
 
@@ -422,7 +443,7 @@ __global__ void sclp_sidecar_correct_gemm_kernel(
         uint8_t b     = ws[(uint64_t)n * K + k];
         uint8_t smn   = b & 0x0F;
         uint16_t approx_bits = ((uint16_t)(smn >> 3) << 15)
-                             | ((uint16_t)s_palette[b >> 4] << 7)
+                             | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, b >> 4) << 7)
                              | ((uint16_t)(smn & 0x7) << 4);
 
         float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
@@ -491,6 +512,12 @@ __global__ void sclp_fused_gemm_kernel(
     }
     __syncthreads();
 
+    uint32_t pal0, pal1, pal2, pal3;
+    __builtin_memcpy(&pal0, s_palette + 0,  sizeof(uint32_t));
+    __builtin_memcpy(&pal1, s_palette + 4,  sizeof(uint32_t));
+    __builtin_memcpy(&pal2, s_palette + 8,  sizeof(uint32_t));
+    __builtin_memcpy(&pal3, s_palette + 12, sizeof(uint32_t));
+
     const uint16_t* scales = (const uint16_t*)(blob + s_scales_start);
     const uint8_t* ws = blob + s_ws_start;  // ws_stream: N*K bytes, 1 per weight
 
@@ -521,7 +548,7 @@ __global__ void sclp_fused_gemm_kernel(
             uint8_t b     = (uint8_t)(ws8 >> (j * 8));
             uint8_t smn   = b & 0x0F;
             uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                          | ((uint16_t)s_palette[b >> 4] << 7)
+                          | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, b >> 4) << 7)
                           | ((uint16_t)(smn & 0x7) << 4);
             float w = __bfloat162float(*(__hip_bfloat16*)&bits) * scale;
             #pragma unroll TILE_M
@@ -537,7 +564,7 @@ __global__ void sclp_fused_gemm_kernel(
         uint8_t b     = ws[row_base + k];
         uint8_t smn   = b & 0x0F;
         uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                      | ((uint16_t)s_palette[b >> 4] << 7)
+                      | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, b >> 4) << 7)
                       | ((uint16_t)(smn & 0x7) << 4);
         float w = __bfloat162float(*(__hip_bfloat16*)&bits) * scale;
         #pragma unroll TILE_M
@@ -657,6 +684,12 @@ __global__ void sclp_fused_moe_gemv_kernel(
     }
     __syncthreads();
 
+    uint32_t pal0, pal1, pal2, pal3;
+    __builtin_memcpy(&pal0, s_palette + 0,  sizeof(uint32_t));
+    __builtin_memcpy(&pal1, s_palette + 4,  sizeof(uint32_t));
+    __builtin_memcpy(&pal2, s_palette + 8,  sizeof(uint32_t));
+    __builtin_memcpy(&pal3, s_palette + 12, sizeof(uint32_t));
+
     const uint16_t* scales = (const uint16_t*)(blob + s_scales_start);
     const uint8_t*  ws     = blob + s_ws_start;
 
@@ -680,17 +713,17 @@ __global__ void sclp_fused_moe_gemv_kernel(
     const uint32_t K16 = (K / 16) * 16;
 
     for (uint32_t k16 = lane * 16; k16 < K16; k16 += 32 * 16) {
-        float scale0 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (ws_base + k16) / QK_SCLP));
-        float scale1 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (ws_base + k16 + 8) / QK_SCLP));
+        float scale0 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((ws_base + k16) >> 5)));
+        float scale1 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((ws_base + k16 + 8) >> 5)));
         {
             uint64_t ws8; __builtin_memcpy(&ws8, ws + ws_base + k16, sizeof(uint64_t));
             #pragma unroll
             for (int j = 0; j < 8; j++) {
-                uint8_t b     = (uint8_t)(ws8 >> (j * 8));
-                uint8_t smn   = b & 0x0F;
-                uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                              | ((uint16_t)s_palette[b >> 4] << 7)
-                              | ((uint16_t)(smn & 0x7) << 4);
+            uint8_t b     = (uint8_t)(ws8 >> (j * 8));
+            uint8_t smn   = b & 0x0F;
+            uint16_t bits = ((uint16_t)(smn >> 3) << 15)
+                          | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, b >> 4) << 7)
+                          | ((uint16_t)(smn & 0x7) << 4);
                 acc0 += (__bfloat162float(*(__hip_bfloat16*)&bits) * scale0) * x[k16 + j];
             }
         }
@@ -698,22 +731,22 @@ __global__ void sclp_fused_moe_gemv_kernel(
             uint64_t ws8; __builtin_memcpy(&ws8, ws + ws_base + k16 + 8, sizeof(uint64_t));
             #pragma unroll
             for (int j = 0; j < 8; j++) {
-                uint8_t b     = (uint8_t)(ws8 >> (j * 8));
-                uint8_t smn   = b & 0x0F;
-                uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                              | ((uint16_t)s_palette[b >> 4] << 7)
-                              | ((uint16_t)(smn & 0x7) << 4);
+            uint8_t b     = (uint8_t)(ws8 >> (j * 8));
+            uint8_t smn   = b & 0x0F;
+            uint16_t bits = ((uint16_t)(smn >> 3) << 15)
+                          | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, b >> 4) << 7)
+                          | ((uint16_t)(smn & 0x7) << 4);
                 acc1 += (__bfloat162float(*(__hip_bfloat16*)&bits) * scale1) * x[k16 + 8 + j];
             }
         }
     }
     float acc = acc0 + acc1;
     for (uint32_t k = K16 + lane; k < K; k += 32) {
-        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (ws_base + k) / QK_SCLP));
+        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((ws_base + k) >> 5)));
         uint8_t b     = ws[ws_base + k];
         uint8_t smn   = b & 0x0F;
         uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                      | ((uint16_t)s_palette[b >> 4] << 7)
+                      | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, b >> 4) << 7)
                       | ((uint16_t)(smn & 0x7) << 4);
         acc += (__bfloat162float(*(__hip_bfloat16*)&bits) * scale) * x[k];
     }
@@ -801,6 +834,12 @@ __global__ void sclp_fused_wmma_kernel(
     }
     __syncthreads();
 
+    uint32_t pal0, pal1, pal2, pal3;
+    __builtin_memcpy(&pal0, s_palette + 0,  sizeof(uint32_t));
+    __builtin_memcpy(&pal1, s_palette + 4,  sizeof(uint32_t));
+    __builtin_memcpy(&pal2, s_palette + 8,  sizeof(uint32_t));
+    __builtin_memcpy(&pal3, s_palette + 12, sizeof(uint32_t));
+
     const uint16_t* scales = (const uint16_t*)(blob + s_scales_start);
     const uint8_t* ws = blob + s_ws_start;  // ws_stream: N*K bytes, 1 per weight
 
@@ -851,7 +890,7 @@ __global__ void sclp_fused_wmma_kernel(
                 uint8_t p_idx  = b >> 4;
                 uint8_t smn    = b & 0x0F;
                 uint16_t bits  = ((uint16_t)(smn >> 3) << 15)
-                               | ((uint16_t)s_palette[p_idx] << 7)
+                               | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, p_idx) << 7)
                                | ((uint16_t)(smn & 0x7) << 4);
                 float w = __bfloat162float(*(__hip_bfloat16*)&bits) * scale;
                 a_frag[j] = __float2bfloat16(w);
@@ -1318,8 +1357,9 @@ __global__ void sclp5_decode_blob_kernel(
         uint32_t local_base = g_local * 8;
         uint32_t base_idx   = e * enw + local_base;
 
-        uint32_t block_idx = e * s_blocks_per_expert + local_base / QK_SCLP4;
-        const uint8_t* bp  = bpal_base + (uint64_t)block_idx * 4;
+        uint32_t block_idx = e * s_blocks_per_expert + (local_base >> 8);
+        uint32_t pal;
+        __builtin_memcpy(&pal, bpal_base + (uint64_t)block_idx * 4, sizeof(pal));
 
         const uint8_t* g = ws + (uint64_t)e * s_expert_ws_bytes + (uint64_t)g_local * 5;
         uint64_t v = ((uint64_t)g[0] << 32) | ((uint64_t)g[1] << 24) |
@@ -1331,7 +1371,7 @@ __global__ void sclp5_decode_blob_kernel(
             uint8_t idx  = code >> 3;
             uint8_t sign = (code >> 2) & 1;
             uint8_t mant = code & 0x3;
-            uint8_t exp_ = bp[idx];
+            uint8_t exp_ = sclp4_palette_pick(pal, idx);
             uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp_ << 7) | ((uint16_t)mant << 5);
             output[base_idx + i] = bits;
         }
@@ -1459,8 +1499,9 @@ __global__ void sclp5_fused_gemv_kernel(
         uint64_t v = ((uint64_t)gp[0] << 32) | ((uint64_t)gp[1] << 24) |
                      ((uint64_t)gp[2] << 16) | ((uint64_t)gp[3] << 8) | (uint64_t)gp[4];
         uint32_t k0 = g * 8;
-        uint32_t block_idx = (uint32_t)((row_weight_base + k0) / QK_SCLP4);
-        const uint8_t* bp = bpal_base + (uint64_t)block_idx * 4;
+        uint32_t block_idx = (uint32_t)((row_weight_base + k0) >> 8);
+        uint32_t pal;
+        __builtin_memcpy(&pal, bpal_base + (uint64_t)block_idx * 4, sizeof(pal));
         #pragma unroll
         for (int j = 0; j < 8; j++) {
             uint32_t k = k0 + j;
@@ -1469,7 +1510,7 @@ __global__ void sclp5_fused_gemv_kernel(
             uint8_t idx  = code >> 3;
             uint8_t sign = (code >> 2) & 1;
             uint8_t mant = code & 0x3;
-            uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)bp[idx] << 7) | ((uint16_t)mant << 5);
+            uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)sclp4_palette_pick(pal, idx) << 7) | ((uint16_t)mant << 5);
             float w = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&bits));
             acc += w * s_x[k];
         }
@@ -1502,9 +1543,10 @@ __global__ void sclp5_fused_gemv_kernel(
             uint64_t v = ((uint64_t)gp[0] << 32) | ((uint64_t)gp[1] << 24) |
                          ((uint64_t)gp[2] << 16) | ((uint64_t)gp[3] << 8) | (uint64_t)gp[4];
             uint8_t code = (uint8_t)((v >> (5 * (7 - sub))) & 0x1F);
-            const uint8_t* bp = bpal_base + (uint64_t)(gidx / QK_SCLP4) * 4;
+            uint32_t pal;
+            __builtin_memcpy(&pal, bpal_base + ((uint64_t)gidx >> 8) * 4, sizeof(pal));
             uint16_t ab = ((uint16_t)((code >> 2) & 1) << 15) |
-                          ((uint16_t)bp[code >> 3] << 7) | ((uint16_t)(code & 0x3) << 5);
+                          ((uint16_t)sclp4_palette_pick(pal, code >> 3) << 7) | ((uint16_t)(code & 0x3) << 5);
             float approx = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&ab));
             uint16_t tb = sc_val[e];
             float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
@@ -2742,7 +2784,7 @@ __global__ void sclp6_fused_gemv_kernel(
 
         uint32_t base_k = g * 4;
         uint32_t n_k = (base_k + 4 <= K) ? 4 : (K - base_k);
-        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (row_weight_base + base_k) / QK_SCLP));
+        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((row_weight_base + base_k) >> 5)));
         for (uint32_t j = 0; j < n_k; j++) {
             acc += (s_lut[sixbits[j]] * scale) * s_x[base_k + j];
         }
@@ -2775,7 +2817,7 @@ __global__ void sclp6_fused_gemv_kernel(
                 case 2:  six = ((b1 & 0xF) << 2) | (b2 >> 6); break;
                 default: six = b2 & 0x3F; break;
             }
-            float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + gidx / QK_SCLP));
+            float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (gidx >> 5)));
             float approx = s_lut[six] * scale;
             uint16_t tb = sc_val[e];
             float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
