@@ -3420,6 +3420,43 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         return;
     }
 
+    // SCLP5 MoE: fused GEMV for single-token generation (n_batches==1); two-pass for prefill.
+    if (src0->type == GGML_TYPE_SCLP5) {
+        GGML_ASSERT(ids != nullptr && "SCLP5 MUL_MAT_ID requires routing ids");
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        const int64_t n_batches = ids->ne[1];
+        if (n_batches == 1) {
+            const int64_t K        = src0->ne[0];
+            const int64_t N        = src0->ne[1];
+            const int64_t n_active = ids->ne[0];
+            llama_sclp5_fused_moe_gemv(
+                src0->data,
+                (const float*)src1->data,
+                (const int32_t*)ids->data,
+                (float*)dst->data,
+                (uint32_t)N, (uint32_t)K, (uint32_t)n_active, (uint32_t)n_batches,
+                (uint32_t)src1->ne[1],
+                ctx.stream());
+            return;
+        }
+        const int64_t num_weights = ggml_nelements(src0);
+        ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
+        llama_sclp5_dispatch(src0->data, decoded.get(), (uint32_t)num_weights, ctx.stream());
+
+        ggml_tensor src0_bf16 = *src0;
+        src0_bf16.type  = GGML_TYPE_BF16;
+        src0_bf16.data  = decoded.get();
+        src0_bf16.nb[0] = sizeof(ggml_bf16_t);
+        for (int i = 1; i < GGML_MAX_DIMS; i++) {
+            src0_bf16.nb[i] = src0_bf16.nb[i-1] * src0_bf16.ne[i-1];
+        }
+        ggml_tensor * orig_src0 = dst->src[0];
+        dst->src[0] = &src0_bf16;
+        ggml_cuda_mul_mat_id(ctx, dst);
+        dst->src[0] = orig_src0;
+        return;
+    }
+
     // SCLP6 MoE: fused GEMV for single-token generation (n_batches==1); two-pass for prefill.
     if (src0->type == GGML_TYPE_SCLP6) {
         GGML_ASSERT(ids != nullptr && "SCLP6 MUL_MAT_ID requires routing ids");
