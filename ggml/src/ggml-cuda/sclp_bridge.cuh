@@ -95,6 +95,18 @@ static __device__ __forceinline__ float sclp5_decode_code(uint32_t packed_palett
     return __bfloat162float(*(__hip_bfloat16*)&bits);
 }
 
+static __device__ __forceinline__ float sclp5_decode_weight_at(
+    const uint8_t* __restrict__ ws,
+    uint64_t w_idx,
+    uint32_t packed_palette
+) {
+    const uint8_t* g = ws + ((w_idx >> 3) * 5);
+    uint64_t v = ((uint64_t)g[0] << 32) | ((uint64_t)g[1] << 24) |
+                 ((uint64_t)g[2] << 16) | ((uint64_t)g[3] << 8)  | (uint64_t)g[4];
+    uint8_t code = (uint8_t)((v >> (5 * (7 - (w_idx & 7)))) & 0x1F);
+    return sclp5_decode_code(packed_palette, code);
+}
+
 static __device__ __forceinline__ uint8_t sclp8_palette_pick(
     uint32_t pal0,
     uint32_t pal1,
@@ -1695,6 +1707,351 @@ inline void llama_sclp5_fused_moe_gemv(
     sclp5_fused_moe_gemv_kernel<<<grid, block, smem_bytes, stream>>>(
         (const uint8_t*)blob_ptr,
         src1, ids, dst, N, K, n_active, src1_ne1);
+}
+
+// Fused decode-WMMA kernel for SCLP5 MoE prefill (M > 1).
+__launch_bounds__(32, 8)
+__global__ void sclp5_fused_moe_wmma_kernel(
+    const uint8_t* __restrict__ blob,
+    const float*   __restrict__ src1,
+    const int32_t* __restrict__ perm,
+    const int32_t* __restrict__ expert_offsets,
+    const int32_t* __restrict__ ids,
+    float*         __restrict__ dst,
+    uint32_t N, uint32_t K,
+    uint32_t n_active, uint32_t src1_ne1, uint32_t n_experts
+) {
+    constexpr int TILE = 16;
+
+    const uint32_t m_tile = blockIdx.y;
+    const uint32_t m_base = m_tile * TILE;
+    int32_t e = -1;
+    for (uint32_t ei = 0; ei < n_experts; ei++) {
+        if ((uint32_t)expert_offsets[ei] <= m_base && m_base < (uint32_t)expert_offsets[ei + 1]) {
+            e = (int32_t)ei;
+            break;
+        }
+    }
+    if (e < 0) return;
+
+    __shared__ uint32_t s_bpal_offset;
+    __shared__ uint32_t s_ws_offset;
+    __shared__ int32_t  s_m_global[TILE];
+    __shared__ __hip_bfloat16 s_XT[TILE][TILE + 1];
+
+    if (threadIdx.x == 0) {
+        uint32_t total_nw, ne;
+        __builtin_memcpy(&total_nw, blob,     sizeof(uint32_t));
+        __builtin_memcpy(&ne,       blob + 4, sizeof(uint32_t));
+        const uint8_t* p = blob + 8;
+        for (uint32_t ei = 0; ei < ne; ei++) { p += 1 + p[0]; }
+        uint32_t expert_nw = total_nw / ne;
+        uint32_t bpal_start = (uint32_t)(p - blob);
+        uint32_t bpe = expert_nw / QK_SCLP4;
+        s_bpal_offset = bpal_start + (uint32_t)e * bpe * 4;
+        uint32_t ws_start = bpal_start + (total_nw / QK_SCLP4) * 4;
+        uint32_t expert_ws_bytes = ((expert_nw + 7) / 8) * 5;
+        s_ws_offset = ws_start + (uint32_t)e * expert_ws_bytes;
+    }
+
+    if (threadIdx.x < TILE) {
+        uint32_t m_g = m_base + threadIdx.x;
+        s_m_global[threadIdx.x] = perm[m_g];
+    }
+    __syncthreads();
+
+    const uint8_t* bpal_base = blob + s_bpal_offset;
+    const uint8_t* ws = blob + s_ws_offset;
+    const int lane     = threadIdx.x;
+    const int frag_row = lane % TILE;
+    const uint32_t n_base = (uint32_t)blockIdx.x * TILE;
+    const uint32_t n_row  = n_base + (uint32_t)frag_row;
+    const bool valid = n_row < N;
+
+    using bf16x16_t = __attribute__((ext_vector_type(16))) __bf16;
+    using floatx8_t  = __attribute__((ext_vector_type(8))) float;
+    floatx8_t acc = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+
+    for (uint32_t k16 = 0; k16 < K; k16 += TILE) {
+        bf16x16_t a_frag;
+        const uint64_t row_weight_base = (uint64_t)n_row * K;
+        #pragma unroll
+        for (int j = 0; j < TILE; j++) {
+            const uint32_t kg = k16 + j;
+            if (valid && kg < K) {
+                uint64_t w_idx = row_weight_base + kg;
+                uint32_t block_idx = (uint32_t)(w_idx >> 8);
+                uint32_t pal;
+                __builtin_memcpy(&pal, bpal_base + (uint64_t)block_idx * 4, sizeof(pal));
+                float w = sclp5_decode_weight_at(ws, w_idx, pal);
+                a_frag[j] = __float2bfloat16(w);
+            } else {
+                a_frag[j] = (__bf16)0.f;
+            }
+        }
+
+        {
+            const uint32_t k_local = frag_row;
+            const uint32_t kg = k16 + k_local;
+            #pragma unroll
+            for (int j = 0; j < TILE; j += (32 / TILE)) {
+                const uint32_t m_local = lane / TILE + j;
+                if (m_local < TILE) {
+                    int32_t mg = s_m_global[m_local];
+                    if (mg >= 0 && kg < K) {
+                        uint32_t i_active = (uint32_t)mg % n_active;
+                        uint32_t i_batch  = (uint32_t)mg / n_active;
+                        const float* x_row = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
+                        s_XT[k_local][m_local] = (__hip_bfloat16)x_row[kg];
+                    } else {
+                        s_XT[k_local][m_local] = (__hip_bfloat16)0.f;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        bf16x16_t b_frag;
+        #pragma unroll
+        for (int j = 0; j < TILE; j++) {
+            b_frag[j] = *(const __bf16*)&s_XT[frag_row][j];
+        }
+        __syncthreads();
+
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a_frag, b_frag, acc);
+    }
+
+    if (valid) {
+        const int col_lo = lane / TILE;
+        #pragma unroll
+        for (int l = 0; l < 8; l++) {
+            const uint32_t m_local = (uint32_t)(2 * l + col_lo);
+            if (m_local < TILE) {
+                int32_t mg = s_m_global[m_local];
+                if (mg >= 0) {
+                    dst[(uint64_t)mg * N + n_row] = acc[l];
+                }
+            }
+        }
+    }
+    (void)ids;
+}
+
+__global__ void sclp_moe_route_sort_kernel(
+    const int32_t* __restrict__ ids,
+    int32_t*       __restrict__ perm,
+    int32_t*       __restrict__ expert_offsets,
+    uint32_t total_slots,
+    uint32_t n_active,
+    uint32_t ids_s1,
+    uint32_t n_experts,
+    uint32_t tile
+);
+
+// Blocked sidecar correction for SCLP5 MoE fused output.
+// Mirrors the SCLP4 blocked sidecar kernel but decodes SCLP5's 5-byte/8-weight
+// ws stream on the fly. Each block owns one (n_tile, m_tile) output tile and
+// accumulates corrections for the routed slots that map into that expert.
+__launch_bounds__(128, 1)
+__global__ void sclp5_moe_sidecar_correct_blocked_kernel(
+    const uint8_t* __restrict__ blob,
+    const float*   __restrict__ src1,
+    const int32_t* __restrict__ perm,
+    const int32_t* __restrict__ expert_offsets,
+    float*         __restrict__ dst,
+    uint32_t N, uint32_t K, uint32_t n_active, uint32_t src1_ne1, uint32_t n_experts
+) {
+    constexpr int TILE = 16;
+    constexpr int MAX_SC_PER_BLOCK = 4096;
+
+    const uint32_t m_tile = blockIdx.y;
+    const uint32_t m_base = m_tile * TILE;
+    int32_t e = -1;
+    for (uint32_t ei = 0; ei < n_experts; ei++) {
+        if ((uint32_t)expert_offsets[ei] <= m_base && m_base < (uint32_t)expert_offsets[ei + 1]) {
+            e = (int32_t)ei;
+            break;
+        }
+    }
+    if (e < 0) return;
+
+    __shared__ uint32_t s_expert_nw;
+    __shared__ uint32_t s_bpal_offset_e;
+    __shared__ uint32_t s_ws_offset_e;
+    __shared__ uint32_t s_sc_base_offset;
+    __shared__ uint32_t s_sc_total;
+    __shared__ int32_t  s_m_global[TILE];
+    __shared__ uint32_t s_sc_n_e[MAX_SC_PER_BLOCK];
+    __shared__ uint32_t s_sc_k[MAX_SC_PER_BLOCK];
+    __shared__ float    s_sc_delta[MAX_SC_PER_BLOCK];
+    __shared__ uint32_t s_sc_count;
+    __shared__ uint32_t s_sc_range_begin;
+    __shared__ uint32_t s_sc_range_end;
+
+    if (threadIdx.x == 0) {
+        uint32_t total_nw, ne;
+        __builtin_memcpy(&total_nw, blob,     sizeof(uint32_t));
+        __builtin_memcpy(&ne,       blob + 4, sizeof(uint32_t));
+        const uint8_t* p = blob + 8;
+        for (uint32_t ei = 0; ei < ne; ei++) { p += 1 + p[0]; }
+        uint32_t expert_nw = total_nw / ne;
+        s_expert_nw = expert_nw;
+        uint32_t bpal_start = (uint32_t)(p - blob);
+        uint32_t bpe = expert_nw / QK_SCLP4;
+        s_bpal_offset_e = bpal_start + (uint32_t)e * bpe * 4;
+        uint32_t ws_start = bpal_start + (total_nw / QK_SCLP4) * 4;
+        uint32_t expert_ws_bytes = ((expert_nw + 7) / 8) * 5;
+        s_ws_offset_e = ws_start + (uint32_t)e * expert_ws_bytes;
+
+        uint64_t total_ws_bytes = (uint64_t)ne * expert_ws_bytes;
+        uint32_t sc_base_off = ws_start + (uint32_t)total_ws_bytes;
+        s_sc_base_offset = sc_base_off;
+        const uint8_t* sc_base = blob + sc_base_off;
+        uint32_t sc_total;
+        __builtin_memcpy(&sc_total, sc_base, sizeof(uint32_t));
+        s_sc_total = sc_total;
+        const uint8_t* sc_idx = sc_base + 4;
+
+        uint32_t target_lo = (uint32_t)e * expert_nw;
+        uint32_t target_hi = ((uint32_t)e + 1) * expert_nw;
+
+        uint32_t lo = 0, hi = sc_total;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            uint32_t val;
+            __builtin_memcpy(&val, sc_idx + (uint64_t)mid * 4, 4);
+            if (val < target_lo) lo = mid + 1; else hi = mid;
+        }
+        s_sc_range_begin = lo;
+
+        lo = s_sc_range_begin; hi = sc_total;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            uint32_t val;
+            __builtin_memcpy(&val, sc_idx + (uint64_t)mid * 4, 4);
+            if (val < target_hi) lo = mid + 1; else hi = mid;
+        }
+        s_sc_range_end = lo;
+        s_sc_count = 0;
+    }
+    if (threadIdx.x < TILE) {
+        uint32_t m_g = m_base + threadIdx.x;
+        s_m_global[threadIdx.x] = perm[m_g];
+    }
+    __syncthreads();
+
+    const uint32_t sc_begin = s_sc_range_begin;
+    const uint32_t sc_end   = s_sc_range_end;
+    if (sc_begin >= sc_end) return;
+
+    const uint32_t expert_nw = s_expert_nw;
+    const uint32_t sc_total = s_sc_total;
+    const uint8_t* sidecar_base = blob + s_sc_base_offset;
+    const uint8_t* sc_idx_base = sidecar_base + 4;
+    const uint8_t* sc_val_base = sc_idx_base + (uint64_t)sc_total * sizeof(uint32_t);
+    const uint8_t* ws_e = blob + s_ws_offset_e;
+    const uint8_t* bpal_e = blob + s_bpal_offset_e;
+
+    const uint32_t n_base = (uint32_t)blockIdx.x * TILE;
+    const uint32_t n_end  = min(n_base + (uint32_t)TILE, N);
+
+    const uint32_t range_size = sc_end - sc_begin;
+    for (uint32_t ri = threadIdx.x; ri < range_size; ri += blockDim.x) {
+        uint32_t i = sc_begin + ri;
+        uint32_t global_idx;
+        __builtin_memcpy(&global_idx, sc_idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint32_t));
+
+        uint32_t local = global_idx - (uint32_t)e * expert_nw;
+        uint32_t n_e = local / K;
+        if (n_e < n_base || n_e >= n_end) continue;
+
+        uint32_t k = local % K;
+        uint16_t correct_bits;
+        __builtin_memcpy(&correct_bits, sc_val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint16_t));
+
+        uint64_t w_idx = (uint64_t)n_e * K + k;
+        uint32_t block_idx = (uint32_t)(w_idx >> 8);
+        uint32_t pal;
+        __builtin_memcpy(&pal, bpal_e + (uint64_t)block_idx * 4, sizeof(pal));
+        float w_approx = sclp5_decode_weight_at(ws_e, w_idx, pal);
+        float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
+        float w_delta   = w_correct - w_approx;
+        if (w_delta == 0.f) continue;
+
+        uint32_t slot = atomicAdd(&s_sc_count, 1);
+        if (slot >= MAX_SC_PER_BLOCK) continue;
+        s_sc_n_e[slot] = n_e;
+        s_sc_k[slot]   = k;
+        s_sc_delta[slot] = w_delta;
+    }
+    __syncthreads();
+
+    const uint32_t sc_count = min(s_sc_count, (uint32_t)MAX_SC_PER_BLOCK);
+    if (sc_count == 0) return;
+
+    for (uint32_t cell_idx = threadIdx.x; cell_idx < (uint32_t)TILE * (uint32_t)TILE; cell_idx += blockDim.x) {
+        uint32_t n_local = cell_idx / TILE;
+        uint32_t m_local = cell_idx % TILE;
+        uint32_t n_e = n_base + n_local;
+        if (n_e >= N) continue;
+        int32_t mg = s_m_global[m_local];
+        if (mg < 0) continue;
+
+        uint32_t i_active = (uint32_t)mg % n_active;
+        uint32_t i_batch  = (uint32_t)mg / n_active;
+        const float* x_row = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
+
+        float correction = 0.f;
+        for (uint32_t s = 0; s < sc_count; s++) {
+            if (s_sc_n_e[s] != n_e) continue;
+            correction += s_sc_delta[s] * x_row[s_sc_k[s]];
+        }
+        if (correction != 0.f) {
+            dst[(uint64_t)mg * N + n_e] += correction;
+        }
+    }
+}
+
+inline void llama_sclp5_fused_moe_wmma(
+    const void*    blob_ptr,
+    const float*   src1,
+    const int32_t* ids,
+    float*         dst,
+    float*         dst_pre_sidecar,
+    int32_t*       perm_scratch,
+    int32_t*       expert_offsets_scratch,
+    uint32_t       N,
+    uint32_t       K,
+    uint32_t       n_active,
+    uint32_t       n_batches,
+    uint32_t       ids_s1,
+    uint32_t       src1_ne1,
+    uint32_t       n_experts,
+    hipStream_t    stream
+) {
+    const uint32_t total_slots = n_active * n_batches;
+    constexpr int TILE = 16;
+
+    sclp_moe_route_sort_kernel<<<1, 256, 2 * (n_experts + 1) * sizeof(int32_t), stream>>>(
+        ids, perm_scratch, expert_offsets_scratch, total_slots, n_active, ids_s1, n_experts, (uint32_t)TILE);
+
+    const uint32_t m_tile_count = (total_slots + n_experts * TILE + TILE - 1) / TILE;
+    dim3 block(32);
+    dim3 grid((N + TILE - 1) / TILE, m_tile_count);
+    sclp5_fused_moe_wmma_kernel<<<grid, block, 0, stream>>>(
+        (const uint8_t*)blob_ptr,
+        src1, perm_scratch, expert_offsets_scratch, ids, dst,
+        N, K, n_active, src1_ne1, n_experts);
+
+    if (dst_pre_sidecar != nullptr) {
+        const size_t out_elems = (size_t)N * (size_t)n_active * (size_t)n_batches;
+        hipMemcpyAsync(dst_pre_sidecar, dst, out_elems * sizeof(float), hipMemcpyDeviceToDevice, stream);
+    }
+
+    sclp5_moe_sidecar_correct_blocked_kernel<<<dim3((N + TILE - 1) / TILE, m_tile_count), 128, 0, stream>>>(
+        (const uint8_t*)blob_ptr,
+        src1, perm_scratch, expert_offsets_scratch, dst,
+        N, K, n_active, src1_ne1, n_experts);
 }
 
 inline void llama_sclp4_fused_gemv(

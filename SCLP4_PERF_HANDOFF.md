@@ -126,3 +126,15 @@ Benchmarks rerun on 2026-05-26 with the current build on RX 7900 XTX after a low
 | SCLP8 | 42.75 | 42.84 | 2690.12 | 2648.51 | Palette-cache rewrite was effectively flat on tg and noisy on pp |
 
 Takeaway: the repeated-palette read pattern was a real win in SCLP4/SCLP5, but SCLP6 needed a different cleanup. Removing the shared LUT from the hot loop recovered most of the tg gap; SCLP8 still did not show a reliable throughput improvement from the same approach.
+
+## SCLP5 MoE Branch
+
+Added a dedicated SCLP5 `mul_mat_id` MoE path so SCLP5 no longer falls through to the generic non-MoE dispatcher behavior.
+
+- Single-token generation (`n_batches == 1`) now uses the fused SCLP5 MoE GEMV path.
+- Prefill now uses a fused SCLP5 MoE WMMA path by default, including blocked sidecar correction, so it no longer needs the full BF16 expert buffer.
+- Set `SCLP5_FUSED_MOE_WMMA=0` to force the old two-pass decode + recursive GEMM path for bisecting.
+- Build validation passed after wiring the branch into `ggml/src/ggml-cuda/ggml-cuda.cu`.
+- I did not run a runtime benchmark for SCLP5 MoE because the local MoE model on disk is SCLP4 MoE (`Qwen3.6-SCLP6attn-SCLP4moe.gguf`), not SCLP5 MoE.
+
+Practical note: the 21 GiB Qwen3.6 MoE file fits within the 24 GiB card budget, but it exercises the SCLP4 MoE kernels, so it is not a valid benchmark for the new SCLP5 branch.

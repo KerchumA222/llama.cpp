@@ -3439,6 +3439,32 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 ctx.stream());
             return;
         }
+        static const bool use_fused_prefill = [] {
+            const char * v = getenv("SCLP5_FUSED_MOE_WMMA");
+            if (!v || !v[0]) return true;
+            return v[0] != '0';
+        }();
+        if (use_fused_prefill) {
+            const int64_t K        = src0->ne[0];
+            const int64_t N        = src0->ne[1];
+            const int64_t n_active = ids->ne[0];
+            const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
+            const int64_t ids_s1 = ids->nb[1] / (int64_t)sizeof(int32_t);
+            ggml_cuda_pool_alloc<int32_t> perm_scratch(ctx.pool(), (size_t)(n_active * n_batches + n_experts * 16));
+            ggml_cuda_pool_alloc<int32_t> expert_offsets_scratch(ctx.pool(), (size_t)(n_experts + 1));
+            llama_sclp5_fused_moe_wmma(
+                src0->data,
+                (const float*)src1->data,
+                (const int32_t*)ids->data,
+                (float*)dst->data,
+                nullptr,
+                perm_scratch.get(), expert_offsets_scratch.get(),
+                (uint32_t)N, (uint32_t)K, (uint32_t)n_active,
+                (uint32_t)n_batches, (uint32_t)ids_s1, (uint32_t)src1->ne[1], (uint32_t)n_experts,
+                ctx.stream());
+            return;
+        }
+
         const int64_t num_weights = ggml_nelements(src0);
         ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
         llama_sclp5_dispatch(src0->data, decoded.get(), (uint32_t)num_weights, ctx.stream());
