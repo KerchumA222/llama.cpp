@@ -451,6 +451,22 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_SCLP8] = {
+        .vec_dot_type             = GGML_TYPE_BF16,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_SCLP4] = {
+        .vec_dot_type             = GGML_TYPE_BF16,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_SCLP5] = {
+        .vec_dot_type             = GGML_TYPE_BF16,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_SCLP6] = {
+        .vec_dot_type             = GGML_TYPE_BF16,
+        .nrows                    = 1,
+    },
 };
 
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {
@@ -1290,6 +1306,174 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+// Decode a CPU-hosted SCLP blob to BF16 (uint16_t). Supports SCLP8/4/6.
+// Called only by thread 0.
+// bf16 (top 16 bits of f32) <-> f32 helpers, matching the GPU kernels which
+// truncate (x.u >> 16) rather than round.
+static inline float sclp_bf16_to_f32(uint16_t b) {
+    uint32_t u = (uint32_t)b << 16;
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+static inline uint16_t sclp_f32_to_bf16(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    return (uint16_t)(u >> 16);
+}
+
+// Mirrors the on-device decode kernels in ggml-cuda/sclp_bridge.cuh:
+//   SCLP6/SCLP8 — per-block scaling (PBS): BF16 scale per QK_SCLP=32 weights,
+//     stored between the palette headers and the ws_stream. Decoded value is
+//     bf16(bits) * scale.
+//   SCLP4 — per-block palette: palette_size=0 header, then 4 palette bytes per
+//     QK_SCLP4=256 weights; no scale multiply.
+// QK_SCLP=32, QK_SCLP4=256 (see ggml-cuda/sclp_bridge.cuh / src/llama-sclp.h).
+static void sclp_decode_to_bf16_cpu(
+    enum ggml_type type,
+    const uint8_t * blob,
+    uint16_t * output,
+    int64_t num_weights
+) {
+    enum { QK_SCLP_CPU = 32, QK_SCLP4_CPU = 256, SCLP_MAX_EXPERTS = 256 };
+
+    uint32_t n_experts;
+    memcpy(&n_experts, blob + 4, 4);
+    if (n_experts == 0) n_experts = 1;
+    GGML_ASSERT(n_experts <= SCLP_MAX_EXPERTS && "sclp cpu decode: too many experts");
+
+    // Parse per-expert palette headers. SCLP4 per-block-palette uses size 0.
+    const uint8_t * p = blob + 8;
+    uint8_t  palettes[SCLP_MAX_EXPERTS][16];
+    uint8_t  palette_lens[SCLP_MAX_EXPERTS];
+    for (uint32_t e = 0; e < n_experts; e++) {
+        palette_lens[e] = p[0];
+        memcpy(palettes[e], p + 1, p[0]);
+        p += 1 + p[0];
+    }
+
+    const int64_t enw = num_weights / n_experts; // uniform per-expert weight count
+
+    // Section after the palette headers: scales (SCLP6/8) or block palettes (SCLP4).
+    const uint32_t section_start = (uint32_t)(p - blob);
+    uint32_t ws_start;
+    uint64_t expert_ws_bytes;
+    if (type == GGML_TYPE_SCLP4) {
+        const uint64_t n_blocks = (uint64_t)num_weights / QK_SCLP4_CPU;
+        ws_start = section_start + (uint32_t)(n_blocks * 4);
+        expert_ws_bytes = (uint64_t)((enw + 1) / 2);
+    } else if (type == GGML_TYPE_SCLP5) {
+        const uint64_t n_blocks = (uint64_t)num_weights / QK_SCLP4_CPU;
+        ws_start = section_start + (uint32_t)(n_blocks * 4);
+        expert_ws_bytes = (uint64_t)(((enw + 7) / 8) * 5);
+    } else if (type == GGML_TYPE_SCLP6) {
+        const uint64_t n_scales = (uint64_t)num_weights / QK_SCLP_CPU;
+        ws_start = section_start + (uint32_t)(n_scales * sizeof(uint16_t));
+        expert_ws_bytes = (uint64_t)(((enw + 3) / 4) * 3);
+    } else { // SCLP8
+        const uint64_t n_scales = (uint64_t)num_weights / QK_SCLP_CPU;
+        ws_start = section_start + (uint32_t)(n_scales * sizeof(uint16_t));
+        expert_ws_bytes = (uint64_t)enw;
+    }
+
+    const uint16_t * scales      = (const uint16_t *)(blob + section_start);    // SCLP6/8
+    const uint8_t  * block_pals  = blob + section_start;                        // SCLP4
+    const uint8_t  * ws_base     = blob + ws_start;
+    const int64_t blocks_per_expert = enw / QK_SCLP4_CPU;                       // SCLP4
+
+    for (uint32_t e = 0; e < n_experts; e++) {
+        const uint8_t * ws_e   = ws_base + (uint64_t)e * expert_ws_bytes;
+        const int64_t   base_idx = (int64_t)e * enw;
+
+        if (type == GGML_TYPE_SCLP8) {
+            // 1 byte/weight: idx(7:4) | smn(3:0); value = bf16(bits) * scale.
+            for (int64_t j = 0; j < enw; j++) {
+                uint8_t b    = ws_e[j];
+                uint8_t pidx = b >> 4;
+                uint8_t smn  = b & 0xF;
+                uint8_t exp  = pidx < palette_lens[e] ? palettes[e][pidx] : 0;
+                uint16_t bits = (uint16_t)(((smn >> 3) & 1) << 15) |
+                                ((uint16_t)exp << 7) |
+                                ((uint16_t)(smn & 0x7) << 4);
+                float scale = sclp_bf16_to_f32(scales[(base_idx + j) / QK_SCLP_CPU]);
+                output[base_idx + j] = sclp_f32_to_bf16(sclp_bf16_to_f32(bits) * scale);
+            }
+        } else if (type == GGML_TYPE_SCLP4) {
+            // 2 weights/byte; per-block palette (4 entries per QK_SCLP4 block); no scale.
+            for (int64_t j = 0; j < enw; j++) {
+                int64_t block_idx = (int64_t)e * blocks_per_expert + j / QK_SCLP4_CPU;
+                const uint8_t * bp = block_pals + block_idx * 4;
+                uint8_t byte   = ws_e[j / 2];
+                uint8_t nibble = (j & 1) ? (byte & 0xF) : (byte >> 4);
+                uint8_t pidx   = nibble >> 2;
+                uint8_t smn    = nibble & 0x3;
+                uint8_t exp    = bp[pidx];
+                output[base_idx + j] =
+                    (uint16_t)(((smn >> 1) & 1) << 15) |
+                    ((uint16_t)exp << 7) |
+                    ((uint16_t)(smn & 1) << 6);
+            }
+        } else if (type == GGML_TYPE_SCLP5) {
+            // 8 weights / 5 bytes; per-block palette; code = idx2|sign1|mant2; no scale.
+            const int64_t groups = (enw + 7) / 8;
+            for (int64_t group = 0; group < groups; group++) {
+                const uint8_t * g = ws_e + group * 5;
+                uint64_t v = ((uint64_t)g[0] << 32) | ((uint64_t)g[1] << 24) |
+                             ((uint64_t)g[2] << 16) | ((uint64_t)g[3] << 8) | (uint64_t)g[4];
+                int64_t j0 = group * 8;
+                int64_t block_idx = (int64_t)e * blocks_per_expert + j0 / QK_SCLP4_CPU;
+                const uint8_t * bp = block_pals + block_idx * 4;
+                int64_t remaining = enw - j0;
+                for (int k = 0; k < 8 && k < remaining; k++) {
+                    uint8_t code = (uint8_t)((v >> (5 * (7 - k))) & 0x1F);
+                    uint8_t pidx = code >> 3;
+                    uint8_t smn  = code & 0x7;
+                    uint8_t exp  = bp[pidx];
+                    output[base_idx + j0 + k] =
+                        (uint16_t)(((smn >> 2) & 1) << 15) |
+                        ((uint16_t)exp << 7) |
+                        ((uint16_t)(smn & 0x3) << 5);
+                }
+            }
+        } else { // SCLP6
+            // 4 weights per 3 bytes; value = bf16(bits) * scale.
+            const int64_t groups = (enw + 3) / 4;
+            for (int64_t group = 0; group < groups; group++) {
+                const uint8_t * g = ws_e + group * 3;
+                uint8_t sixbits[4];
+                sixbits[0] = g[0] >> 2;
+                sixbits[1] = ((g[0] & 0x3) << 4) | (g[1] >> 4);
+                sixbits[2] = ((g[1] & 0xF) << 2) | (g[2] >> 6);
+                sixbits[3] = g[2] & 0x3F;
+                int64_t j = group * 4;
+                int64_t remaining = enw - j;
+                for (int k = 0; k < 4 && k < remaining; k++) {
+                    uint8_t pidx = sixbits[k] >> 3;
+                    uint8_t smn  = sixbits[k] & 0x7;
+                    uint8_t exp  = pidx < palette_lens[e] ? palettes[e][pidx] : 0;
+                    uint16_t bits = (uint16_t)(((smn >> 2) & 1) << 15) |
+                                    ((uint16_t)exp << 7) |
+                                    ((uint16_t)(smn & 0x3) << 5);
+                    float scale = sclp_bf16_to_f32(scales[(base_idx + j + k) / QK_SCLP_CPU]);
+                    output[base_idx + j + k] = sclp_f32_to_bf16(sclp_bf16_to_f32(bits) * scale);
+                }
+            }
+        }
+    }
+
+    // Sidecar fixup (same layout for all three types): raw BF16 originals, written
+    // directly (no scale multiply), restoring outliers exactly.
+    const uint64_t ws_total = (uint64_t)n_experts * expert_ws_bytes;
+    const uint8_t * sc_base = blob + ws_start + ws_total;
+    uint32_t sc_count;
+    memcpy(&sc_count, sc_base, 4);
+    const uint32_t * sc_idx = (const uint32_t *)(sc_base + 4);
+    const uint16_t * sc_val = (const uint16_t *)(sc_idx + sc_count);
+    for (uint32_t i = 0; i < sc_count; i++) {
+        output[sc_idx[i]] = sc_val[i];
+    }
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1300,6 +1484,54 @@ void ggml_compute_forward_mul_mat(
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
         ggml_compute_forward_fwht(params, dst);
+        return;
+    }
+
+    // CPU fallback for SCLP: single-threaded (thread 0 only) to avoid barrier deadlocks.
+    if (src0->type == GGML_TYPE_SCLP8 || src0->type == GGML_TYPE_SCLP4 || src0->type == GGML_TYPE_SCLP5 || src0->type == GGML_TYPE_SCLP6) {
+        if (params->ith != 0) return;
+
+        struct ggml_tensor * src0_nc = (struct ggml_tensor *)(uintptr_t)src0;
+        if (src0_nc->extra == NULL) {
+            int64_t nw = ggml_nelements(src0);
+            uint16_t * bf16 = (uint16_t *)malloc((size_t)nw * sizeof(uint16_t));
+            GGML_ASSERT(bf16 != NULL && "sclp cpu decode: out of memory");
+            sclp_decode_to_bf16_cpu(src0->type, (const uint8_t *)src0->data, bf16, nw);
+            src0_nc->extra = bf16;
+        }
+
+        const uint16_t * bf16 = (const uint16_t *)src0_nc->extra;
+        const int64_t K  = src0->ne[0];   // inner dim
+        const int64_t N  = src0->ne[1];   // output rows
+        const int64_t n_batch = ggml_nrows(dst->src[1]);  // total tokens * batch dims
+
+        // Direct BF16 GEMM: dst[n, b] = sum_k W[k, n] * src1[k, b]
+        // src0 layout: [K, N, ...], src1 layout: [K, n_batch], dst: [N, n_batch]
+        const struct ggml_tensor * src1 = dst->src[1];
+        const int64_t ne11 = src1->ne[1];
+        const int64_t ne12 = src1->ne[2];
+        const int64_t ne13 = src1->ne[3];
+
+        for (int64_t i3 = 0; i3 < ne13; i3++) {
+            for (int64_t i2 = 0; i2 < ne12; i2++) {
+                for (int64_t i1 = 0; i1 < ne11; i1++) {
+                    const float * x = (const float *)((const char *)src1->data
+                        + i1 * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
+                    float * out = (float *)((char *)dst->data
+                        + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+                    for (int64_t n = 0; n < N; n++) {
+                        const uint16_t * w = bf16 + n * K;
+                        float acc = 0.0f;
+                        for (int64_t k = 0; k < K; k++) {
+                            uint32_t tmp = (uint32_t)w[k] << 16;
+                            float wf; memcpy(&wf, &tmp, sizeof(float));
+                            acc += wf * x[k];
+                        }
+                        out[n] = acc;
+                    }
+                }
+            }
+        }
         return;
     }
 
@@ -1577,6 +1809,72 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
+
+    // CPU SCLP MoE: decode blob to BF16 once (cached in src0->extra) then recurse.
+    // The decoded BF16 buffer persists for the model's lifetime, amortizing decode
+    // cost across all forward passes (sched_reserve, warmup, and generation).
+    if (src0->type == GGML_TYPE_SCLP8 || src0->type == GGML_TYPE_SCLP4 || src0->type == GGML_TYPE_SCLP5 || src0->type == GGML_TYPE_SCLP6) {
+        // Only thread 0 handles SCLP MoE — avoids barrier count mismatch with threadpool.
+        // Other threads return immediately; thread 0 does the full GEMV.
+        // For bs=1 (generation): ~30ms. For bs=512 (sched_reserve): ~200ms. Acceptable.
+        if (params->ith != 0) {
+            return;
+        }
+
+        struct ggml_tensor * src0_nc = (struct ggml_tensor *)(uintptr_t)src0;
+        if (src0_nc->extra == NULL) {
+            int64_t nw = ggml_nelements(src0);
+            uint16_t * bf16 = (uint16_t *)malloc((size_t)nw * sizeof(uint16_t));
+            GGML_ASSERT(bf16 != NULL && "sclp mul_mat_id cpu: out of memory");
+            sclp_decode_to_bf16_cpu(src0->type, (const uint8_t *)src0->data, bf16, nw);
+            src0_nc->extra = bf16;
+        }
+
+        const uint16_t * W      = (const uint16_t *)src0_nc->extra;
+        const int64_t    K      = src0->ne[0];
+        const int64_t    N      = src0->ne[1];
+        const int64_t    n_ids  = ids->ne[0];
+        const int64_t    n_toks = ids->ne[1];
+
+        {
+            static int moe_call = 0;
+            static double t_moe_last = 0.0;
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            double t_now = ts.tv_sec + ts.tv_nsec * 1e-9;
+            /*
+            // fprintf(stderr, "[SCLP-MoE] call#%d K=%ld N=%ld n_ids=%ld n_toks=%ld dt=%.3fs\n",
+            //     chunk_idx, (long)K, (long)N, (long)n_ids, (long)n_toks, dt);
+                moe_call > 1 ? t_now - t_moe_last : 0.0);
+            */
+            moe_call++;
+            t_moe_last = t_now;
+        }
+
+        for (int64_t i_tok = 0; i_tok < n_toks; i_tok++) {
+            for (int64_t i_active = 0; i_active < n_ids; i_active++) {
+                const float * x = (const float *)((const char *)src1->data
+                    + i_tok * src1->nb[2] + (i_active % src1->ne[1]) * src1->nb[1]);
+                const int32_t expert = *(const int32_t *)((const char *)ids->data
+                    + i_active * ids->nb[0] + i_tok * ids->nb[1]);
+                GGML_ASSERT(expert >= 0 && expert < src0->ne[2]);
+                const uint16_t * W_expert = W + (int64_t)expert * K * N;
+                float * dst_col = (float *)((char *)dst->data
+                    + i_active * dst->nb[1] + i_tok * dst->nb[2]);
+
+                for (int64_t out_row = 0; out_row < N; out_row++) {
+                    const uint16_t * w = W_expert + out_row * K;
+                    float acc = 0.0f;
+                    for (int64_t k = 0; k < K; k++) {
+                        uint32_t tmp = (uint32_t)w[k] << 16;
+                        float wf; memcpy(&wf, &tmp, sizeof(float));
+                        acc += wf * x[k];
+                    }
+                    dst_col[out_row] = acc;
+                }
+            }
+        }
+        return;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 

@@ -160,6 +160,7 @@ extern "C" {
     GGML_API void gguf_set_tensor_type(struct gguf_context * ctx, const char * name, enum ggml_type type);
 
     // assumes that at least gguf_get_tensor_size bytes can be read from data
+    GGML_API void gguf_set_tensor_disk_size(struct gguf_context * ctx, const char * name, size_t disk_size);
     GGML_API void gguf_set_tensor_data(struct gguf_context * ctx, const char * name, const void * data);
 
     // writing gguf files can be done in 3 ways:

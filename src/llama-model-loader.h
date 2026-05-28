@@ -31,8 +31,9 @@ const char * llama_file_version_name(llama_fver version);
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
-        uint16_t  idx; // source file index
-        size_t   offs; // tensor data offset in the original file
+        uint16_t  idx;       // source file index
+        size_t   offs;       // tensor data offset in the original file
+        size_t   disk_size;  // actual on-disk byte count (may be < ggml_nbytes for SCLP)
 
         ggml_tensor * tensor;
 
@@ -42,8 +43,23 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
             }
 
-            offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
-            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
+            const size_t data_offset = gguf_get_data_offset(gguf_ctx);
+            offs = data_offset + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+
+            // For variable-size types, derive actual disk size from consecutive offsets.
+            const int n_tensors = gguf_get_n_tensors(gguf_ctx);
+            if (tensor_idx + 1 < n_tensors) {
+                size_t next_off = gguf_get_tensor_offset(gguf_ctx, tensor_idx + 1);
+                size_t this_off = gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+                disk_size = next_off - this_off; // padded to alignment
+            } else {
+                // Last tensor: derive disk_size from file boundary.
+                size_t file_data_end = file->size() - data_offset;
+                size_t this_off = gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+                disk_size = file_data_end - this_off;
+            }
+
+            if (offs + disk_size < offs || offs + disk_size > file->size()) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
