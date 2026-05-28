@@ -138,3 +138,72 @@ Added a dedicated SCLP5 `mul_mat_id` MoE path so SCLP5 no longer falls through t
 - I did not run a runtime benchmark for SCLP5 MoE because the local MoE model on disk is SCLP4 MoE (`Qwen3.6-SCLP6attn-SCLP4moe.gguf`), not SCLP5 MoE.
 
 Practical note: the 21 GiB Qwen3.6 MoE file fits within the 24 GiB card budget, but it exercises the SCLP4 MoE kernels, so it is not a valid benchmark for the new SCLP5 branch.
+
+### SCLP5 TG Triage: auto-fit can block generation
+
+While comparing the reduced SCLP5 hybrid against full Q4, the model sometimes never reached the generation stage under the default `--fit` planner. The failure happened during:
+
+- `common_init_result: fitting params to device memory ...`
+- followed by WSL/ROCm DXG allocation errors:
+  - `get_user_pages_fast failed: -14`
+  - `dxgkio_create_allocation: Ioctl failed: -12`
+
+Key finding:
+
+- `--fit off` reaches `generate` and produces tokens normally on the same model / prompt / KV settings.
+- `--fit on -fitt 0` also reaches `generate`.
+- The issue is therefore the loader's memory-fit pass, not the SCLP5 decode or MoE WMMA path.
+
+Practical workaround:
+
+- Use `--fit off` for this hybrid if the goal is to benchmark TG quickly.
+- If fit must stay enabled, lower the fit target explicitly instead of relying on the default safety margin.
+- Keep `TURBO_AUTO_ASYMMETRIC=0` when using `-ctk turbo4 -ctv turbo4`; otherwise the loader may upgrade K back to `q8_0` and erase most of the KV footprint reduction.
+
+### Fused Decode Follow-Up: 2026-05-27
+
+Applied a small fused-kernel cleanup pass in `ggml/src/ggml-cuda/sclp_bridge.cuh`:
+
+- Fixed SCLP5 MoE GEMV palette indexing so the expert-local palette base is paired with an expert-local weight block index.
+- SCLP5 MoE WMMA now decodes each aligned 8-weight group once per 16-wide K tile instead of reloading the same 5-byte group for every weight. Boundary cases still fall back to the existing per-weight helper.
+- SCLP4/SCLP5 blocked MoE sidecar correction now binary-searches down to the current row tile after finding the expert's sidecar range. This avoids scanning the full expert sidecar range in every `(n_tile, m_tile)` block.
+
+Validation:
+
+- `cmake --build /home/ajkerchum/llama.cpp/build2 -j` passes.
+- Llama-3 SCLP5 dense benchmark still runs: `pp512 2557.28 t/s`, `tg128 38.66 t/s` on this run.
+- Llama-3 SCLP6 dense benchmark after reverting the packed-palette experiment: `pp512 2677.10 t/s`, `tg128 36.14 t/s` on this run.
+- Reduced Qwen3.6 hybrid functional smoke with `SCLP5_FUSED_MOE_WMMA=1` completes:
+  `Qwen3.6-Q4Kattn-SCLP5.gguf`, `-p 64 -n 16 -b 128 -ub 32 -fa 1 -ctk turbo4 -ctv turbo4`,
+  `pp64 691.90 t/s`, `tg16 77.41 t/s`. This validates that the mixed model runs with the SCLP5 MoE path available, but the numbers are not representative of pure SCLP5 MoE because most tensors are Q4.
+
+Rejected experiment:
+
+- Packing the SCLP6 8-byte palette into a per-thread register made the current SCLP6 dense benchmark slower (`tg128 36.60 t/s` in the A/B run), so that change was reverted.
+
+Open validation gap:
+
+- No local pure/full SCLP5 MoE GGUF currently fits comfortably enough for a representative performance benchmark. The tiny `Qwen3.6-SCLP5moe-from-sclp4.gguf` is not a valid GGUF, and the full SCLP5 MoE Qwen files are ~24.7-24.9 GB before runtime buffers.
+
+### Compilation Unit Split: 2026-05-27
+
+Split `sclp_bridge.cuh` (3586-line monolithic header) into separate compilation units per SCLP type to isolate GPU register allocation:
+
+- `sclp_bridge_common.cuh` — shared constants, device helpers, timing macros, route sort forward decl
+- `sclp_bridge_common.cu` — `sclp_moe_route_sort_kernel` (single definition, was duplicated)
+- `sclp_bridge_sclp8.cu` — SCLP8 decode, fused GEMV/GEMM/WMMA, MoE GEMV, dispatch
+- `sclp_bridge_sclp4.cu` — SCLP4 decode, fused GEMV, MoE GEMV/WMMA/scalar, sidecar correct, dispatch
+- `sclp_bridge_sclp5.cu` — SCLP5 decode, fused GEMV, MoE GEMV/WMMA, sidecar correct, dispatch
+- `sclp_bridge_sclp6.cu` — SCLP6 decode, fused GEMV, MoE GEMV, dispatch
+- `sclp_bridge.cuh` — thin header with launcher declarations only
+
+Llama-3-8B dense tg128 results (RX 7900 XTX):
+
+| Type | Before Split | After Split | Change |
+|------|-------------|-------------|--------|
+| SCLP4 | 31.5 | 34.0 | +8% |
+| SCLP5 | 28.9 | 39.9 | +38% |
+| SCLP6 | 36.1 | 37.6 | +4% |
+| SCLP8 | — | 42.6 | baseline |
+
+SCLP5's WMMA kernel had the largest register footprint and was the primary source of spillover. Prefill (pp512) unchanged at ~2600-2700 t/s across all types.
