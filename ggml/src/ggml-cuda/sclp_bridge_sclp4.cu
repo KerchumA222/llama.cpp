@@ -174,13 +174,10 @@ __global__ void sclp4_fixup_sidecar_kernel(
 }
 
 // Fused decode-GEMV for SCLP4, M=1 (dense).
-// Mirrors the MoE GEMV structure: cooperative LDS load of activation vector + 4×4 decode LUT.
-// Previous per-warp-reads-x version left ~17× HBM headroom: 32 warps/block all re-read
-// the same x[k] from global memory, costing ~K*32*4 redundant bytes per block.
-// Shared memory layout:
-//   [0..63]   s_lut[16]  (float, 64 bytes) — decoded float for each (pidx, smn) pair
-//   [64..]    s_x[K]     (float, K*4 bytes) — activation vector
-__launch_bounds__(512, 2)
+// K-tiled: processes activation vector in TILE_K chunks to reduce shared memory
+// from K*4 to TILE_K*4 bytes, increasing occupancy (blocks per CU) for large K.
+// For K=14336: smem drops from 56 KB (1 block/CU) to 16 KB (4 blocks/CU).
+__launch_bounds__(512, 4)
 __global__ void sclp4_fused_gemv_kernel(
     const uint8_t* __restrict__ blob,
     const float*   __restrict__ x,
@@ -188,12 +185,13 @@ __global__ void sclp4_fused_gemv_kernel(
     uint32_t N,
     uint32_t K
 ) {
+    constexpr uint32_t TILE_K = 4096;
     extern __shared__ char smem[];
     __shared__ uint32_t s_bpal_start;
     __shared__ uint32_t s_ws_start;
     __shared__ uint32_t s_sc_base;
     __shared__ uint32_t s_sc_count;
-    float* s_x = (float*)smem;   // K floats (no LUT needed)
+    float* s_x = (float*)smem;
 
     if (threadIdx.x == 0) {
         uint32_t ne; __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
@@ -207,10 +205,6 @@ __global__ void sclp4_fused_gemv_kernel(
         s_sc_base = s_ws_start + (uint32_t)ws_total;
         __builtin_memcpy(&s_sc_count, blob + s_sc_base, sizeof(uint32_t));
     }
-
-    for (uint32_t k = threadIdx.x; k < K; k += blockDim.x) {
-        s_x[k] = x[k];
-    }
     __syncthreads();
 
     const uint8_t*  bpal_base = blob + s_bpal_start;
@@ -221,47 +215,63 @@ __global__ void sclp4_fused_gemv_kernel(
     const int lane     = threadIdx.x & 31;
     const uint32_t row = (uint32_t)blockIdx.x * warps_per_block + warp_id;
 
-    if (row >= N) return;
+    const bool valid = (row < N);
 
     float acc = 0.0f;
-    const uint32_t n_bytes_row    = (K + 1) / 2;
-    const uint64_t row_byte_base  = (uint64_t)row * n_bytes_row;
-    const uint64_t row_weight_base = (uint64_t)row * K;
-    uint32_t cached_block_idx = UINT32_MAX;
-    uint32_t pal = 0;
+    const uint32_t n_bytes_row     = valid ? (K + 1) / 2 : 0;
+    const uint64_t row_byte_base   = valid ? (uint64_t)row * n_bytes_row : 0;
+    const uint64_t row_weight_base = valid ? (uint64_t)row * K : 0;
 
-    for (uint32_t b = lane; b < n_bytes_row; b += 32) {
-        uint8_t byte = ws[row_byte_base + b];
-        uint32_t k0  = b * 2;
-        uint32_t block_idx = (uint32_t)((row_weight_base + k0) >> 8);
-        if (block_idx != cached_block_idx) {
-            cached_block_idx = block_idx;
-            __builtin_memcpy(&pal, bpal_base + block_idx * 4, sizeof(pal));
+    for (uint32_t k_tile = 0; k_tile < K; k_tile += TILE_K) {
+        const uint32_t tile_end = min(k_tile + TILE_K, K);
+        const uint32_t tile_len = tile_end - k_tile;
+
+        for (uint32_t k = threadIdx.x; k < tile_len; k += blockDim.x) {
+            s_x[k] = x[k_tile + k];
         }
+        __syncthreads();
 
-        uint8_t pidx_hi = byte >> 6;
-        uint8_t smn_hi  = (byte >> 4) & 0x3;
-        uint8_t exp_hi  = sclp4_palette_pick(pal, pidx_hi);
-        uint8_t sign_hi = (smn_hi >> 1) & 1;
-        uint8_t mant_hi = smn_hi & 1;
-        uint16_t bits_hi = ((uint16_t)sign_hi << 15) | ((uint16_t)exp_hi << 7) | ((uint16_t)mant_hi << 6);
-        float w_hi = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&bits_hi));
-        acc += w_hi * s_x[k0];
+        if (valid) {
+            uint32_t cached_block_idx = UINT32_MAX;
+            uint32_t pal = 0;
+            const uint32_t b_start = k_tile / 2;
+            const uint32_t b_end   = (tile_end + 1) / 2;
 
-        if (k0 + 1 < K) {
-            uint8_t pidx_lo = (byte >> 2) & 0x3;
-            uint8_t smn_lo  = byte & 0x3;
-            uint8_t exp_lo  = sclp4_palette_pick(pal, pidx_lo);
-            uint8_t sign_lo = (smn_lo >> 1) & 1;
-            uint8_t mant_lo = smn_lo & 1;
-            uint16_t bits_lo = ((uint16_t)sign_lo << 15) | ((uint16_t)exp_lo << 7) | ((uint16_t)mant_lo << 6);
-            float w_lo = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&bits_lo));
-            acc += w_lo * s_x[k0 + 1];
+            for (uint32_t b = b_start + lane; b < b_end; b += 32) {
+                uint8_t byte = ws[row_byte_base + b];
+                uint32_t k0  = b * 2;
+                uint32_t block_idx = (uint32_t)((row_weight_base + k0) >> 8);
+                if (block_idx != cached_block_idx) {
+                    cached_block_idx = block_idx;
+                    __builtin_memcpy(&pal, bpal_base + block_idx * 4, sizeof(pal));
+                }
+
+                uint8_t pidx_hi = byte >> 6;
+                uint8_t smn_hi  = (byte >> 4) & 0x3;
+                uint8_t exp_hi  = sclp4_palette_pick(pal, pidx_hi);
+                uint16_t bits_hi = ((uint16_t)((smn_hi >> 1) & 1) << 15)
+                                 | ((uint16_t)exp_hi << 7)
+                                 | ((uint16_t)(smn_hi & 1) << 6);
+                float w_hi = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&bits_hi));
+                acc += w_hi * s_x[k0 - k_tile];
+
+                if (k0 + 1 < tile_end) {
+                    uint8_t pidx_lo = (byte >> 2) & 0x3;
+                    uint8_t smn_lo  = byte & 0x3;
+                    uint8_t exp_lo  = sclp4_palette_pick(pal, pidx_lo);
+                    uint16_t bits_lo = ((uint16_t)((smn_lo >> 1) & 1) << 15)
+                                     | ((uint16_t)exp_lo << 7)
+                                     | ((uint16_t)(smn_lo & 1) << 6);
+                    float w_lo = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&bits_lo));
+                    acc += w_lo * s_x[k0 + 1 - k_tile];
+                }
+            }
         }
+        __syncthreads();
     }
 
-    // Fold sidecar (sorted-index → contiguous per-row range). Previously SCLP4 fused
-    // GEMV omitted sidecar entirely; correcting it improves token-gen quality.
+    if (!valid) return;
+
     uint32_t sc_count = s_sc_count;
     if (sc_count > 0) {
         const uint32_t* sc_idx = (const uint32_t*)(blob + s_sc_base + 4);
@@ -286,7 +296,7 @@ __global__ void sclp4_fused_gemv_kernel(
             float approx = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&ab));
             uint16_t tb = sc_val[e];
             float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
-            acc += (trueval - approx) * s_x[col];
+            acc += (trueval - approx) * x[col];
         }
     }
 
@@ -354,9 +364,10 @@ void llama_sclp4_fused_gemv(
     hipStream_t   stream
 ) {
     constexpr int WARPS_PER_BLOCK = 16;
+    constexpr uint32_t TILE_K = 4096;
     dim3 gemv_block(WARPS_PER_BLOCK * 32);
     dim3 gemv_grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
-    size_t smem_bytes = (size_t)K * sizeof(float);
+    size_t smem_bytes = (size_t)min(K, TILE_K) * sizeof(float);
     SCLP_TG_TIME_BEGIN(sclp_tg::CAT_SCLP4_DENSE);
     sclp4_fused_gemv_kernel<<<gemv_grid, gemv_block, smem_bytes, stream>>>(
         (const uint8_t*)blob_ptr,
