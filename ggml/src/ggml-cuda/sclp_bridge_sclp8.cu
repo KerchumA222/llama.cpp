@@ -136,27 +136,11 @@ __global__ void sclp_fixup_sidecar_kernel(
     }
 }
 
-// Fused decode-GEMV with inline sidecar correction.
-// Eliminates the intermediate BF16 weight buffer and the separate sidecar kernel.
-//
-// Each warp handles one output row n (16 warps/block → 16 rows/block).
-// After the main dot-product reduction, all threads in the block collaborate
-// to scan the sidecar and atomically correct any outlier weights whose row
-// falls within [block_n_start, block_n_end). This avoids a separate kernel
-// launch while keeping all corrections in the same GPU invocation.
-//
-// Phase 1 (sync 1): load palette_size.
-// Phase 2 (sync 2): load palette entries + sidecar_count in parallel.
-// Phase 3 (main GEMV, conditional on row < N).
-// Phase 4 (sync 3): wait for all y[n] writes in this block.
-// Phase 5 (sidecar scan): stride loop, skip entries outside our row range.
-// Accepts F32 activations directly — no separate f32_to_bf16_kernel needed.
-// Saves one kernel launch + one BF16 scratch buffer per layer (224 launches/token).
-// Shared memory layout:
-//   [0..1023]   s_lut[256] (float, 1024 bytes) — decoded float for each (pidx, smn) pair
-//                                                 indexed as s_lut[byte] where byte = pidx<<4 | smn
-//   [1024..]    s_x[K]     (float, K*4 bytes) — activation vector
-__launch_bounds__(512, 2)
+// K-tiled fused decode-GEMV for SCLP8 with folded sidecar correction.
+// LUT (256 floats = 1024 bytes) stays in smem permanently; x is K-tiled.
+// Sidecar reads from global x (not s_x which only holds the current tile).
+// smem = 1024 (LUT) + 16384 (TILE_K×4) = 17408 → 3 blocks/CU on RDNA3.
+__launch_bounds__(512, 3)
 __global__ void sclp_fused_gemv_kernel(
     const uint8_t* __restrict__ blob,
     const float*   __restrict__ x,
@@ -164,12 +148,11 @@ __global__ void sclp_fused_gemv_kernel(
     uint32_t N,
     uint32_t K
 ) {
+    constexpr uint32_t TILE_K = 4096;
     extern __shared__ char smem[];
-    float* s_lut = (float*)smem;          // 256 floats = 1024 bytes
-    float* s_x   = (float*)(smem + 1024); // K floats
+    float* s_lut = (float*)smem;
+    float* s_x   = (float*)(smem + 1024);
 
-    // Threads 0..15 build the LUT collaboratively (one palette entry each).
-    // For GEMV, we assume n_experts=1 since it's the dense kernel.
     __shared__ uint32_t s_scales_start;
     __shared__ uint32_t s_ws_start;
     __shared__ uint32_t s_sc_base;
@@ -192,12 +175,10 @@ __global__ void sclp_fused_gemv_kernel(
             for (uint32_t ei = 0; ei < ne; ei++) p_p += 1 + p_p[0];
             s_scales_start = (uint32_t)(p_p - blob);
             s_ws_start = s_scales_start + ((uint64_t)N * K / QK_SCLP) * sizeof(uint16_t);
-            s_sc_base  = s_ws_start + (uint32_t)((uint64_t)N * K);   // 1 byte/weight
+            s_sc_base  = s_ws_start + (uint32_t)((uint64_t)N * K);
             __builtin_memcpy(&s_sc_count, blob + s_sc_base, sizeof(uint32_t));
         }
     }
-
-    for (uint32_t k = threadIdx.x; k < K; k += blockDim.x) s_x[k] = x[k];
     __syncthreads();
 
     const uint16_t* scales = (const uint16_t*)(blob + s_scales_start);
@@ -208,48 +189,68 @@ __global__ void sclp_fused_gemv_kernel(
     const int lane     = threadIdx.x & 31;
     const uint32_t row = (uint32_t)blockIdx.x * warps_per_block + warp_id;
 
-    if (row >= N) return;
+    const bool valid = (row < N);
 
     float acc = 0.0f;
-    const uint64_t row_base = (uint64_t)row * K;
-    const uint32_t K8 = (K / 8) * 8;
+    const uint64_t row_base = valid ? (uint64_t)row * K : 0;
 
-    // 8 weights per uint64 load.
-    for (uint32_t k8 = lane * 8; k8 < K8; k8 += 32 * 8) {
-        uint64_t ws8; __builtin_memcpy(&ws8, ws + row_base + k8, sizeof(uint64_t));
-        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((row_base + k8) >> 5)));
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            acc += (s_lut[(uint8_t)(ws8 >> (j * 8))] * scale) * s_x[k8 + j];
+    for (uint32_t k_tile = 0; k_tile < K; k_tile += TILE_K) {
+        const uint32_t tile_end = min(k_tile + TILE_K, K);
+        const uint32_t tile_len = tile_end - k_tile;
+
+        for (uint32_t k = threadIdx.x; k < tile_len; k += blockDim.x) {
+            s_x[k] = x[k_tile + k];
         }
-    }
-    for (uint32_t k = K8 + lane; k < K; k += 32) {
-        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((row_base + k) >> 5)));
-        acc += (s_lut[ws[row_base + k]] * scale) * s_x[k];
+        __syncthreads();
+
+        if (valid) {
+            const uint32_t K8_start = ((k_tile + 7) / 8) * 8;
+            const uint32_t K8_end   = (tile_end / 8) * 8;
+
+            for (uint32_t k8 = K8_start + lane * 8; k8 < K8_end; k8 += 32 * 8) {
+                uint64_t ws8; __builtin_memcpy(&ws8, ws + row_base + k8, sizeof(uint64_t));
+                float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((row_base + k8) >> 5)));
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    acc += (s_lut[(uint8_t)(ws8 >> (j * 8))] * scale) * s_x[k8 + j - k_tile];
+                }
+            }
+            for (uint32_t k = k_tile + lane; k < K8_start && k < tile_end; k += 32) {
+                float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((row_base + k) >> 5)));
+                acc += (s_lut[ws[row_base + k]] * scale) * s_x[k - k_tile];
+            }
+            for (uint32_t k = K8_end + lane; k < tile_end; k += 32) {
+                float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((row_base + k) >> 5)));
+                acc += (s_lut[ws[row_base + k]] * scale) * s_x[k - k_tile];
+            }
+        }
+        __syncthreads();
     }
 
-    // Fold sidecar (sorted-index → contiguous per-row range): add (true - approx*scale)*x[col].
+    if (!valid) return;
+
+    // Folded sidecar: reads from global x (not s_x).
     uint32_t sc_count = s_sc_count;
     if (sc_count > 0) {
         const uint32_t* sc_idx = (const uint32_t*)(blob + s_sc_base + 4);
         const uint16_t* sc_val = (const uint16_t*)(blob + s_sc_base + 4 + (uint64_t)sc_count * 4);
         uint32_t lo = 0, hi = 0;
         if (lane == 0) {
-            uint32_t t0 = (uint32_t)row_base, t1 = t0 + K, a = 0, b = sc_count;
-            while (a < b) { uint32_t m = (a + b) >> 1; if (sc_idx[m] < t0) a = m + 1; else b = m; }
-            lo = a; b = sc_count;
-            while (a < b) { uint32_t m = (a + b) >> 1; if (sc_idx[m] < t1) a = m + 1; else b = m; }
+            uint32_t t0 = (uint32_t)row_base, t1 = t0 + K, a = 0, b2 = sc_count;
+            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t0) a = m + 1; else b2 = m; }
+            lo = a; b2 = sc_count;
+            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t1) a = m + 1; else b2 = m; }
             hi = a;
         }
         lo = __shfl(lo, 0); hi = __shfl(hi, 0);
-        for (uint32_t e = lo + lane; e < hi; e += 32) {
-            uint32_t gidx = sc_idx[e];
+        for (uint32_t si = lo + lane; si < hi; si += 32) {
+            uint32_t gidx = sc_idx[si];
             uint32_t col  = gidx - (uint32_t)row_base;
             float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (gidx >> 5)));
             float approx = s_lut[ws[gidx]] * scale;
-            uint16_t tb = sc_val[e];
+            uint16_t tb = sc_val[si];
             float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
-            acc += (trueval - approx) * s_x[col];
+            acc += (trueval - approx) * x[col];
         }
     }
 
@@ -515,7 +516,8 @@ void llama_sclp_fused_gemv(
     constexpr int WARPS_PER_BLOCK = 16;
     dim3 gemv_block(WARPS_PER_BLOCK * 32);
     dim3 gemv_grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
-    size_t smem_bytes = 1024 + (size_t)K * sizeof(float);
+    constexpr uint32_t TILE_K = 4096;
+    size_t smem_bytes = 1024 + (size_t)min(K, TILE_K) * sizeof(float);
     SCLP_TG_TIME_BEGIN(sclp_tg::CAT_SCLP_DENSE);
     sclp_fused_gemv_kernel<<<gemv_grid, gemv_block, smem_bytes, stream>>>(
         (const uint8_t*)blob_ptr,
@@ -531,20 +533,28 @@ void llama_sclp_fused_gemv(
 // dst:  F32 [N, n_active] output.
 // Sidecar correction is omitted (same rationale as sclp_fused_gemv_kernel).
 __launch_bounds__(1024, 2)
+// K-tiled fused MoE GEMV for SCLP8 with smem x broadcast + folded sidecar.
+__launch_bounds__(512, 2)
 __global__ void sclp_fused_moe_gemv_kernel(
     const uint8_t* __restrict__ blob,
-    const float*   __restrict__ src1,   // [K × n_active × n_batches]
-    const int32_t* __restrict__ ids,    // [n_active × n_batches]
-    float*         __restrict__ dst,    // [N × n_active × n_batches]
+    const float*   __restrict__ src1,
+    const int32_t* __restrict__ ids,
+    float*         __restrict__ dst,
     uint32_t N, uint32_t K, uint32_t n_active, uint32_t src1_ne1
 ) {
+    constexpr uint32_t TILE_K = 4096;
+    extern __shared__ char smem[];
     __shared__ uint32_t s_scales_start;
     __shared__ uint32_t s_ws_start;
+    __shared__ uint32_t s_sc_base;
+    __shared__ uint32_t s_sc_count;
     __shared__ uint8_t  s_palette[16];
+    float* s_x = (float*)smem;
 
-    // blockIdx.x = row group, blockIdx.y = flat index (i_active + i_batch * n_active)
     const uint32_t flat = blockIdx.y;
     const int32_t  e    = ids[flat];
+    const uint32_t i_active = flat % n_active;
+    const uint32_t i_batch  = flat / n_active;
 
     if (threadIdx.x == 0) {
         uint32_t ne, total_nw;
@@ -559,6 +569,8 @@ __global__ void sclp_fused_moe_gemv_kernel(
         }
         s_scales_start = (uint32_t)(p - blob);
         s_ws_start = s_scales_start + (total_nw / QK_SCLP) * sizeof(uint16_t);
+        s_sc_base  = s_ws_start + total_nw;
+        __builtin_memcpy(&s_sc_count, blob + s_sc_base, sizeof(uint32_t));
     }
     __syncthreads();
 
@@ -574,86 +586,110 @@ __global__ void sclp_fused_moe_gemv_kernel(
     const int warps_per_block = blockDim.x / 32;
     const int warp_id = threadIdx.x / 32;
     const int lane    = threadIdx.x & 31;
+    const uint32_t row = (uint32_t)blockIdx.x * warps_per_block + warp_id;
 
-    // blockIdx.x = row group, blockIdx.y = flat index (i_active + i_batch * n_active)
-    const uint32_t row    = (uint32_t)blockIdx.x * warps_per_block + warp_id;
+    const bool valid = (row < N);
 
-    if (row >= N) return;
-
-    const uint32_t i_active = flat % n_active;
-    const uint32_t i_batch  = flat / n_active;
-
-    // ws index for weight (k, row, e): k + row*K + e*N*K
-    const uint64_t ws_base = (uint64_t)e * N * K + (uint64_t)row * K;
     const float* x = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
+    const uint64_t ws_base = valid ? (uint64_t)e * N * K + (uint64_t)row * K : 0;
 
-    float acc0 = 0.0f, acc1 = 0.0f;
-    const uint32_t K16 = (K / 16) * 16;
+    float acc = 0.0f;
 
-    for (uint32_t k16 = lane * 16; k16 < K16; k16 += 32 * 16) {
-        float scale0 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((ws_base + k16) >> 5)));
-        float scale1 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((ws_base + k16 + 8) >> 5)));
-        {
-            uint64_t ws8; __builtin_memcpy(&ws8, ws + ws_base + k16, sizeof(uint64_t));
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-            uint8_t b     = (uint8_t)(ws8 >> (j * 8));
-            uint8_t smn   = b & 0x0F;
-            uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                          | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, b >> 4) << 7)
-                          | ((uint16_t)(smn & 0x7) << 4);
-                acc0 += (__bfloat162float(*(__hip_bfloat16*)&bits) * scale0) * x[k16 + j];
+    for (uint32_t k_tile = 0; k_tile < K; k_tile += TILE_K) {
+        const uint32_t tile_end = min(k_tile + TILE_K, K);
+        const uint32_t tile_len = tile_end - k_tile;
+
+        for (uint32_t k = threadIdx.x; k < tile_len; k += blockDim.x) {
+            s_x[k] = x[k_tile + k];
+        }
+        __syncthreads();
+
+        if (valid) {
+            const uint32_t K8_start = ((k_tile + 7) / 8) * 8;
+            const uint32_t K8_end   = (tile_end / 8) * 8;
+
+            for (uint32_t k8 = K8_start + lane * 8; k8 < K8_end; k8 += 32 * 8) {
+                uint64_t ws8; __builtin_memcpy(&ws8, ws + ws_base + k8, sizeof(uint64_t));
+                float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((ws_base + k8) >> 5)));
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    uint8_t b   = (uint8_t)(ws8 >> (j * 8));
+                    uint8_t smn = b & 0x0F;
+                    uint16_t bits = ((uint16_t)(smn >> 3) << 15)
+                                  | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, b >> 4) << 7)
+                                  | ((uint16_t)(smn & 0x7) << 4);
+                    acc += (__bfloat162float(*(__hip_bfloat16*)&bits) * scale) * s_x[k8 + j - k_tile];
+                }
+            }
+            for (uint32_t k = k_tile + lane; k < K8_start && k < tile_end; k += 32) {
+                float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((ws_base + k) >> 5)));
+                uint8_t b = ws[ws_base + k]; uint8_t smn = b & 0x0F;
+                uint16_t bits = ((uint16_t)(smn >> 3) << 15) | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, b >> 4) << 7) | ((uint16_t)(smn & 0x7) << 4);
+                acc += (__bfloat162float(*(__hip_bfloat16*)&bits) * scale) * s_x[k - k_tile];
+            }
+            for (uint32_t k = K8_end + lane; k < tile_end; k += 32) {
+                float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((ws_base + k) >> 5)));
+                uint8_t b = ws[ws_base + k]; uint8_t smn = b & 0x0F;
+                uint16_t bits = ((uint16_t)(smn >> 3) << 15) | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, b >> 4) << 7) | ((uint16_t)(smn & 0x7) << 4);
+                acc += (__bfloat162float(*(__hip_bfloat16*)&bits) * scale) * s_x[k - k_tile];
             }
         }
-        {
-            uint64_t ws8; __builtin_memcpy(&ws8, ws + ws_base + k16 + 8, sizeof(uint64_t));
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-            uint8_t b     = (uint8_t)(ws8 >> (j * 8));
-            uint8_t smn   = b & 0x0F;
-            uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                          | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, b >> 4) << 7)
-                          | ((uint16_t)(smn & 0x7) << 4);
-                acc1 += (__bfloat162float(*(__hip_bfloat16*)&bits) * scale1) * x[k16 + 8 + j];
-            }
+        __syncthreads();
+    }
+
+    if (!valid) return;
+
+    // Folded sidecar: indices are global (e*N*K + row*K + col).
+    uint32_t sc_count = s_sc_count;
+    if (sc_count > 0) {
+        const uint32_t* sc_idx = (const uint32_t*)(blob + s_sc_base + 4);
+        const uint16_t* sc_val = (const uint16_t*)(blob + s_sc_base + 4 + (uint64_t)sc_count * 4);
+        uint32_t lo = 0, hi = 0;
+        if (lane == 0) {
+            uint32_t t0 = (uint32_t)ws_base, t1 = t0 + K;
+            uint32_t a = 0, b2 = sc_count;
+            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t0) a = m + 1; else b2 = m; }
+            lo = a; b2 = sc_count;
+            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t1) a = m + 1; else b2 = m; }
+            hi = a;
+        }
+        lo = __shfl(lo, 0); hi = __shfl(hi, 0);
+        for (uint32_t si = lo + lane; si < hi; si += 32) {
+            uint32_t gidx = sc_idx[si];
+            uint32_t col  = gidx - (uint32_t)ws_base;
+            float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (gidx >> 5)));
+            uint8_t b = ws[gidx]; uint8_t smn = b & 0x0F;
+            uint16_t ab = ((uint16_t)(smn >> 3) << 15) | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, b >> 4) << 7) | ((uint16_t)(smn & 0x7) << 4);
+            float approx = __bfloat162float(*(__hip_bfloat16*)&ab) * scale;
+            uint16_t tb = sc_val[si];
+            float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
+            acc += (trueval - approx) * x[col];
         }
     }
-    float acc = acc0 + acc1;
-    for (uint32_t k = K16 + lane; k < K; k += 32) {
-        float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + ((ws_base + k) >> 5)));
-        uint8_t b     = ws[ws_base + k];
-        uint8_t smn   = b & 0x0F;
-        uint16_t bits = ((uint16_t)(smn >> 3) << 15)
-                      | ((uint16_t)sclp8_palette_pick(pal0, pal1, pal2, pal3, b >> 4) << 7)
-                      | ((uint16_t)(smn & 0x7) << 4);
-        acc += (__bfloat162float(*(__hip_bfloat16*)&bits) * scale) * x[k];
-    }
+
     for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
     if (lane == 0) dst[row + (uint64_t)flat * N] = acc;
 }
 
-// Launch fused MoE GEMV for SCLP expert weights (MUL_MAT_ID, any n_batches).
-// Processes each (row, i_active, i_batch) output element independently.
-// src1: F32 [K × n_active × n_batches], ids: int32 [n_active × n_batches],
-// dst: F32 [N × n_active × n_batches].
 void llama_sclp_fused_moe_gemv(
     const void*    blob_ptr,
-    const float*   src1,       // F32 [K × n_active × n_batches]
-    const int32_t* ids,        // int32 [n_active × n_batches]
-    float*         dst,        // F32 [N × n_active × n_batches]
-    uint32_t       N,          // output rows per expert
-    uint32_t       K,          // input dim
-    uint32_t       n_active,   // active experts per token
-    uint32_t       n_batches,  // number of token batches
-    uint32_t       src1_ne1,   // number of columns in src1 per batch (1 or n_active)
+    const float*   src1,
+    const int32_t* ids,
+    float*         dst,
+    uint32_t       N,
+    uint32_t       K,
+    uint32_t       n_active,
+    uint32_t       n_batches,
+    uint32_t       src1_ne1,
     hipStream_t    stream
 ) {
-    constexpr int WARPS_PER_BLOCK = 32;
+    constexpr int WARPS_PER_BLOCK = 16;
+    constexpr uint32_t TILE_K = 4096;
     dim3 block(WARPS_PER_BLOCK * 32);
-    // blockIdx.y = i_active + i_batch * n_active  (flat expert-batch index)
     dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, n_active * n_batches);
+    size_t smem_bytes = (size_t)min(K, TILE_K) * sizeof(float);
     SCLP_TG_TIME_BEGIN(sclp_tg::CAT_SCLP_MOE);
-    sclp_fused_moe_gemv_kernel<<<grid, block, 0, stream>>>(
+    sclp_fused_moe_gemv_kernel<<<grid, block, smem_bytes, stream>>>(
         (const uint8_t*)blob_ptr,
         src1, ids, dst, N, K, n_active, src1_ne1);
     SCLP_TG_TIME_END();
