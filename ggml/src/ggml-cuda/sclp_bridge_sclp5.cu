@@ -75,7 +75,6 @@ __global__ void sclp5_fixup_sidecar_kernel(
 ) {
     __shared__ uint32_t s_ws_start;
     __shared__ uint32_t s_n_experts;
-    __shared__ uint32_t sidecar_count_s;
 
     if (threadIdx.x == 0) {
         uint32_t ne;
@@ -93,24 +92,18 @@ __global__ void sclp5_fixup_sidecar_kernel(
     uint64_t total_ws_bytes = (uint64_t)s_n_experts * (((expert_nw + 7) / 8) * 5);
     const uint8_t* sidecar_base = ws + total_ws_bytes;
 
-    if (threadIdx.x == 0) {
-        uint32_t sc;
-        __builtin_memcpy(&sc, sidecar_base, sizeof(uint32_t));
-        sidecar_count_s = sc;
-    }
-    __syncthreads();
-    if (sidecar_count_s == 0) return;
+    // Sidecar v2: CSR-style per-row ranges; one thread per row.
+    const sclp_sidecar_view sc = sclp_sidecar_parse(sidecar_base, num_weights);
+    if (sc.count == 0) return;
 
-    const uint8_t* idx_base = sidecar_base + 4;
-    const uint8_t* val_base = sidecar_base + 4 + (uint64_t)sidecar_count_s * sizeof(uint32_t);
-
-    uint32_t stride = gridDim.x * blockDim.x;
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    for (uint32_t si = tid; si < sidecar_count_s; si += stride) {
-        uint32_t idx; uint16_t val;
-        __builtin_memcpy(&idx, idx_base + (uint64_t)si * sizeof(uint32_t), sizeof(uint32_t));
-        __builtin_memcpy(&val, val_base + (uint64_t)si * sizeof(uint16_t), sizeof(uint16_t));
-        output[idx] = val;
+    const uint32_t n_rows = num_weights / sc.K;
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t r = blockIdx.x * blockDim.x + threadIdx.x; r < n_rows; r += stride) {
+        uint32_t lo, hi;
+        sclp_sidecar_row_range(sc, r, &lo, &hi);
+        for (uint32_t i = lo; i < hi; i++) {
+            output[(uint64_t)r * sc.K + sclp_sidecar_col(sc, i)] = sclp_sidecar_val(sc, i);
+        }
     }
 }
 
@@ -147,7 +140,6 @@ __global__ void sclp5_fused_gemv_kernel(
     __shared__ uint32_t s_bpal_start;
     __shared__ uint32_t s_ws_start;
     __shared__ uint32_t s_sc_base;
-    __shared__ uint32_t s_sc_count;
     float* s_x = (float*)smem;
 
     if (threadIdx.x == 0) {
@@ -160,7 +152,6 @@ __global__ void sclp5_fused_gemv_kernel(
         uint32_t enw = (uint32_t)(nw / ne);
         uint64_t ws_total = (uint64_t)ne * (((enw + 7) / 8) * 5);
         s_sc_base = s_ws_start + (uint32_t)ws_total;
-        __builtin_memcpy(&s_sc_count, blob + s_sc_base, sizeof(uint32_t));
     }
     __syncthreads();
 
@@ -214,33 +205,25 @@ __global__ void sclp5_fused_gemv_kernel(
 
     if (!valid) return;
 
-    // Folded sidecar: reads from global x (not s_x which only holds last tile).
-    uint32_t sc_count = s_sc_count;
-    if (sc_count > 0) {
-        const uint32_t* sc_idx = (const uint32_t*)(blob + s_sc_base + 4);
-        const uint16_t* sc_val = (const uint16_t*)(blob + s_sc_base + 4 + (uint64_t)sc_count * 4);
+    // Folded sidecar v2: O(1) row-range lookup, reads from global x (not s_x).
+    const sclp_sidecar_view sc = sclp_sidecar_parse(blob + s_sc_base, (uint32_t)((uint64_t)N * K));
+    if (sc.count > 0) {
         uint32_t lo = 0, hi = 0;
-        if (lane == 0) {
-            uint32_t t0 = (uint32_t)row_weight_base, t1 = t0 + K, a = 0, b2 = sc_count;
-            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t0) a = m + 1; else b2 = m; }
-            lo = a; b2 = sc_count;
-            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t1) a = m + 1; else b2 = m; }
-            hi = a;
-        }
+        if (lane == 0) sclp_sidecar_row_range(sc, row, &lo, &hi);
         lo = __shfl(lo, 0); hi = __shfl(hi, 0);
         for (uint32_t si = lo + lane; si < hi; si += 32) {
-            uint32_t gidx = sc_idx[si];
-            uint32_t col  = gidx - (uint32_t)row_weight_base;
-            uint32_t g    = gidx >> 3;
-            uint32_t sub  = gidx & 7;
+            uint32_t col  = sclp_sidecar_col(sc, si);
+            uint64_t gidx = row_weight_base + col;
+            uint32_t g    = (uint32_t)(gidx >> 3);
+            uint32_t sub  = (uint32_t)(gidx & 7);
             const uint8_t* gp = ws + (uint64_t)g * 5;
             uint64_t v = ((uint64_t)gp[0] << 32) | ((uint64_t)gp[1] << 24) |
                          ((uint64_t)gp[2] << 16) | ((uint64_t)gp[3] << 8) | (uint64_t)gp[4];
             uint8_t code = (uint8_t)((v >> (5 * (7 - sub))) & 0x1F);
             uint32_t pal_sc;
-            __builtin_memcpy(&pal_sc, bpal_base + ((uint64_t)gidx >> 8) * 4, sizeof(pal_sc));
+            __builtin_memcpy(&pal_sc, bpal_base + (gidx >> 8) * 4, sizeof(pal_sc));
             float approx = sclp5_decode_code(pal_sc, code);
-            uint16_t tb = sc_val[si];
+            uint16_t tb = sclp_sidecar_val(sc, si);
             float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
             acc += (trueval - approx) * x[col];
         }
@@ -281,7 +264,7 @@ __global__ void sclp5_fused_moe_gemv_kernel(
     __shared__ uint32_t s_bpal_offset;
     __shared__ uint32_t s_ws_offset;
     __shared__ uint32_t s_sc_base;
-    __shared__ uint32_t s_sc_count;
+    __shared__ uint32_t s_total_nw;
     __shared__ uint32_t s_expert_nw;
     float* s_x = (float*)smem;
 
@@ -309,7 +292,7 @@ __global__ void sclp5_fused_moe_gemv_kernel(
         uint64_t ws_total = (uint64_t)n_experts * expert_ws_bytes;
         uint32_t sc_base = ws_start + (uint32_t)ws_total;
         s_sc_base = sc_base;
-        __builtin_memcpy(&s_sc_count, blob + sc_base, sizeof(uint32_t));
+        s_total_nw = total_nw;
     }
     __syncthreads();
 
@@ -368,27 +351,16 @@ __global__ void sclp5_fused_moe_gemv_kernel(
 
     if (!valid) return;
 
-    // Folded sidecar: indices are global (expert_offset + row*K + col).
-    uint32_t sc_count = s_sc_count;
-    if (sc_count > 0) {
-        const uint32_t* sc_idx = (const uint32_t*)(blob + s_sc_base + 4);
-        const uint16_t* sc_val = (const uint16_t*)(blob + s_sc_base + 4 + (uint64_t)sc_count * 4);
-        uint32_t expert_off = (uint32_t)e * s_expert_nw;
+    // Folded sidecar v2: global row = e * N + row, O(1) range lookup.
+    const sclp_sidecar_view sc = sclp_sidecar_parse(blob + s_sc_base, s_total_nw);
+    if (sc.count > 0) {
+        const uint32_t grow = (uint32_t)e * N + row;
         uint32_t lo = 0, hi = 0;
-        if (lane == 0) {
-            uint32_t t0 = expert_off + (uint32_t)row_weight_base;
-            uint32_t t1 = t0 + K;
-            uint32_t a = 0, b2 = sc_count;
-            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t0) a = m + 1; else b2 = m; }
-            lo = a; b2 = sc_count;
-            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t1) a = m + 1; else b2 = m; }
-            hi = a;
-        }
+        if (lane == 0) sclp_sidecar_row_range(sc, grow, &lo, &hi);
         lo = __shfl(lo, 0); hi = __shfl(hi, 0);
         for (uint32_t si = lo + lane; si < hi; si += 32) {
-            uint32_t gidx = sc_idx[si];
-            uint32_t local_idx = gidx - expert_off;
-            uint32_t col = local_idx - (uint32_t)row_weight_base;
+            uint32_t col = sclp_sidecar_col(sc, si);
+            uint32_t local_idx = (uint32_t)row_weight_base + col;
             uint32_t g   = local_idx >> 3;
             uint32_t sub = local_idx & 7;
             const uint8_t* gp = ws + (uint64_t)g * 5;
@@ -398,7 +370,7 @@ __global__ void sclp5_fused_moe_gemv_kernel(
             uint32_t pal_sc;
             __builtin_memcpy(&pal_sc, bpal_base + ((uint64_t)local_idx >> 8) * 4, sizeof(pal_sc));
             float approx = sclp5_decode_code(pal_sc, code);
-            uint16_t tb = sc_val[si];
+            uint16_t tb = sclp_sidecar_val(sc, si);
             float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
             acc += (trueval - approx) * x[col];
         }
@@ -609,27 +581,24 @@ __global__ void sclp5_moe_sidecar_correct_blocked_kernel(
     }
     if (e < 0) return;
 
-    __shared__ uint32_t s_expert_nw;
+    __shared__ uint32_t s_total_nw;
     __shared__ uint32_t s_bpal_offset_e;
     __shared__ uint32_t s_ws_offset_e;
     __shared__ uint32_t s_sc_base_offset;
-    __shared__ uint32_t s_sc_total;
     __shared__ int32_t  s_m_global[TILE];
     __shared__ uint32_t s_sc_n_e[MAX_SC_PER_BLOCK];
     __shared__ uint32_t s_sc_k[MAX_SC_PER_BLOCK];
     __shared__ float    s_sc_delta[MAX_SC_PER_BLOCK];
     __shared__ uint32_t s_sc_count;
-    __shared__ uint32_t s_sc_range_begin;
-    __shared__ uint32_t s_sc_range_end;
 
     if (threadIdx.x == 0) {
         uint32_t total_nw, ne;
         __builtin_memcpy(&total_nw, blob,     sizeof(uint32_t));
         __builtin_memcpy(&ne,       blob + 4, sizeof(uint32_t));
+        s_total_nw = total_nw;
         const uint8_t* p = blob + 8;
         for (uint32_t ei = 0; ei < ne; ei++) { p += 1 + p[0]; }
         uint32_t expert_nw = total_nw / ne;
-        s_expert_nw = expert_nw;
         uint32_t bpal_start = (uint32_t)(p - blob);
         uint32_t bpe = expert_nw / QK_SCLP4;
         s_bpal_offset_e = bpal_start + (uint32_t)e * bpe * 4;
@@ -638,34 +607,7 @@ __global__ void sclp5_moe_sidecar_correct_blocked_kernel(
         s_ws_offset_e = ws_start + (uint32_t)e * expert_ws_bytes;
 
         uint64_t total_ws_bytes = (uint64_t)ne * expert_ws_bytes;
-        uint32_t sc_base_off = ws_start + (uint32_t)total_ws_bytes;
-        s_sc_base_offset = sc_base_off;
-        const uint8_t* sc_base = blob + sc_base_off;
-        uint32_t sc_total;
-        __builtin_memcpy(&sc_total, sc_base, sizeof(uint32_t));
-        s_sc_total = sc_total;
-        const uint8_t* sc_idx = sc_base + 4;
-
-        uint32_t target_lo = (uint32_t)e * expert_nw;
-        uint32_t target_hi = ((uint32_t)e + 1) * expert_nw;
-
-        uint32_t lo = 0, hi = sc_total;
-        while (lo < hi) {
-            uint32_t mid = lo + (hi - lo) / 2;
-            uint32_t val;
-            __builtin_memcpy(&val, sc_idx + (uint64_t)mid * 4, 4);
-            if (val < target_lo) lo = mid + 1; else hi = mid;
-        }
-        s_sc_range_begin = lo;
-
-        lo = s_sc_range_begin; hi = sc_total;
-        while (lo < hi) {
-            uint32_t mid = lo + (hi - lo) / 2;
-            uint32_t val;
-            __builtin_memcpy(&val, sc_idx + (uint64_t)mid * 4, 4);
-            if (val < target_hi) lo = mid + 1; else hi = mid;
-        }
-        s_sc_range_end = lo;
+        s_sc_base_offset = ws_start + (uint32_t)total_ws_bytes;
         s_sc_count = 0;
     }
     if (threadIdx.x < TILE) {
@@ -674,73 +616,47 @@ __global__ void sclp5_moe_sidecar_correct_blocked_kernel(
     }
     __syncthreads();
 
-    if (s_sc_range_begin >= s_sc_range_end) return;
-
-    const uint32_t expert_nw = s_expert_nw;
-    const uint32_t sc_total = s_sc_total;
-    const uint8_t* sidecar_base = blob + s_sc_base_offset;
-    const uint8_t* sc_idx_base = sidecar_base + 4;
-    const uint8_t* sc_val_base = sc_idx_base + (uint64_t)sc_total * sizeof(uint32_t);
     const uint8_t* ws_e = blob + s_ws_offset_e;
     const uint8_t* bpal_e = blob + s_bpal_offset_e;
 
+    // Sidecar v2: a tile's entries are exactly its rows' ranges — no searches.
+    const sclp_sidecar_view sc = sclp_sidecar_parse(blob + s_sc_base_offset, s_total_nw);
+    if (sc.count == 0) return;
+
     const uint32_t n_base = (uint32_t)blockIdx.x * TILE;
     const uint32_t n_end  = min(n_base + (uint32_t)TILE, N);
+    const uint32_t grow_base = (uint32_t)e * N;  // rows per expert == N
 
-    if (threadIdx.x == 0) {
-        const uint32_t tile_lo = (uint32_t)e * expert_nw + n_base * K;
-        const uint32_t tile_hi = (uint32_t)e * expert_nw + n_end * K;
-        uint32_t lo = s_sc_range_begin, hi = s_sc_range_end;
-        while (lo < hi) {
-            uint32_t mid = lo + (hi - lo) / 2;
-            uint32_t val;
-            __builtin_memcpy(&val, sc_idx_base + (uint64_t)mid * sizeof(uint32_t), sizeof(uint32_t));
-            if (val < tile_lo) lo = mid + 1; else hi = mid;
-        }
-        s_sc_range_begin = lo;
-        hi = s_sc_range_end;
-        while (lo < hi) {
-            uint32_t mid = lo + (hi - lo) / 2;
-            uint32_t val;
-            __builtin_memcpy(&val, sc_idx_base + (uint64_t)mid * sizeof(uint32_t), sizeof(uint32_t));
-            if (val < tile_hi) lo = mid + 1; else hi = mid;
-        }
-        s_sc_range_end = lo;
+    // Whole-tile early out: contiguous rows → contiguous entry range.
+    {
+        uint32_t tile_lo, tile_hi, dummy;
+        sclp_sidecar_row_range(sc, grow_base + n_base, &tile_lo, &dummy);
+        sclp_sidecar_row_range(sc, grow_base + n_end - 1, &dummy, &tile_hi);
+        if (tile_lo >= tile_hi) return;
     }
-    __syncthreads();
 
-    const uint32_t sc_begin = s_sc_range_begin;
-    const uint32_t sc_end   = s_sc_range_end;
-    if (sc_begin >= sc_end) return;
+    for (uint32_t n_e = n_base; n_e < n_end; n_e++) {
+        uint32_t lo, hi;
+        sclp_sidecar_row_range(sc, grow_base + n_e, &lo, &hi);
+        for (uint32_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+            uint32_t k = sclp_sidecar_col(sc, i);
+            uint16_t correct_bits = sclp_sidecar_val(sc, i);
 
-    const uint32_t range_size = sc_end - sc_begin;
-    for (uint32_t ri = threadIdx.x; ri < range_size; ri += blockDim.x) {
-        uint32_t i = sc_begin + ri;
-        uint32_t global_idx;
-        __builtin_memcpy(&global_idx, sc_idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint32_t));
+            uint64_t w_idx = (uint64_t)n_e * K + k;
+            uint32_t block_idx = (uint32_t)(w_idx >> 8);
+            uint32_t pal;
+            __builtin_memcpy(&pal, bpal_e + (uint64_t)block_idx * 4, sizeof(pal));
+            float w_approx = sclp5_decode_weight_at(ws_e, w_idx, pal);
+            float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
+            float w_delta   = w_correct - w_approx;
+            if (w_delta == 0.f) continue;
 
-        uint32_t local = global_idx - (uint32_t)e * expert_nw;
-        uint32_t n_e = local / K;
-        if (n_e < n_base || n_e >= n_end) continue;
-
-        uint32_t k = local % K;
-        uint16_t correct_bits;
-        __builtin_memcpy(&correct_bits, sc_val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint16_t));
-
-        uint64_t w_idx = (uint64_t)n_e * K + k;
-        uint32_t block_idx = (uint32_t)(w_idx >> 8);
-        uint32_t pal;
-        __builtin_memcpy(&pal, bpal_e + (uint64_t)block_idx * 4, sizeof(pal));
-        float w_approx = sclp5_decode_weight_at(ws_e, w_idx, pal);
-        float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
-        float w_delta   = w_correct - w_approx;
-        if (w_delta == 0.f) continue;
-
-        uint32_t slot = atomicAdd(&s_sc_count, 1);
-        if (slot >= MAX_SC_PER_BLOCK) continue;
-        s_sc_n_e[slot] = n_e;
-        s_sc_k[slot]   = k;
-        s_sc_delta[slot] = w_delta;
+            uint32_t slot = atomicAdd(&s_sc_count, 1);
+            if (slot >= MAX_SC_PER_BLOCK) continue;
+            s_sc_n_e[slot] = n_e;
+            s_sc_k[slot]   = k;
+            s_sc_delta[slot] = w_delta;
+        }
     }
     __syncthreads();
 

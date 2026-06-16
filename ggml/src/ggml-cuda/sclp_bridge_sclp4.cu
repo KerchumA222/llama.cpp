@@ -119,7 +119,6 @@ __global__ void sclp4_fixup_sidecar_kernel(
 ) {
     __shared__ uint32_t s_ws_start;
     __shared__ uint32_t s_n_experts;
-    __shared__ uint32_t sidecar_count_s;
 
     if (threadIdx.x == 0) {
         uint32_t ne;
@@ -137,39 +136,18 @@ __global__ void sclp4_fixup_sidecar_kernel(
     uint64_t total_nibble_bytes = (uint64_t)s_n_experts * ((expert_nw + 1) / 2);
     const uint8_t* sidecar_base = ws + total_nibble_bytes;
 
-    if (threadIdx.x == 0) {
-        uint32_t sc;
-        __builtin_memcpy(&sc, sidecar_base, sizeof(uint32_t));
-        sidecar_count_s = sc;
-    }
-    __syncthreads();
+    // Sidecar v2: CSR-style per-row ranges; one thread per row.
+    const sclp_sidecar_view sc = sclp_sidecar_parse(sidecar_base, num_weights);
+    if (sc.count == 0) return;
 
-    if (sidecar_count_s == 0) return;
-
-    const uint8_t* idx_base = sidecar_base + 4;
-    const uint8_t* val_base = sidecar_base + 4 + (uint64_t)sidecar_count_s * sizeof(uint32_t);
-
-    uint32_t stride = gridDim.x * blockDim.x;
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-
-    uint32_t i = tid * 4;
-    for (; i + 3 < sidecar_count_s; i += stride * 4) {
-        uint4 idx4;
-        uint64_t val4_64;
-        __builtin_memcpy(&idx4,    idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint4));
-        __builtin_memcpy(&val4_64, val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint64_t));
-        output[idx4.x] = (uint16_t)(val4_64 & 0xFFFF);
-        output[idx4.y] = (uint16_t)((val4_64 >> 16) & 0xFFFF);
-        output[idx4.z] = (uint16_t)((val4_64 >> 32) & 0xFFFF);
-        output[idx4.w] = (uint16_t)(val4_64 >> 48);
-    }
-
-    for (uint32_t si = i; si < sidecar_count_s; si++) {
-        uint32_t idx;
-        uint16_t val;
-        __builtin_memcpy(&idx, idx_base + (uint64_t)si * sizeof(uint32_t), sizeof(uint32_t));
-        __builtin_memcpy(&val, val_base + (uint64_t)si * sizeof(uint16_t), sizeof(uint16_t));
-        output[idx] = val;
+    const uint32_t n_rows = num_weights / sc.K;
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t r = blockIdx.x * blockDim.x + threadIdx.x; r < n_rows; r += stride) {
+        uint32_t lo, hi;
+        sclp_sidecar_row_range(sc, r, &lo, &hi);
+        for (uint32_t i = lo; i < hi; i++) {
+            output[(uint64_t)r * sc.K + sclp_sidecar_col(sc, i)] = sclp_sidecar_val(sc, i);
+        }
     }
 }
 
@@ -190,7 +168,6 @@ __global__ void sclp4_fused_gemv_kernel(
     __shared__ uint32_t s_bpal_start;
     __shared__ uint32_t s_ws_start;
     __shared__ uint32_t s_sc_base;
-    __shared__ uint32_t s_sc_count;
     float* s_x = (float*)smem;
 
     if (threadIdx.x == 0) {
@@ -203,7 +180,6 @@ __global__ void sclp4_fused_gemv_kernel(
         uint32_t enw = (uint32_t)(nw / ne);
         uint64_t ws_total = (uint64_t)ne * ((enw + 1) / 2);
         s_sc_base = s_ws_start + (uint32_t)ws_total;
-        __builtin_memcpy(&s_sc_count, blob + s_sc_base, sizeof(uint32_t));
     }
     __syncthreads();
 
@@ -272,29 +248,22 @@ __global__ void sclp4_fused_gemv_kernel(
 
     if (!valid) return;
 
-    uint32_t sc_count = s_sc_count;
-    if (sc_count > 0) {
-        const uint32_t* sc_idx = (const uint32_t*)(blob + s_sc_base + 4);
-        const uint16_t* sc_val = (const uint16_t*)(blob + s_sc_base + 4 + (uint64_t)sc_count * 4);
+    // Folded sidecar v2: O(1) row-range lookup.
+    const sclp_sidecar_view sc = sclp_sidecar_parse(blob + s_sc_base, (uint32_t)((uint64_t)N * K));
+    if (sc.count > 0) {
         uint32_t lo = 0, hi = 0;
-        if (lane == 0) {
-            uint32_t t0 = (uint32_t)row_weight_base, t1 = t0 + K, a = 0, b2 = sc_count;
-            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t0) a = m + 1; else b2 = m; }
-            lo = a; b2 = sc_count;
-            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t1) a = m + 1; else b2 = m; }
-            hi = a;
-        }
+        if (lane == 0) sclp_sidecar_row_range(sc, row, &lo, &hi);
         lo = __shfl(lo, 0); hi = __shfl(hi, 0);
         for (uint32_t e = lo + lane; e < hi; e += 32) {
-            uint32_t gidx = sc_idx[e];
-            uint32_t col  = gidx - (uint32_t)row_weight_base;
-            uint8_t byte  = ws[(uint64_t)gidx >> 1];
+            uint32_t col  = sclp_sidecar_col(sc, e);
+            uint64_t gidx = row_weight_base + col;
+            uint8_t byte  = ws[gidx >> 1];
             uint8_t nib   = (gidx & 1) ? (byte & 0xF) : (byte >> 4);
             uint32_t pal;
-            __builtin_memcpy(&pal, bpal_base + ((uint64_t)gidx >> 8) * 4, sizeof(pal));
+            __builtin_memcpy(&pal, bpal_base + (gidx >> 8) * 4, sizeof(pal));
             uint16_t ab = ((uint16_t)((nib >> 1) & 1) << 15) | ((uint16_t)sclp4_palette_pick(pal, nib >> 2) << 7) | ((uint16_t)(nib & 1) << 6);
             float approx = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&ab));
-            uint16_t tb = sc_val[e];
+            uint16_t tb = sclp_sidecar_val(sc, e);
             float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
             acc += (trueval - approx) * x[col];
         }
@@ -394,7 +363,7 @@ __global__ void sclp4_fused_moe_gemv_kernel(
     __shared__ uint32_t s_bpal_offset;
     __shared__ uint32_t s_ws_offset;
     __shared__ uint32_t s_sc_base;
-    __shared__ uint32_t s_sc_count;
+    __shared__ uint32_t s_total_nw;
     __shared__ uint32_t s_expert_nw;
     float*    s_x = (float*)smem;
 
@@ -422,7 +391,7 @@ __global__ void sclp4_fused_moe_gemv_kernel(
         uint64_t ws_total = (uint64_t)n_experts * expert_nibble_bytes;
         uint32_t sc_base = ws_start + (uint32_t)ws_total;
         s_sc_base = sc_base;
-        __builtin_memcpy(&s_sc_count, blob + sc_base, sizeof(uint32_t));
+        s_total_nw = total_nw;
     }
     __syncthreads();
 
@@ -490,34 +459,23 @@ __global__ void sclp4_fused_moe_gemv_kernel(
 
     if (!valid) return;
 
-    // Folded sidecar correction: sidecar indices are global (expert_offset + row*K + col).
-    uint32_t sc_count = s_sc_count;
-    if (sc_count > 0) {
-        const uint32_t* sc_idx = (const uint32_t*)(blob + s_sc_base + 4);
-        const uint16_t* sc_val = (const uint16_t*)(blob + s_sc_base + 4 + (uint64_t)sc_count * 4);
-        uint32_t expert_off = (uint32_t)e * s_expert_nw;
+    // Folded sidecar v2: global row = e * N + row, O(1) range lookup.
+    const sclp_sidecar_view sc = sclp_sidecar_parse(blob + s_sc_base, s_total_nw);
+    if (sc.count > 0) {
+        const uint32_t grow = (uint32_t)e * N + row;
         uint32_t lo = 0, hi = 0;
-        if (lane == 0) {
-            uint32_t t0 = expert_off + (uint32_t)row_weight_base;
-            uint32_t t1 = t0 + K;
-            uint32_t a = 0, b2 = sc_count;
-            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t0) a = m + 1; else b2 = m; }
-            lo = a; b2 = sc_count;
-            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t1) a = m + 1; else b2 = m; }
-            hi = a;
-        }
+        if (lane == 0) sclp_sidecar_row_range(sc, grow, &lo, &hi);
         lo = __shfl(lo, 0); hi = __shfl(hi, 0);
         for (uint32_t si = lo + lane; si < hi; si += 32) {
-            uint32_t gidx = sc_idx[si];
-            uint32_t local_idx = gidx - expert_off;
-            uint32_t col = local_idx - (uint32_t)row_weight_base;
+            uint32_t col = sclp_sidecar_col(sc, si);
+            uint32_t local_idx = (uint32_t)row_weight_base + col;
             uint8_t byte = ws[(uint64_t)local_idx >> 1];
             uint8_t nib  = (local_idx & 1) ? (byte & 0xF) : (byte >> 4);
             uint32_t pal_sc;
             __builtin_memcpy(&pal_sc, bpal_base + ((uint64_t)local_idx >> 8) * 4, sizeof(pal_sc));
             uint16_t ab = ((uint16_t)((nib >> 1) & 1) << 15) | ((uint16_t)sclp4_palette_pick(pal_sc, nib >> 2) << 7) | ((uint16_t)(nib & 1) << 6);
             float approx = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&ab));
-            uint16_t tb = sc_val[si];
+            uint16_t tb = sclp_sidecar_val(sc, si);
             float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
             acc += (trueval - approx) * x[col];
         }
@@ -921,7 +879,6 @@ __global__ void sclp4_moe_sidecar_correct_kernel(
     __shared__ uint32_t s_n_experts;
     __shared__ uint32_t s_bpal_start;
     __shared__ uint32_t s_ws_start;
-    __shared__ uint32_t s_sidecar_count;
     if (threadIdx.x == 0) {
         uint32_t total_nw, ne;
         __builtin_memcpy(&total_nw, blob,     sizeof(uint32_t));
@@ -932,74 +889,68 @@ __global__ void sclp4_moe_sidecar_correct_kernel(
         for (uint32_t e = 0; e < ne; e++) p += 1 + p[0];
         uint32_t bpal_start = (uint32_t)(p - blob);
         s_bpal_start = bpal_start;
-        uint32_t ws_start = bpal_start + (total_nw / QK_SCLP4) * 4;
-        s_ws_start = ws_start;
-        uint32_t expert_nw = total_nw / ne;
-        uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
-        uint64_t total_ws_bytes = (uint64_t)ne * expert_nibble_bytes;
-        uint32_t sc;
-        __builtin_memcpy(&sc, blob + ws_start + total_ws_bytes, sizeof(uint32_t));
-        s_sidecar_count = sc;
+        s_ws_start = bpal_start + (total_nw / QK_SCLP4) * 4;
     }
     __syncthreads();
-
-    if (s_sidecar_count == 0) return;
 
     const uint32_t expert_nw = s_total_nw / s_n_experts;
     const uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
     const uint64_t total_ws_bytes = (uint64_t)s_n_experts * expert_nibble_bytes;
-    const uint8_t* sidecar_base = blob + s_ws_start + total_ws_bytes;
-    const uint8_t* idx_base = sidecar_base + 4;
-    const uint8_t* val_base = idx_base + (uint64_t)s_sidecar_count * sizeof(uint32_t);
     const uint8_t* bpal_base = blob + s_bpal_start;
 
+    // Sidecar v2: one thread per global row (= e * N + n_e); direct range lookup.
+    const sclp_sidecar_view sc = sclp_sidecar_parse(blob + s_ws_start + total_ws_bytes, s_total_nw);
+    if (sc.count == 0) return;
+
+    const uint32_t n_rows = s_total_nw / sc.K;
     const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < s_sidecar_count; i += stride) {
-        uint32_t global_idx;
-        uint16_t correct_bits;
-        __builtin_memcpy(&global_idx, idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint32_t));
-        __builtin_memcpy(&correct_bits, val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint16_t));
+    for (uint32_t grow = blockIdx.x * blockDim.x + threadIdx.x; grow < n_rows; grow += stride) {
+        uint32_t lo, hi;
+        sclp_sidecar_row_range(sc, grow, &lo, &hi);
+        if (lo >= hi) continue;
 
-        uint32_t e        = global_idx / expert_nw;
-        uint32_t local    = global_idx - e * expert_nw;
-        uint32_t n_e      = local / K;
-        uint32_t k        = local % K;
-
+        uint32_t e   = grow / N;   // rows per expert == N
+        uint32_t n_e = grow % N;
         const uint8_t* ws_e = blob + s_ws_start + (uint64_t)e * expert_nibble_bytes;
-        uint64_t w_idx = (uint64_t)n_e * K + k;
-        uint32_t block_idx = e * (expert_nw / QK_SCLP4) + (uint32_t)(w_idx / QK_SCLP4);
-        const uint8_t* bp = bpal_base + block_idx * 4;
-        uint8_t byte = ws_e[w_idx >> 1];
-        uint8_t nib  = (w_idx & 1) ? (byte & 0xF) : (byte >> 4);
-        uint8_t pidx = nib >> 2;
-        uint8_t smn  = nib & 0x3;
-        uint8_t exp_a = bp[pidx];
-        uint8_t sign_a = (smn >> 1) & 1;
-        uint8_t mant_a = smn & 1;
-        uint16_t approx_bits = ((uint16_t)sign_a << 15) | ((uint16_t)exp_a << 7) | ((uint16_t)mant_a << 6);
 
-        float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
-        float w_approx  = __bfloat162float(*(__hip_bfloat16*)&approx_bits);
-        float w_delta   = w_correct - w_approx;
-        if (w_delta == 0.f) continue;
+        for (uint32_t i = lo; i < hi; i++) {
+            uint32_t k = sclp_sidecar_col(sc, i);
+            uint16_t correct_bits = sclp_sidecar_val(sc, i);
 
-        // For every routed slot mg whose ids[mg] == e (i.e., whose perm position is
-        // in [offsets[e], offsets[e+1])), apply correction.
-        int32_t bin_start = expert_offsets[e];
-        int32_t bin_end   = expert_offsets[e + 1];
-        for (int32_t p_pos = bin_start; p_pos < bin_end; p_pos++) {
-            int32_t mg = perm[p_pos];
-            if (mg < 0) continue;
-            uint32_t i_active = (uint32_t)mg % n_active;
-            uint32_t i_batch  = (uint32_t)mg / n_active;
-            const float* x_row = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
-            float xval = x_row[k];
-            if (sidecar_mode & 1u) {
-                __hip_bfloat16 xbf = (__hip_bfloat16)xval;
-                xval = __bfloat162float(xbf);
+            uint64_t w_idx = (uint64_t)n_e * K + k;
+            uint32_t block_idx = e * (expert_nw / QK_SCLP4) + (uint32_t)(w_idx / QK_SCLP4);
+            const uint8_t* bp = bpal_base + block_idx * 4;
+            uint8_t byte = ws_e[w_idx >> 1];
+            uint8_t nib  = (w_idx & 1) ? (byte & 0xF) : (byte >> 4);
+            uint8_t pidx = nib >> 2;
+            uint8_t smn  = nib & 0x3;
+            uint8_t exp_a = bp[pidx];
+            uint8_t sign_a = (smn >> 1) & 1;
+            uint8_t mant_a = smn & 1;
+            uint16_t approx_bits = ((uint16_t)sign_a << 15) | ((uint16_t)exp_a << 7) | ((uint16_t)mant_a << 6);
+
+            float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
+            float w_approx  = __bfloat162float(*(__hip_bfloat16*)&approx_bits);
+            float w_delta   = w_correct - w_approx;
+            if (w_delta == 0.f) continue;
+
+            // For every routed slot mg whose ids[mg] == e (i.e., whose perm position is
+            // in [offsets[e], offsets[e+1])), apply correction.
+            int32_t bin_start = expert_offsets[e];
+            int32_t bin_end   = expert_offsets[e + 1];
+            for (int32_t p_pos = bin_start; p_pos < bin_end; p_pos++) {
+                int32_t mg = perm[p_pos];
+                if (mg < 0) continue;
+                uint32_t i_active = (uint32_t)mg % n_active;
+                uint32_t i_batch  = (uint32_t)mg / n_active;
+                const float* x_row = src1 + (uint64_t)(i_batch * src1_ne1 + (i_active % src1_ne1)) * K;
+                float xval = x_row[k];
+                if (sidecar_mode & 1u) {
+                    __hip_bfloat16 xbf = (__hip_bfloat16)xval;
+                    xval = __bfloat162float(xbf);
+                }
+                atomicAdd(&dst[(uint64_t)mg * N + n_e], w_delta * xval);
             }
-            atomicAdd(&dst[(uint64_t)mg * N + n_e], w_delta * xval);
         }
     }
 }
@@ -1047,8 +998,6 @@ __global__ void sclp4_moe_sidecar_correct_blocked_kernel(
     __shared__ uint32_t s_sc_k[MAX_SC_PER_BLOCK];
     __shared__ float    s_sc_delta[MAX_SC_PER_BLOCK];
     __shared__ uint32_t s_sc_count;
-    __shared__ uint32_t s_sc_range_begin;
-    __shared__ uint32_t s_sc_range_end;
 
     if (threadIdx.x == 0) {
         uint32_t total_nw, ne;
@@ -1065,36 +1014,6 @@ __global__ void sclp4_moe_sidecar_correct_blocked_kernel(
         uint32_t expert_nw = total_nw / ne;
         uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
         s_ws_offset_e = ws_start + (uint32_t)e * expert_nibble_bytes;
-
-        // Inline binary search for this expert's sidecar range.
-        uint64_t total_ws_bytes = (uint64_t)ne * expert_nibble_bytes;
-        const uint8_t* sc_base = blob + ws_start + total_ws_bytes;
-        uint32_t sc_total;
-        __builtin_memcpy(&sc_total, sc_base, sizeof(uint32_t));
-        const uint8_t* sc_idx = sc_base + 4;
-
-        uint32_t target_lo = (uint32_t)e * expert_nw;
-        uint32_t target_hi = ((uint32_t)e + 1) * expert_nw;
-
-        // lower_bound for target_lo
-        uint32_t lo = 0, hi = sc_total;
-        while (lo < hi) {
-            uint32_t mid = lo + (hi - lo) / 2;
-            uint32_t val;
-            __builtin_memcpy(&val, sc_idx + (uint64_t)mid * 4, 4);
-            if (val < target_lo) lo = mid + 1; else hi = mid;
-        }
-        s_sc_range_begin = lo;
-
-        // lower_bound for target_hi
-        lo = s_sc_range_begin; hi = sc_total;
-        while (lo < hi) {
-            uint32_t mid = lo + (hi - lo) / 2;
-            uint32_t val;
-            __builtin_memcpy(&val, sc_idx + (uint64_t)mid * 4, 4);
-            if (val < target_hi) lo = mid + 1; else hi = mid;
-        }
-        s_sc_range_end = lo;
         s_sc_count = 0;
     }
     if (threadIdx.x < TILE) {
@@ -1103,84 +1022,59 @@ __global__ void sclp4_moe_sidecar_correct_blocked_kernel(
     }
     __syncthreads();
 
-    if (s_sc_range_begin >= s_sc_range_end) return;
-
     const uint32_t expert_nw = s_total_nw / s_ne;
     const uint32_t expert_nibble_bytes = (expert_nw + 1) / 2;
     const uint64_t total_ws_bytes = (uint64_t)s_ne * expert_nibble_bytes;
     const uint8_t* sidecar_base = blob + s_ws_start + total_ws_bytes;
-    uint32_t sc_total;
-    __builtin_memcpy(&sc_total, sidecar_base, sizeof(uint32_t));
-    const uint8_t* sc_idx_base = sidecar_base + 4;
-    const uint8_t* sc_val_base = sc_idx_base + (uint64_t)sc_total * sizeof(uint32_t);
     const uint8_t* ws_e = blob + s_ws_offset_e;
     const uint8_t* bpal_base = blob + s_bpal_start;
 
+    // Sidecar v2: a tile's entries are exactly its rows' ranges — no searches.
+    const sclp_sidecar_view sc = sclp_sidecar_parse(sidecar_base, s_total_nw);
+    if (sc.count == 0) return;
+
     const uint32_t n_base = (uint32_t)blockIdx.x * TILE;
     const uint32_t n_end  = min(n_base + (uint32_t)TILE, N);
+    const uint32_t grow_base = (uint32_t)e * N;  // rows per expert == N
 
-    if (threadIdx.x == 0) {
-        const uint32_t tile_lo = (uint32_t)e * expert_nw + n_base * K;
-        const uint32_t tile_hi = (uint32_t)e * expert_nw + n_end * K;
-        uint32_t lo = s_sc_range_begin, hi = s_sc_range_end;
-        while (lo < hi) {
-            uint32_t mid = lo + (hi - lo) / 2;
-            uint32_t val;
-            __builtin_memcpy(&val, sc_idx_base + (uint64_t)mid * sizeof(uint32_t), sizeof(uint32_t));
-            if (val < tile_lo) lo = mid + 1; else hi = mid;
-        }
-        s_sc_range_begin = lo;
-        hi = s_sc_range_end;
-        while (lo < hi) {
-            uint32_t mid = lo + (hi - lo) / 2;
-            uint32_t val;
-            __builtin_memcpy(&val, sc_idx_base + (uint64_t)mid * sizeof(uint32_t), sizeof(uint32_t));
-            if (val < tile_hi) lo = mid + 1; else hi = mid;
-        }
-        s_sc_range_end = lo;
+    // Whole-tile early out: contiguous rows → contiguous entry range.
+    {
+        uint32_t tile_lo, tile_hi, dummy;
+        sclp_sidecar_row_range(sc, grow_base + n_base, &tile_lo, &dummy);
+        sclp_sidecar_row_range(sc, grow_base + n_end - 1, &dummy, &tile_hi);
+        if (tile_lo >= tile_hi) return;
     }
-    __syncthreads();
 
-    const uint32_t sc_begin = s_sc_range_begin;
-    const uint32_t sc_end   = s_sc_range_end;
-    if (sc_begin >= sc_end) return;
+    for (uint32_t n_e = n_base; n_e < n_end; n_e++) {
+        uint32_t lo, hi;
+        sclp_sidecar_row_range(sc, grow_base + n_e, &lo, &hi);
+        for (uint32_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+            uint32_t k = sclp_sidecar_col(sc, i);
+            uint16_t correct_bits = sclp_sidecar_val(sc, i);
 
-    const uint32_t range_size = sc_end - sc_begin;
-    for (uint32_t ri = threadIdx.x; ri < range_size; ri += blockDim.x) {
-        uint32_t i = sc_begin + ri;
-        uint32_t global_idx;
-        __builtin_memcpy(&global_idx, sc_idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint32_t));
+            uint64_t w_idx = (uint64_t)n_e * K + k;
+            uint32_t block_idx = (uint32_t)e * (expert_nw / QK_SCLP4) + (uint32_t)(w_idx / QK_SCLP4);
+            const uint8_t* bp = bpal_base + block_idx * 4;
+            uint8_t byte = ws_e[w_idx >> 1];
+            uint8_t nib  = (w_idx & 1) ? (byte & 0xF) : (byte >> 4);
+            uint8_t pidx = nib >> 2;
+            uint8_t smn  = nib & 0x3;
+            uint8_t exp_a = bp[pidx];
+            uint8_t sign_a = (smn >> 1) & 1;
+            uint8_t mant_a = smn & 1;
+            uint16_t approx_bits = ((uint16_t)sign_a << 15) | ((uint16_t)exp_a << 7) | ((uint16_t)mant_a << 6);
 
-        uint32_t local = global_idx - (uint32_t)e * expert_nw;
-        uint32_t n_e = local / K;
-        if (n_e < n_base || n_e >= n_end) continue;
+            float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
+            float w_approx  = __bfloat162float(*(__hip_bfloat16*)&approx_bits);
+            float w_delta   = w_correct - w_approx;
+            if (w_delta == 0.f) continue;
 
-        uint32_t k = local % K;
-        uint16_t correct_bits;
-        __builtin_memcpy(&correct_bits, sc_val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint16_t));
-
-        uint64_t w_idx = (uint64_t)n_e * K + k;
-        uint32_t block_idx = (uint32_t)e * (expert_nw / QK_SCLP4) + (uint32_t)(w_idx / QK_SCLP4);
-        const uint8_t* bp = bpal_base + block_idx * 4;
-        uint8_t byte = ws_e[w_idx >> 1];
-        uint8_t nib  = (w_idx & 1) ? (byte & 0xF) : (byte >> 4);
-        uint8_t pidx = nib >> 2;
-        uint8_t smn  = nib & 0x3;
-        uint8_t exp_a = bp[pidx];
-        uint8_t sign_a = (smn >> 1) & 1;
-        uint8_t mant_a = smn & 1;
-        uint16_t approx_bits = ((uint16_t)sign_a << 15) | ((uint16_t)exp_a << 7) | ((uint16_t)mant_a << 6);
-
-        float w_correct = __bfloat162float(*(__hip_bfloat16*)&correct_bits);
-        float w_approx  = __bfloat162float(*(__hip_bfloat16*)&approx_bits);
-        float w_delta   = w_correct - w_approx;
-        if (w_delta == 0.f) continue;
-
-        uint32_t slot = atomicAdd(&s_sc_count, 1);
-        if (slot >= MAX_SC_PER_BLOCK) continue;
-        s_sc_n_e[slot] = n_e;
-        s_sc_k[slot]   = k;
-        s_sc_delta[slot] = w_delta;
+            uint32_t slot = atomicAdd(&s_sc_count, 1);
+            if (slot >= MAX_SC_PER_BLOCK) continue;
+            s_sc_n_e[slot] = n_e;
+            s_sc_k[slot]   = k;
+            s_sc_delta[slot] = w_delta;
+        }
     }
     __syncthreads();
 

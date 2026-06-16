@@ -396,15 +396,15 @@ static sclp_expert_encoded encode_sclp_expert(
                 indices[i] = best_idx;
                 sm_nibbles[i] = (sign << mant_bits) | best_mant;
 
-                if (!bin_pal[exp]) {
-                    if (bexp_distance[exp] > 1) {
-                        enc.sc_indices.push_back(expert_offset + (uint32_t)i);
-                        enc.sc_values.push_back(float_to_bf16(data[i]));
-                    } else if (has_imatrix) {
-                        priority[i] = imatrix[(uint64_t)i % K] * (float)bexp_distance[exp];
-                    }
-                } else if (has_imatrix && bexp_distance[exp] > 0) {
-                    priority[i] = imatrix[(uint64_t)i % K] * (float)bexp_distance[exp];
+                if (!bin_pal[exp] && bexp_distance[exp] > 1) {
+                    enc.sc_indices.push_back(expert_offset + (uint32_t)i);
+                    enc.sc_values.push_back(float_to_bf16(data[i]));
+                } else if (has_imatrix) {
+                    // Rank by importance × squared reconstruction error (not exponent
+                    // distance). best_err is already computed against original data[i]
+                    // and includes mantissa-grid error, which the sidecar does fix.
+                    // Weights with best_err == 0 naturally get priority 0 and are skipped.
+                    priority[i] = imatrix[(uint64_t)i % K] * best_err * best_err;
                 }
             }
         }
@@ -452,15 +452,23 @@ static sclp_expert_encoded encode_sclp_expert(
 
             sm_nibbles[i] = (sign << (sm_bits - 1)) | mant;
 
-            if (!in_palette[exp]) {
-                if (exp_distance[exp] > 1) {
-                    enc.sc_indices.push_back(expert_offset + (uint32_t)i);
-                    enc.sc_values.push_back(float_to_bf16(data[i]));
-                } else if (has_imatrix) {
-                    priority[i] = imatrix[(uint64_t)i % K] * (float)exp_distance[exp];
-                }
-            } else if (has_imatrix && exp_distance[exp] > 0) {
-                priority[i] = imatrix[(uint64_t)i % K] * (float)exp_distance[exp];
+            if (!in_palette[exp] && exp_distance[exp] > 1) {
+                enc.sc_indices.push_back(expert_offset + (uint32_t)i);
+                enc.sc_values.push_back(float_to_bf16(data[i]));
+            } else if (has_imatrix) {
+                // Reconstruct what the decoder will produce (scale × decoded_bf16),
+                // then rank by importance × squared reconstruction error.
+                // mant_shift is already defined (7 - mant_bits): 4 for SCLP8, 5 for SCLP6.
+                uint8_t mant_recon;
+                if (type == GGML_TYPE_SCLP8) mant_recon = (w >> 4) & 0x7;
+                else                          mant_recon = (w >> 5) & 0x3;
+                uint16_t recon_bits = ((uint16_t)sign << 15)
+                                    | ((uint16_t)enc.palette[indices[i]] << 7)
+                                    | ((uint16_t)mant_recon << mant_shift);
+                float scale = bf16_to_float(enc.scales[(size_t)(i / qk)]);
+                float recon = bf16_to_float(recon_bits) * scale;
+                float err   = std::fabs(recon - data[i]);
+                priority[i] = imatrix[(uint64_t)i % K] * err * err;
             }
         }
     }
@@ -635,14 +643,40 @@ size_t llama_tensor_quantize_sclp(
         all_sc_values.insert(all_sc_values.end(), experts[e].sc_values.begin(), experts[e].sc_values.end());
     }
 
+    // Sidecar v2 (see sclp_bridge_common.cuh): [u32 count|bit31][u32 K]
+    // [u32 row_offsets[n_rows+1]][u16 cols][u16 vals]. Entries arrive sorted by
+    // global index (sorted per expert, experts in ascending offset order), which
+    // is exactly (row, col) order.
     uint32_t sc_count = (uint32_t)all_sc_indices.size();
-    std::memcpy(p, &sc_count, 4);
+    uint32_t count_word = 0x80000000u | sc_count;
+    std::memcpy(p, &count_word, 4);
     p += 4;
     if (sc_count > 0) {
-        std::memcpy(p, all_sc_indices.data(), sc_count * 4);
-        p += sc_count * 4;
-        std::memcpy(p, all_sc_values.data(), sc_count * 2);
-        p += sc_count * 2;
+        GGML_ASSERT(K > 0 && K <= 65536 && nelements % K == 0 &&
+                    "SCLP sidecar v2 requires row length K in (0, 65536] dividing nelements");
+        const uint32_t n_rows = (uint32_t)(nelements / K);
+        uint32_t Ku = (uint32_t)K;
+        std::memcpy(p, &Ku, 4);
+        p += 4;
+
+        std::vector<uint32_t> row_offsets(n_rows + 1, 0);
+        for (uint32_t i = 0; i < sc_count; i++) {
+            row_offsets[all_sc_indices[i] / Ku + 1]++;
+        }
+        for (uint32_t r = 0; r < n_rows; r++) {
+            row_offsets[r + 1] += row_offsets[r];
+        }
+        std::memcpy(p, row_offsets.data(), (size_t)(n_rows + 1) * 4);
+        p += (size_t)(n_rows + 1) * 4;
+
+        std::vector<uint16_t> cols(sc_count);
+        for (uint32_t i = 0; i < sc_count; i++) {
+            cols[i] = (uint16_t)(all_sc_indices[i] % Ku);
+        }
+        std::memcpy(p, cols.data(), (size_t)sc_count * 2);
+        p += (size_t)sc_count * 2;
+        std::memcpy(p, all_sc_values.data(), (size_t)sc_count * 2);
+        p += (size_t)sc_count * 2;
     }
 
     return (size_t)(p - out);
@@ -747,15 +781,32 @@ void llama_tensor_dequantize_sclp(
         (type == GGML_TYPE_SCLP4) ? (weights_per_expert + 1) / 2 :
         (type == GGML_TYPE_SCLP5) ? (weights_per_expert + 7) / 8 * 5 :
                                     (weights_per_expert + 3) / 4 * 3;
+    // Sidecar v2: [u32 count|bit31][u32 K][u32 row_offsets[n_rows+1]][u16 cols][u16 vals]
     p = ws + (uint64_t)ne * ws_bytes_per_expert;
-    uint32_t sc_count;
-    std::memcpy(&sc_count, p, 4);
-    p += 4;
-    const uint32_t * sc_indices = (const uint32_t *)p;
-    const uint16_t * sc_values = (const uint16_t *)(p + sc_count * 4);
-    for (uint32_t i = 0; i < sc_count; i++) {
-        if (sc_indices[i] < (uint32_t)nelements) {
-            f32_data[sc_indices[i]] = bf16_to_float(sc_values[i]);
+    uint32_t count_word;
+    std::memcpy(&count_word, p, 4);
+    const uint32_t sc_count = count_word & 0x7FFFFFFFu;
+    if (!(count_word & 0x80000000u) || sc_count == 0) {
+        return; // empty, or pre-v2 blob (sidecar skipped — regenerate the GGUF)
+    }
+    uint32_t Ku;
+    std::memcpy(&Ku, p + 4, 4);
+    const uint32_t n_rows = (uint32_t)(nw / Ku);
+    const uint8_t * offs = p + 8;
+    const uint8_t * cols = offs + (uint64_t)(n_rows + 1) * 4;
+    const uint8_t * vals = cols + (uint64_t)sc_count * 2;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        uint32_t lo, hi;
+        std::memcpy(&lo, offs + (uint64_t)r * 4,     4);
+        std::memcpy(&hi, offs + (uint64_t)r * 4 + 4, 4);
+        for (uint32_t i = lo; i < hi && i < sc_count; i++) {
+            uint16_t c, v;
+            std::memcpy(&c, cols + (uint64_t)i * 2, 2);
+            std::memcpy(&v, vals + (uint64_t)i * 2, 2);
+            uint64_t gidx = (uint64_t)r * Ku + c;
+            if (gidx < (uint64_t)nelements) {
+                f32_data[gidx] = bf16_to_float(v);
+            }
         }
     }
 }

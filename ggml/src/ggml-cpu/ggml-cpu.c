@@ -1411,16 +1411,33 @@ static void sclp_decode_to_bf16_cpu(
         }
     }
 
-    // Sidecar fixup (same layout for all three types): raw BF16 originals, written
+    // Sidecar v2 fixup (same layout for all types): raw BF16 originals, written
     // directly (no scale multiply), restoring outliers exactly.
+    // [u32 count|bit31][u32 K][u32 row_offsets[n_rows+1]][u16 cols][u16 vals]
     const uint64_t ws_total = (uint64_t)n_experts * expert_ws_bytes;
     const uint8_t * sc_base = blob + ws_start + ws_total;
-    uint32_t sc_count;
-    memcpy(&sc_count, sc_base, 4);
-    const uint32_t * sc_idx = (const uint32_t *)(sc_base + 4);
-    const uint16_t * sc_val = (const uint16_t *)(sc_idx + sc_count);
-    for (uint32_t i = 0; i < sc_count; i++) {
-        output[sc_idx[i]] = sc_val[i];
+    uint32_t count_word;
+    memcpy(&count_word, sc_base, 4);
+    const uint32_t sc_count = count_word & 0x7FFFFFFFu;
+    if (!(count_word & 0x80000000u) || sc_count == 0) {
+        return; // empty, or pre-v2 blob (sidecar skipped — regenerate the GGUF)
+    }
+    uint32_t K;
+    memcpy(&K, sc_base + 4, 4);
+    const uint32_t n_rows = (uint32_t)(num_weights / K);
+    const uint8_t * sc_offs = sc_base + 8;
+    const uint8_t * sc_cols = sc_offs + (uint64_t)(n_rows + 1) * 4;
+    const uint8_t * sc_vals = sc_cols + (uint64_t)sc_count * 2;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        uint32_t lo, hi;
+        memcpy(&lo, sc_offs + (uint64_t)r * 4,     4);
+        memcpy(&hi, sc_offs + (uint64_t)r * 4 + 4, 4);
+        for (uint32_t i = lo; i < hi && i < sc_count; i++) {
+            uint16_t c, v;
+            memcpy(&c, sc_cols + (uint64_t)i * 2, 2);
+            memcpy(&v, sc_vals + (uint64_t)i * 2, 2);
+            output[(uint64_t)r * K + c] = v;
+        }
     }
 }
 

@@ -143,7 +143,6 @@ __global__ void sclp6_fixup_sidecar_kernel(
 ) {
     __shared__ uint32_t s_ws_start;
     __shared__ uint32_t s_n_experts;
-    __shared__ uint32_t sidecar_count_s;
 
     if (threadIdx.x == 0) {
         uint32_t ne;
@@ -162,41 +161,18 @@ __global__ void sclp6_fixup_sidecar_kernel(
     uint64_t total_groups  = expert_groups * s_n_experts;
     const uint8_t* sidecar_base = ws + total_groups * 3;
 
-    if (threadIdx.x == 0) {
-        uint32_t sc;
-        __builtin_memcpy(&sc, sidecar_base, sizeof(uint32_t));
-        sidecar_count_s = sc;
-    }
-    __syncthreads();
+    // Sidecar v2: CSR-style per-row ranges; one thread per row.
+    const sclp_sidecar_view sc = sclp_sidecar_parse(sidecar_base, num_weights);
+    if (sc.count == 0) return;
 
-    if (sidecar_count_s == 0) return;
-
-    const uint8_t* idx_base = sidecar_base + 4;
-    const uint8_t* val_base = sidecar_base + 4 + (uint64_t)sidecar_count_s * sizeof(uint32_t);
-
-    uint32_t stride = gridDim.x * blockDim.x;
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-
-    // Vectorized path: 4 entries per thread (32 bytes per thread: 16 index + 8 value + 8 output_write)
-    uint32_t i = tid * 4;
-    for (; i + 3 < sidecar_count_s; i += stride * 4) {
-        uint4 idx4;
-        uint64_t val4_64;
-        __builtin_memcpy(&idx4,    idx_base + (uint64_t)i * sizeof(uint32_t), sizeof(uint4));
-        __builtin_memcpy(&val4_64, val_base + (uint64_t)i * sizeof(uint16_t), sizeof(uint64_t));
-        output[idx4.x] = (uint16_t)(val4_64 & 0xFFFF);
-        output[idx4.y] = (uint16_t)((val4_64 >> 16) & 0xFFFF);
-        output[idx4.z] = (uint16_t)((val4_64 >> 32) & 0xFFFF);
-        output[idx4.w] = (uint16_t)(val4_64 >> 48);
-    }
-
-    // Scalar tail
-    for (uint32_t si = i; si < sidecar_count_s; si++) {
-        uint32_t idx;
-        uint16_t val;
-        __builtin_memcpy(&idx, idx_base + (uint64_t)si * sizeof(uint32_t), sizeof(uint32_t));
-        __builtin_memcpy(&val, val_base + (uint64_t)si * sizeof(uint16_t), sizeof(uint16_t));
-        output[idx] = val;
+    const uint32_t n_rows = num_weights / sc.K;
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t r = blockIdx.x * blockDim.x + threadIdx.x; r < n_rows; r += stride) {
+        uint32_t lo, hi;
+        sclp_sidecar_row_range(sc, r, &lo, &hi);
+        for (uint32_t i = lo; i < hi; i++) {
+            output[(uint64_t)r * sc.K + sclp_sidecar_col(sc, i)] = sclp_sidecar_val(sc, i);
+        }
     }
 }
 
@@ -217,7 +193,7 @@ __global__ void sclp6_fused_gemv_kernel(
     uint32_t* s_scales_offset = (uint32_t*)smem;
     uint32_t* s_ws_offset     = (uint32_t*)(smem + 4);
     uint32_t* s_sc_base       = (uint32_t*)(smem + 8);
-    uint32_t* s_sc_count      = (uint32_t*)(smem + 12);
+    uint32_t* s_total_nw      = (uint32_t*)(smem + 12);
     uint32_t* s_expert_nw     = (uint32_t*)(smem + 16);
     uint8_t*  s_pal           = (uint8_t*)(smem + 20);
     float*    s_x             = (float*)(smem + 28);
@@ -250,7 +226,7 @@ __global__ void sclp6_fused_gemv_kernel(
         }
         uint32_t ws_total = n_experts * expert_groups * 3;
         *s_sc_base = ws_start + ws_total;
-        __builtin_memcpy(s_sc_count, blob + *s_sc_base, sizeof(uint32_t));
+        *s_total_nw = total_nw;
     }
     __syncthreads();
 
@@ -305,29 +281,16 @@ __global__ void sclp6_fused_gemv_kernel(
 
     if (!valid) return;
 
-    // Folded sidecar: works for all expert_idx values.
-    // Sidecar indices are global; for expert_idx>0, search with expert offset.
-    uint32_t sc_count = *s_sc_count;
-    if (sc_count > 0) {
-        uint32_t sc_base_off = *s_sc_base;
-        const uint32_t* sc_idx = (const uint32_t*)(blob + sc_base_off + 4);
-        const uint16_t* sc_val = (const uint16_t*)(blob + sc_base_off + 4 + (uint64_t)sc_count * 4);
-        uint32_t expert_off = expert_idx * (*s_expert_nw);
+    // Folded sidecar v2: global row = expert_idx * N + row, O(1) range lookup.
+    const sclp_sidecar_view sc = sclp_sidecar_parse(blob + *s_sc_base, *s_total_nw);
+    if (sc.count > 0) {
+        const uint32_t grow = expert_idx * N + row;
         uint32_t lo = 0, hi = 0;
-        if (lane == 0) {
-            uint32_t t0 = expert_off + (uint32_t)row_weight_base;
-            uint32_t t1 = t0 + K;
-            uint32_t a = 0, b2 = sc_count;
-            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t0) a = m + 1; else b2 = m; }
-            lo = a; b2 = sc_count;
-            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t1) a = m + 1; else b2 = m; }
-            hi = a;
-        }
+        if (lane == 0) sclp_sidecar_row_range(sc, grow, &lo, &hi);
         lo = __shfl(lo, 0); hi = __shfl(hi, 0);
         for (uint32_t si = lo + lane; si < hi; si += 32) {
-            uint32_t gidx = sc_idx[si];
-            uint32_t local_idx = gidx - expert_off;
-            uint32_t col = local_idx - (uint32_t)row_weight_base;
+            uint32_t col = sclp_sidecar_col(sc, si);
+            uint32_t local_idx = (uint32_t)row_weight_base + col;
             uint64_t byte_off = (uint64_t)(local_idx / 4) * 3;
             uint8_t b0 = ws[byte_off + 0], b1 = ws[byte_off + 1], b2 = ws[byte_off + 2];
             uint8_t six;
@@ -339,7 +302,7 @@ __global__ void sclp6_fused_gemv_kernel(
             }
             float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (local_idx >> 5)));
             float approx = sclp6_decode_code(s_pal, six) * scale;
-            uint16_t tb = sc_val[si];
+            uint16_t tb = sclp_sidecar_val(sc, si);
             float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
             acc += (trueval - approx) * x[col];
         }
@@ -435,7 +398,7 @@ __global__ void sclp6_fused_moe_gemv_kernel(
     uint32_t* s_scales_offset = (uint32_t*)smem;
     uint32_t* s_ws_offset     = (uint32_t*)(smem + 4);
     uint32_t* s_sc_base       = (uint32_t*)(smem + 8);
-    uint32_t* s_sc_count      = (uint32_t*)(smem + 12);
+    uint32_t* s_total_nw      = (uint32_t*)(smem + 12);
     uint32_t* s_expert_nw     = (uint32_t*)(smem + 16);
     uint8_t*  s_pal           = (uint8_t*)(smem + 20);
     float*    s_x             = (float*)(smem + 28);
@@ -475,7 +438,7 @@ __global__ void sclp6_fused_moe_gemv_kernel(
         uint32_t ws_total = n_experts * expert_groups * 3;
         uint32_t sc_base = ws_start + ws_total;
         *s_sc_base = sc_base;
-        __builtin_memcpy(s_sc_count, blob + sc_base, sizeof(uint32_t));
+        *s_total_nw = total_nw;
     }
     __syncthreads();
 
@@ -534,28 +497,16 @@ __global__ void sclp6_fused_moe_gemv_kernel(
 
     if (!valid) return;
 
-    // Folded sidecar: sidecar indices are global (expert_offset + row*K + col).
-    uint32_t sc_count = *s_sc_count;
-    if (sc_count > 0) {
-        uint32_t sc_base_off = *s_sc_base;
-        const uint32_t* sc_idx = (const uint32_t*)(blob + sc_base_off + 4);
-        const uint16_t* sc_val = (const uint16_t*)(blob + sc_base_off + 4 + (uint64_t)sc_count * 4);
-        uint32_t expert_off = (uint32_t)e * (*s_expert_nw);
+    // Folded sidecar v2: global row = e * N + row, O(1) range lookup.
+    const sclp_sidecar_view sc = sclp_sidecar_parse(blob + *s_sc_base, *s_total_nw);
+    if (sc.count > 0) {
+        const uint32_t grow = (uint32_t)e * N + row;
         uint32_t lo = 0, hi = 0;
-        if (lane == 0) {
-            uint32_t t0 = expert_off + (uint32_t)row_weight_base;
-            uint32_t t1 = t0 + K;
-            uint32_t a = 0, b2 = sc_count;
-            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t0) a = m + 1; else b2 = m; }
-            lo = a; b2 = sc_count;
-            while (a < b2) { uint32_t m = (a + b2) >> 1; if (sc_idx[m] < t1) a = m + 1; else b2 = m; }
-            hi = a;
-        }
+        if (lane == 0) sclp_sidecar_row_range(sc, grow, &lo, &hi);
         lo = __shfl(lo, 0); hi = __shfl(hi, 0);
         for (uint32_t si = lo + lane; si < hi; si += 32) {
-            uint32_t gidx = sc_idx[si];
-            uint32_t local_idx = gidx - expert_off;
-            uint32_t col = local_idx - (uint32_t)row_weight_base;
+            uint32_t col = sclp_sidecar_col(sc, si);
+            uint32_t local_idx = (uint32_t)row_weight_base + col;
             uint64_t byte_off = (uint64_t)(local_idx / 4) * 3;
             uint8_t b0 = ws[byte_off + 0], b1 = ws[byte_off + 1], b2 = ws[byte_off + 2];
             uint8_t six;
@@ -567,7 +518,7 @@ __global__ void sclp6_fused_moe_gemv_kernel(
             }
             float scale = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(scales + (local_idx >> 5)));
             float approx = sclp6_decode_code(s_pal, six) * scale;
-            uint16_t tb = sc_val[si];
+            uint16_t tb = sclp_sidecar_val(sc, si);
             float trueval = __bfloat162float(*reinterpret_cast<__hip_bfloat16*>(&tb));
             acc += (trueval - approx) * x[col];
         }

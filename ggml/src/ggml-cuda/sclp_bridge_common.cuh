@@ -75,6 +75,69 @@ inline int _sclp_tg_atexit_register = sclp_tg::register_atexit();
 #define QK_SCLP 32
 #define QK_SCLP4 256
 
+// ============================================================
+// Sidecar v2 (2026-06): replaces [u32 count][u32 gidx × count][u16 val × count].
+// Layout after ws_stream:
+//   [u32 count_word]   bit31 = v2 format flag, bits 30:0 = count
+//   if count > 0:
+//   [u32 K]                          row length (= tensor ne[0])
+//   [u32 row_offsets[n_rows + 1]]    n_rows = num_weights / K; CSR-style ranges
+//   [u16 cols[count]]                column within row
+//   [u16 vals[count]]                verbatim BF16 of the original weight
+// Entries are sorted by (row, col); global row for MoE = expert * rows_per_expert + row.
+// 4 B/entry vs 6 B in v1, and row ranges become O(1) lookups instead of two
+// binary searches per warp in the fused-GEMV folds.
+// A v1 blob (bit31 clear) parses as count == 0: sidecar silently skipped instead
+// of misreading the v1 index array as a v2 table (OOB VRAM reads / GPU hang).
+// Regenerate old GGUFs.
+// ============================================================
+
+struct sclp_sidecar_view {
+    uint32_t       count;    // 0 when absent or v1 blob
+    uint32_t       K;        // row length (entries' cols are < K)
+    const uint8_t* offsets;  // u32[n_rows+1] (byte pointer: section may be unaligned)
+    const uint8_t* cols;     // u16[count]
+    const uint8_t* vals;     // u16[count]
+};
+
+static __device__ __forceinline__ sclp_sidecar_view sclp_sidecar_parse(
+    const uint8_t* __restrict__ sc_base, uint32_t num_weights
+) {
+    sclp_sidecar_view v;
+    uint32_t cw;
+    __builtin_memcpy(&cw, sc_base, sizeof(uint32_t));
+    const uint32_t count = cw & 0x7FFFFFFFu;
+    if (!(cw & 0x80000000u) || count == 0) {
+        v.count = 0; v.K = 0; v.offsets = nullptr; v.cols = nullptr; v.vals = nullptr;
+        return v;
+    }
+    uint32_t K;
+    __builtin_memcpy(&K, sc_base + 4, sizeof(uint32_t));
+    const uint32_t n_rows = num_weights / K;
+    v.count   = count;
+    v.K       = K;
+    v.offsets = sc_base + 8;
+    v.cols    = v.offsets + (uint64_t)(n_rows + 1) * 4;
+    v.vals    = v.cols    + (uint64_t)count * 2;
+    return v;
+}
+
+// Entry range [lo, hi) for global row `grow`.
+static __device__ __forceinline__ void sclp_sidecar_row_range(
+    const sclp_sidecar_view& v, uint32_t grow, uint32_t* lo, uint32_t* hi
+) {
+    __builtin_memcpy(lo, v.offsets + (uint64_t)grow * 4,     sizeof(uint32_t));
+    __builtin_memcpy(hi, v.offsets + (uint64_t)grow * 4 + 4, sizeof(uint32_t));
+}
+
+static __device__ __forceinline__ uint32_t sclp_sidecar_col(const sclp_sidecar_view& v, uint32_t e) {
+    uint16_t c; __builtin_memcpy(&c, v.cols + (uint64_t)e * 2, sizeof(uint16_t)); return c;
+}
+
+static __device__ __forceinline__ uint16_t sclp_sidecar_val(const sclp_sidecar_view& v, uint32_t e) {
+    uint16_t x; __builtin_memcpy(&x, v.vals + (uint64_t)e * 2, sizeof(uint16_t)); return x;
+}
+
 static __device__ __forceinline__ uint16_t float_to_bf16_dev(float f) {
     union { float f; uint32_t u; } x;
     x.f = f;
