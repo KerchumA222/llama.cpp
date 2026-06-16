@@ -812,6 +812,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     GGML_UNUSED(ne0);
     if (tensor->type == GGML_TYPE_SCLP8  ||
         tensor->type == GGML_TYPE_SCLP4 ||
+        tensor->type == GGML_TYPE_SCLP4M ||
         tensor->type == GGML_TYPE_SCLP5 ||
         tensor->type == GGML_TYPE_SCLP6) {
         // Prefer an exact per-tensor hint stashed by the model loader (op_params[13..15]
@@ -838,6 +839,9 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
             return (size_t) (sclp4_fallback_mult * (float) size) + 65536;
         }
         if (tensor->type == GGML_TYPE_SCLP5) return 2 * size + 65536;
+        // SCLP4M: ~4.5 bpw stream + 16 B/256-weight codebook + sidecar. A blob is
+        // ~0.30× of F32 nbytes; 0.5× + 64 KB is a safe fallback when no exact hint.
+        if (tensor->type == GGML_TYPE_SCLP4M) return size / 2 + 65536;
         return size + size / 4 + 65536;
     }
 
@@ -2554,6 +2558,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     if (src0->type == GGML_TYPE_SCLP8) return false;
     if (src0->type == GGML_TYPE_SCLP4) return false;
+    if (src0->type == GGML_TYPE_SCLP4M) return false;
     if (src0->type == GGML_TYPE_SCLP5) return false;
     if (src0->type == GGML_TYPE_SCLP6) return false;
 
@@ -2675,6 +2680,42 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t num_weights = ggml_nelements(src0);
         ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
         llama_sclp4_dispatch(src0->data, decoded.get(), (uint32_t)num_weights, stream);
+
+        ggml_tensor src0_bf16 = *src0;
+        src0_bf16.type  = GGML_TYPE_BF16;
+        src0_bf16.data  = decoded.get();
+        src0_bf16.nb[0] = sizeof(ggml_bf16_t);
+        for (int i = 1; i < GGML_MAX_DIMS; i++) {
+            src0_bf16.nb[i] = src0_bf16.nb[i-1] * src0_bf16.ne[i-1];
+        }
+        ggml_cuda_mul_mat(ctx, &src0_bf16, src1, dst);
+        return;
+    }
+
+    // SCLP4M: fused decode-GEMV for M=1, two-pass otherwise.
+    if (src0->type == GGML_TYPE_SCLP4M) {
+        cudaStream_t stream = ctx.stream();
+
+        const int64_t K = src0->ne[0];
+        const int64_t N = src0->ne[1];
+        const int64_t M = src1->ne[1];
+
+        if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+                && (64 + (size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
+            llama_sclp4m_fused_gemv(
+                src0->data,
+                (const float*)src1->data,
+                (float*)dst->data,
+                (uint32_t)N,
+                (uint32_t)K,
+                stream);
+            return;
+        }
+
+        // Two-pass fallback: decode blob → BF16 → recurse.
+        const int64_t num_weights = ggml_nelements(src0);
+        ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
+        llama_sclp4m_dispatch(src0->data, decoded.get(), (uint32_t)num_weights, stream);
 
         ggml_tensor src0_bf16 = *src0;
         src0_bf16.type  = GGML_TYPE_BF16;
@@ -3422,6 +3463,46 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (dst_fused_pre_raw) hipFree(dst_fused_pre_raw);
             if (dst_fused_repeat_raw) hipFree(dst_fused_repeat_raw);
         }
+        return;
+    }
+
+    // SCLP4M MoE: fused GEMV for single-token generation (n_batches==1); two-pass for prefill.
+    if (src0->type == GGML_TYPE_SCLP4M) {
+        GGML_ASSERT(ids != nullptr && "SCLP4M MUL_MAT_ID requires routing ids");
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        const int64_t n_batches = ids->ne[1];
+        if (n_batches == 1) {
+            // Single-token generation: fused decode+GEMV avoids allocating full expert buffer.
+            const int64_t K       = src0->ne[0];
+            const int64_t N       = src0->ne[1];
+            const int64_t n_active = ids->ne[0];
+            llama_sclp4m_fused_moe_gemv(
+                src0->data,
+                (const float*)src1->data,
+                (const int32_t*)ids->data,
+                (float*)dst->data,
+                (uint32_t)N, (uint32_t)K, (uint32_t)n_active, (uint32_t)n_batches,
+                (uint32_t)src1->ne[1],
+                ctx.stream());
+            return;
+        }
+        // Prefill (n_batches > 1): decode all experts to BF16, then native mul_mat_id.
+        cudaStream_t stream = ctx.stream();
+        const int64_t num_weights = ggml_nelements(src0);
+        ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
+        llama_sclp4m_dispatch(src0->data, decoded.get(), (uint32_t)num_weights, stream);
+
+        ggml_tensor src0_bf16 = *src0;
+        src0_bf16.type  = GGML_TYPE_BF16;
+        src0_bf16.data  = decoded.get();
+        src0_bf16.nb[0] = sizeof(ggml_bf16_t);
+        for (int i = 1; i < GGML_MAX_DIMS; i++) {
+            src0_bf16.nb[i] = src0_bf16.nb[i-1] * src0_bf16.ne[i-1];
+        }
+        ggml_tensor * orig_src0 = dst->src[0];
+        dst->src[0] = &src0_bf16;
+        ggml_cuda_mul_mat_id(ctx, dst);
+        dst->src[0] = orig_src0;
         return;
     }
 
@@ -4196,6 +4277,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // SCLP6/SCLP4/SCLP5 two-pass decode uses pool alloc (hipMalloc) which is illegal during capture.
         if (node->src[0] && (node->src[0]->type == GGML_TYPE_SCLP6 ||
                               node->src[0]->type == GGML_TYPE_SCLP5 ||
+                              node->src[0]->type == GGML_TYPE_SCLP4M ||
                               node->src[0]->type == GGML_TYPE_SCLP4)) {
             use_cuda_graph = false;
         }
@@ -6113,6 +6195,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_TQ3_1S:
                     case GGML_TYPE_SCLP8:
                     case GGML_TYPE_SCLP4:
+                    case GGML_TYPE_SCLP4M:
                     case GGML_TYPE_SCLP5:
                     case GGML_TYPE_SCLP6:
                         return true;

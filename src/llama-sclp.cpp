@@ -9,9 +9,12 @@
 #include <thread>
 
 // SCLP Bit Layouts:
-// SCLP8: idx(4b) | sign(1b) | mant_top3(3b)   - 1 byte per weight, palette size 16
-// SCLP4: idx(2b) | sign(1b) | mant_top1(1b)   - 0.5 bytes per weight, palette size 4
-// SCLP6: idx(3b) | sign(1b) | mant_top2(2b)   - 0.75 bytes per weight, palette size 8
+// SCLP8:  idx(4b) | sign(1b) | mant_top3(3b)  - 1 byte per weight, palette size 16
+// SCLP4:  idx(2b) | sign(1b) | mant_top1(1b)  - 0.5 bytes per weight, palette size 4
+// SCLP6:  idx(3b) | sign(1b) | mant_top2(2b)  - 0.75 bytes per weight, palette size 8
+// SCLP4M: idx(3b) | sign(1b)                  - 0.5 bytes per weight + 16 B/block codebook
+//   (8 free BF16 magnitudes per 256-weight block, Lloyd k-means in linear space —
+//    no exponent/mantissa grid; decode = bf16(cb[idx] | sign<<15))
 
 struct sclp_expert_encoded {
     uint8_t palette[16];
@@ -251,6 +254,47 @@ static void kmeans_palette(const float counts[256], uint8_t * palette, int k) {
     }
 }
 
+// SCLP4M: 1-D Lloyd k-means over |w| for one block → 8 BF16 magnitudes.
+// Deterministic: quantile init on the sorted magnitudes, 15 Lloyd iterations.
+// Centroids are free BF16 values (not constrained to observed weights).
+static void kmeans_magnitude_codebook(const float * w, int64_t n, uint16_t cb[8]) {
+    std::vector<float> mags(n);
+    for (int64_t i = 0; i < n; i++) mags[i] = std::fabs(w[i]);
+    std::sort(mags.begin(), mags.end());
+
+    float c[8];
+    for (int j = 0; j < 8; j++) {
+        int64_t q = (2 * j + 1) * n / 16;
+        if (q >= n) q = n - 1;
+        c[j] = mags[q];
+    }
+
+    for (int iter = 0; iter < 15; iter++) {
+        // Centers stay sorted (means of ordered segments), so assignment is by
+        // midpoint boundaries over the sorted magnitude array.
+        double sum[8] = {0}; int64_t cnt[8] = {0};
+        int j = 0;
+        for (int64_t i = 0; i < n; i++) {
+            while (j < 7 && mags[i] > 0.5f * (c[j] + c[j + 1])) j++;
+            sum[j] += mags[i];
+            cnt[j]++;
+        }
+        bool converged = true;
+        for (int k2 = 0; k2 < 8; k2++) {
+            if (cnt[k2] > 0) {
+                float nc = (float)(sum[k2] / cnt[k2]);
+                if (std::fabs(nc - c[k2]) > 1e-8f) converged = false;
+                c[k2] = nc;
+            }
+        }
+        if (converged) break;
+    }
+
+    for (int j = 0; j < 8; j++) {
+        cb[j] = (uint16_t)(float_to_bf16(c[j]) & 0x7FFF); // magnitude: sign bit clear
+    }
+}
+
 static sclp_expert_encoded encode_sclp_expert(
     ggml_type type,
     const float * data,
@@ -271,10 +315,13 @@ static sclp_expert_encoded encode_sclp_expert(
         sm_bits = 2; p_max = 4;
     } else if (type == GGML_TYPE_SCLP5) {
         sm_bits = 3; p_max = 4;  // idx2 | sign1 | mant2, 4-entry per-block palette
+    } else if (type == GGML_TYPE_SCLP4M) {
+        sm_bits = 1; p_max = 0;  // idx3 | sign1, per-block 8-entry magnitude codebook
     } else {
         sm_bits = 3; p_max = 8;
     }
-    const bool per_block_palette = (type == GGML_TYPE_SCLP4 || type == GGML_TYPE_SCLP5);
+    const bool per_block_palette  = (type == GGML_TYPE_SCLP4 || type == GGML_TYPE_SCLP5);
+    const bool per_block_codebook = (type == GGML_TYPE_SCLP4M);
     const int  mant_bits = sm_bits - 1;                  // SCLP4:1, SCLP5:2, SCLP6:2, SCLP8:3
     const int  mant_shift = 7 - mant_bits;               // bit position of kept mantissa top bits
 
@@ -282,8 +329,8 @@ static sclp_expert_encoded encode_sclp_expert(
     int64_t n_blocks = (n + qk - 1) / qk;
     std::vector<float> scaled_data(n);
 
-    if (per_block_palette) {
-        // SCLP4/SCLP5: per-block palette mode — no PBS normalization
+    if (per_block_palette || per_block_codebook) {
+        // SCLP4/SCLP5/SCLP4M: per-block table modes — no PBS normalization
         for (int64_t i = 0; i < n; i++) scaled_data[i] = data[i];
     } else {
         enc.scales.resize(n_blocks);
@@ -322,7 +369,7 @@ static sclp_expert_encoded encode_sclp_expert(
         bf16_weights.swap(clipped);
     }
 
-    {
+    if (!per_block_codebook) {  // SCLP4M has no mantissa grid — codebook search below
         static const char * env = std::getenv("SCLP_STOCHASTIC_ROUND");
         const bool enabled = !(env && env[0] == '0');
         if (enabled) {
@@ -336,7 +383,41 @@ static sclp_expert_encoded encode_sclp_expert(
     bool has_imatrix = (imatrix != nullptr) && (sidecar_imatrix_budget > 0.0f) && (K > 0);
     std::vector<float> priority(n, 0.0f);
 
-    if (per_block_palette) {
+    if (per_block_codebook) {
+        // SCLP4M: each QK_SCLP4-weight block gets its own 8-entry magnitude codebook
+        // (free BF16 values from linear-space Lloyd k-means). No mandatory sidecar tier:
+        // the codebook adapts to outliers, so rescue is purely discretionary
+        // (importance × squared-error ranking below).
+        enc.palette_size = 0;
+        enc.block_palettes.resize(n_blocks * 16);
+
+        for (int64_t b = 0; b < n_blocks; b++) {
+            int64_t b_start = b * qk;
+            int64_t b_end = std::min(b_start + qk, n);
+
+            uint16_t cb[8];
+            kmeans_magnitude_codebook(data + b_start, b_end - b_start, cb);
+            std::memcpy(enc.block_palettes.data() + b * 16, cb, 16);
+
+            float cbf[8];
+            for (int j = 0; j < 8; j++) cbf[j] = bf16_to_float(cb[j]);
+
+            for (int64_t i = b_start; i < b_end; i++) {
+                float m = std::fabs(data[i]);
+                int best = 0;
+                float best_err = std::fabs(cbf[0] - m);
+                for (int j = 1; j < 8; j++) {
+                    float err = std::fabs(cbf[j] - m);
+                    if (err < best_err) { best_err = err; best = j; }
+                }
+                indices[i]    = (uint8_t)best;
+                sm_nibbles[i] = (uint8_t)(std::signbit(data[i]) ? 1 : 0);
+                if (has_imatrix) {
+                    priority[i] = imatrix[(uint64_t)i % K] * best_err * best_err;
+                }
+            }
+        }
+    } else if (per_block_palette) {
         // Per-block palette: each QK_SCLP4-weight block gets its own 4-entry k-means palette.
         // SCLP4 keeps 1 mantissa bit; SCLP5 keeps 2 (mant_bits / mant_shift).
         const int mant_levels = 1 << mant_bits;
@@ -529,6 +610,16 @@ static sclp_expert_encoded encode_sclp_expert(
             }
             enc.ws_stream[i/2] = b;
         }
+    } else if (type == GGML_TYPE_SCLP4M) {
+        // nibble = idx(3:1) | sign(0); high nibble = even weight
+        enc.ws_stream.resize((n + 1) / 2);
+        for (int64_t i = 0; i < n; i += 2) {
+            uint8_t b = (uint8_t)(((indices[i] << 1) | sm_nibbles[i]) << 4);
+            if (i + 1 < n) {
+                b |= (uint8_t)((indices[i+1] << 1) | sm_nibbles[i+1]);
+            }
+            enc.ws_stream[i/2] = b;
+        }
     } else if (type == GGML_TYPE_SCLP5) {
         // 8 weights -> 5 bytes: eight 5-bit codes (idx2|sign1|mant2) MSB-first in 40 bits.
         enc.ws_stream.resize((n + 7) / 8 * 5);
@@ -618,8 +709,8 @@ size_t llama_tensor_quantize_sclp(
         p += experts[e].palette_size;
     }
 
-    if (type == GGML_TYPE_SCLP4 || type == GGML_TYPE_SCLP5) {
-        // Per-block palettes: 4 bytes per block per expert
+    if (type == GGML_TYPE_SCLP4 || type == GGML_TYPE_SCLP5 || type == GGML_TYPE_SCLP4M) {
+        // Per-block tables: 4 B/block palettes (SCLP4/5) or 16 B/block codebooks (SCLP4M)
         for (uint32_t e = 0; e < ne; e++) {
             std::memcpy(p, experts[e].block_palettes.data(), experts[e].block_palettes.size());
             p += experts[e].block_palettes.size();
@@ -712,6 +803,10 @@ void llama_tensor_dequantize_sclp(
         // Per-block palette: 4 bytes per block
         block_palettes_base = p;
         p += (uint64_t)ne * bpe * 4;
+    } else if (type == GGML_TYPE_SCLP4M) {
+        // Per-block magnitude codebook: 16 bytes (8 × BF16) per block
+        block_palettes_base = p;
+        p += (uint64_t)ne * bpe * 16;
     } else {
         // PBS: 2-byte BF16 scale per block
         scales = (const uint16_t *)p;
@@ -727,6 +822,21 @@ void llama_tensor_dequantize_sclp(
 
         uint8_t exp, smn;
         float scale = 1.0f;
+
+        if (type == GGML_TYPE_SCLP4M) {
+            // Direct codebook decode — no exponent/mantissa assembly, no scale.
+            int64_t block_idx = e * bpe + (local_idx / qk);
+            const uint8_t * cb = block_palettes_base + block_idx * 16;
+            int64_t expert_ws_bytes = (weights_per_expert + 1) / 2;
+            const uint8_t * ws_e = ws + (uint64_t)e * expert_ws_bytes;
+            uint8_t b = ws_e[local_idx / 2];
+            uint8_t nibble = (local_idx % 2 == 0) ? (b >> 4) : (b & 0xF);
+            uint16_t mag;
+            std::memcpy(&mag, cb + (nibble >> 1) * 2, 2);
+            uint16_t bits = (uint16_t)(mag | ((nibble & 1) << 15));
+            f32_data[i] = bf16_to_float(bits);
+            continue;
+        }
 
         if (type == GGML_TYPE_SCLP4) {
             int64_t block_idx = e * bpe + (local_idx / qk);
@@ -778,7 +888,7 @@ void llama_tensor_dequantize_sclp(
     // Sidecar fixup
     int64_t ws_bytes_per_expert =
         (type == GGML_TYPE_SCLP8) ? weights_per_expert :
-        (type == GGML_TYPE_SCLP4) ? (weights_per_expert + 1) / 2 :
+        (type == GGML_TYPE_SCLP4 || type == GGML_TYPE_SCLP4M) ? (weights_per_expert + 1) / 2 :
         (type == GGML_TYPE_SCLP5) ? (weights_per_expert + 7) / 8 * 5 :
                                     (weights_per_expert + 3) / 4 * 3;
     // Sidecar v2: [u32 count|bit31][u32 K][u32 row_offsets[n_rows+1]][u16 cols][u16 vals]

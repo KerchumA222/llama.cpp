@@ -782,6 +782,7 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
             // can underflow.)
             const bool is_compact_eligible =
                 ti.t.type == GGML_TYPE_SCLP4 ||
+                ti.t.type == GGML_TYPE_SCLP4M ||
                 ti.t.type == GGML_TYPE_SCLP5 ||
                 ti.t.type == GGML_TYPE_SCLP6 ||
                 ti.t.type == GGML_TYPE_SCLP8;

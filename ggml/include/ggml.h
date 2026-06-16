@@ -438,7 +438,8 @@ extern "C" {
         GGML_TYPE_SCLP6   = 48,
         GGML_TYPE_SCLP4   = 49,
         GGML_TYPE_SCLP5   = 50,
-        GGML_TYPE_COUNT   = 51,
+        GGML_TYPE_SCLP4M  = 51, // 4-bit + per-block magnitude codebook: idx3|sign1, 8 BF16 magnitudes per 256-weight block
+        GGML_TYPE_COUNT   = 52,
     };
 
     // precision

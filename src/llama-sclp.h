@@ -8,7 +8,8 @@
 #define QK_SCLP4 256
 
 static inline int qk_for_type(ggml_type type) {
-    return (type == GGML_TYPE_SCLP4 || type == GGML_TYPE_SCLP5) ? QK_SCLP4 : QK_SCLP;
+    return (type == GGML_TYPE_SCLP4 || type == GGML_TYPE_SCLP5 || type == GGML_TYPE_SCLP4M)
+        ? QK_SCLP4 : QK_SCLP;
 }
 
 // Quantize a whole tensor (possibly with multiple experts) to SCLP format.
@@ -31,7 +32,13 @@ static inline int qk_for_type(ggml_type type) {
 //   header: [uint32 num_weights][uint32 n_experts][per-expert: palette_size=0]
 //   block_palettes: [4 x uint8] x (num_weights / QK_SCLP4)
 //   ws_stream: packed indices + SM bits
-//   sidecar: [uint32 count][uint32 indices][uint16 bf16_bits]
+//   sidecar: v2 — [uint32 count|bit31][uint32 K][uint32 row_offsets][uint16 cols][uint16 vals]
+//
+// Layout (SCLP4M, per-block magnitude codebook): [header][block_codebooks][ws_stream][sidecar]
+//   header: [uint32 num_weights][uint32 n_experts][per-expert: palette_size=0]
+//   block_codebooks: [8 x uint16 BF16 magnitudes] x (num_weights / QK_SCLP4)
+//   ws_stream: 2 weights/byte; nibble = codebook_idx(3:1) | sign(0)
+//   decode: bf16(codebook[idx] | sign<<15) — no scale, no exponent assembly
 //
 // Returns the total size of the quantized blob.
 size_t llama_tensor_quantize_sclp(

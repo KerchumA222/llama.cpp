@@ -698,6 +698,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 5,
         .is_quantized             = true,
     },
+    [GGML_TYPE_SCLP4M] = {
+        .type_name                = "sclp4m",
+        .blck_size                = 2,
+        .type_size                = 1,
+        .is_quantized             = true,
+    },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,

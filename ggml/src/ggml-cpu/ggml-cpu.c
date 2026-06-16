@@ -1312,6 +1312,10 @@ static void sclp_decode_to_bf16_cpu(
         const uint64_t n_blocks = (uint64_t)num_weights / QK_SCLP4_CPU;
         ws_start = section_start + (uint32_t)(n_blocks * 4);
         expert_ws_bytes = (uint64_t)((enw + 1) / 2);
+    } else if (type == GGML_TYPE_SCLP4M) {
+        const uint64_t n_blocks = (uint64_t)num_weights / QK_SCLP4_CPU;
+        ws_start = section_start + (uint32_t)(n_blocks * 16); // 8 × BF16 codebook per block
+        expert_ws_bytes = (uint64_t)((enw + 1) / 2);
     } else if (type == GGML_TYPE_SCLP5) {
         const uint64_t n_blocks = (uint64_t)num_weights / QK_SCLP4_CPU;
         ws_start = section_start + (uint32_t)(n_blocks * 4);
@@ -1362,6 +1366,18 @@ static void sclp_decode_to_bf16_cpu(
                     (uint16_t)(((smn >> 1) & 1) << 15) |
                     ((uint16_t)exp << 7) |
                     ((uint16_t)(smn & 1) << 6);
+            }
+        } else if (type == GGML_TYPE_SCLP4M) {
+            // 2 weights/byte; per-block 8-entry BF16 magnitude codebook; no scale.
+            // nibble = idx(3:1) | sign(0); decode = bf16(cb[idx] | sign<<15).
+            for (int64_t j = 0; j < enw; j++) {
+                int64_t block_idx = (int64_t)e * blocks_per_expert + j / QK_SCLP4_CPU;
+                const uint8_t * cb = block_pals + block_idx * 16;
+                uint8_t byte   = ws_e[j / 2];
+                uint8_t nibble = (j & 1) ? (byte & 0xF) : (byte >> 4);
+                uint16_t mag;
+                memcpy(&mag, cb + (nibble >> 1) * 2, 2);
+                output[base_idx + j] = (uint16_t)(mag | ((nibble & 1) << 15));
             }
         } else if (type == GGML_TYPE_SCLP5) {
             // 8 weights / 5 bytes; per-block palette; code = idx2|sign1|mant2; no scale.
@@ -1455,7 +1471,7 @@ void ggml_compute_forward_mul_mat(
     }
 
     // CPU fallback for SCLP: single-threaded (thread 0 only) to avoid barrier deadlocks.
-    if (src0->type == GGML_TYPE_SCLP8 || src0->type == GGML_TYPE_SCLP4 || src0->type == GGML_TYPE_SCLP5 || src0->type == GGML_TYPE_SCLP6) {
+    if (src0->type == GGML_TYPE_SCLP8 || src0->type == GGML_TYPE_SCLP4 || src0->type == GGML_TYPE_SCLP4M || src0->type == GGML_TYPE_SCLP5 || src0->type == GGML_TYPE_SCLP6) {
         if (params->ith != 0) return;
 
         struct ggml_tensor * src0_nc = (struct ggml_tensor *)(uintptr_t)src0;
@@ -1780,7 +1796,7 @@ static void ggml_compute_forward_mul_mat_id(
     // CPU SCLP MoE: decode blob to BF16 once (cached in src0->extra) then recurse.
     // The decoded BF16 buffer persists for the model's lifetime, amortizing decode
     // cost across all forward passes (sched_reserve, warmup, and generation).
-    if (src0->type == GGML_TYPE_SCLP8 || src0->type == GGML_TYPE_SCLP4 || src0->type == GGML_TYPE_SCLP5 || src0->type == GGML_TYPE_SCLP6) {
+    if (src0->type == GGML_TYPE_SCLP8 || src0->type == GGML_TYPE_SCLP4 || src0->type == GGML_TYPE_SCLP4M || src0->type == GGML_TYPE_SCLP5 || src0->type == GGML_TYPE_SCLP6) {
         // Only thread 0 handles SCLP MoE — avoids barrier count mismatch with threadpool.
         // Other threads return immediately; thread 0 does the full GEMV.
         // For bs=1 (generation): ~30ms. For bs=512 (sched_reserve): ~200ms. Acceptable.

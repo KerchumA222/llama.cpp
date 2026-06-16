@@ -47,6 +47,20 @@ void llama_sclp4_fused_moe_wmma(
     uint32_t ids_s1, uint32_t src1_ne1, uint32_t n_experts,
     uint32_t scalar_math_mode, uint32_t sidecar_mode, hipStream_t stream);
 
+// SCLP4M
+void llama_sclp4m_dispatch(
+    const void* sclp_data, uint16_t* output,
+    uint32_t num_weights, hipStream_t stream, bool apply_sidecar = true);
+
+void llama_sclp4m_fused_gemv(
+    const void* blob_ptr, const float* src_f32, float* dst_f32,
+    uint32_t N, uint32_t K, hipStream_t stream);
+
+void llama_sclp4m_fused_moe_gemv(
+    const void* blob_ptr, const float* src1, const int32_t* ids, float* dst,
+    uint32_t N, uint32_t K, uint32_t n_active, uint32_t n_batches,
+    uint32_t src1_ne1, hipStream_t stream);
+
 // SCLP5
 void llama_sclp5_dispatch(
     const void* sclp_data, uint16_t* output,

@@ -4254,6 +4254,7 @@ class GGMLQuantizationType(IntEnum):
     SCLP8   = 47
     SCLP6   = 48
     SCLP4   = 49
+    SCLP4M  = 51
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4437,6 +4438,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.SCLP8:   (1, 1),
     GGMLQuantizationType.SCLP6:   (4, 3),
     GGMLQuantizationType.SCLP4:   (2, 1),
+    GGMLQuantizationType.SCLP4M:  (2, 1),
 }
 
 
