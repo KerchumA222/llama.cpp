@@ -255,7 +255,12 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
-    GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+    // Match the bound used by the sync ggml_backend_tensor_set: allow writes up to the
+    // buffer's alloc_size, not just ggml_nbytes. SCLP types reserve disk_size > nbytes via
+    // get_alloc_size to fit blob header + sidecar.
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    GGML_ASSERT(buf != NULL && "tensor buffer not set");
+    GGML_ASSERT(offset + size <= ggml_backend_buffer_get_alloc_size(buf, tensor) && "tensor write out of bounds");
 
     if (backend->iface.set_tensor_async == NULL) {
         ggml_backend_synchronize(backend);

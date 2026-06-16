@@ -1250,17 +1250,28 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
 // Decode a CPU-hosted SCLP blob to BF16 (uint16_t). Called only by thread 0.
 static void sclp_decode_to_bf16_cpu(const uint8_t * blob, uint16_t * output, int64_t num_weights) {
-    const uint8_t palette_size = blob[4];
-    // Copy palette to stack so forward scan doesn't overwrite it.
-    uint8_t palette[16];
-    memcpy(palette, blob + 5, palette_size);
-    const uint8_t * ws = blob + 5 + palette_size;
+    uint32_t n_experts;
+    memcpy(&n_experts, blob + 4, 4);
+
+    const uint8_t * p = blob + 8;
+    uint8_t palettes[128][16];
+    uint8_t palette_lens[128];
+
+    for (uint32_t e = 0; e < n_experts; e++) {
+        palette_lens[e] = p[0];
+        memcpy(palettes[e], p + 1, p[0]);
+        p += 1 + p[0];
+    }
+
+    const uint8_t * ws = p;
+    int64_t weights_per_expert = num_weights / n_experts;
 
     for (int64_t i = 0; i < num_weights; i++) {
+        uint32_t e = (uint32_t)(i / weights_per_expert);
         uint8_t b    = ws[i];
         uint8_t pidx = b >> 4;
         uint8_t smn  = b & 0xF;
-        uint8_t exp  = pidx < palette_size ? palette[pidx] : 0;
+        uint8_t exp  = pidx < palette_lens[e] ? palettes[e][pidx] : 0;
         output[i]    = (uint16_t)(((smn >> 3) & 1) << 15) | ((uint16_t)exp << 7) | ((uint16_t)(smn & 0x7) << 4);
     }
 
