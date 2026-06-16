@@ -1284,7 +1284,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // See risks/mitigations in CLAUDE.md ("SCLP disk_size hint via op_params"). op_params
     // is unused on weight tensors (op == GGML_OP_NONE); we use the trailing slots so any
     // future ggml op that grows op_params from the front stays clear of this region.
-    if (tensor->type == GGML_TYPE_SCLP  ||
+    if (tensor->type == GGML_TYPE_SCLP8  ||
         tensor->type == GGML_TYPE_SCLP4 ||
         tensor->type == GGML_TYPE_SCLP6) {
         const auto * w = get_weight(ggml_get_name(tensor));
@@ -1412,7 +1412,7 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
         } else {
             // SCLP blobs: disk_size is exact (get_alloc_size reserved enough space).
             // Other types: cap at ggml_nbytes in case disk_size is larger.
-            const bool is_sclp = cur->type == GGML_TYPE_SCLP || cur->type == GGML_TYPE_SCLP4 || cur->type == GGML_TYPE_SCLP6;
+            const bool is_sclp = cur->type == GGML_TYPE_SCLP8 || cur->type == GGML_TYPE_SCLP4 || cur->type == GGML_TYPE_SCLP6;
             const size_t copy_bytes = is_sclp ? w.disk_size : std::min(w.disk_size, ggml_nbytes(cur));
             memcpy(cur->data, (uint8_t *)mapping->addr() + w.offs, copy_bytes);
             if (copy_bytes < ggml_nbytes(cur)) {
@@ -1424,7 +1424,7 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
         GGML_ASSERT(w.idx < files.size());
         const auto & file = files.at(w.idx);
         file->seek(w.offs, SEEK_SET);
-        const bool is_sclp = cur->type == GGML_TYPE_SCLP || cur->type == GGML_TYPE_SCLP4 || cur->type == GGML_TYPE_SCLP6;
+        const bool is_sclp = cur->type == GGML_TYPE_SCLP8 || cur->type == GGML_TYPE_SCLP4 || cur->type == GGML_TYPE_SCLP6;
         const size_t read_bytes = is_sclp ? w.disk_size : std::min(w.disk_size, ggml_nbytes(cur));
         file->read_raw(cur->data, read_bytes);
         if (read_bytes < ggml_nbytes(cur)) {
@@ -1594,7 +1594,7 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + disk_size);
             } else {
-                if (cur->type == GGML_TYPE_SCLP  ||
+                if (cur->type == GGML_TYPE_SCLP8  ||
                     cur->type == GGML_TYPE_SCLP4 ||
                     cur->type == GGML_TYPE_SCLP6) {
                     // All SCLP types use self-describing blobs; get_alloc_size reserves
@@ -1614,7 +1614,7 @@ bool llama_model_loader::load_all_data(
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 // All SCLP types: disk_size is the exact blob size; get_alloc_size reserves enough.
-                const bool is_sclp = cur->type == GGML_TYPE_SCLP || cur->type == GGML_TYPE_SCLP4 || cur->type == GGML_TYPE_SCLP6;
+                const bool is_sclp = cur->type == GGML_TYPE_SCLP8 || cur->type == GGML_TYPE_SCLP4 || cur->type == GGML_TYPE_SCLP6;
                 const size_t read_bytes = is_sclp ? disk_size : std::min(disk_size, n_size);
                 file->read_raw(cur->data, read_bytes);
                 if (read_bytes < n_size) {
@@ -1629,7 +1629,7 @@ bool llama_model_loader::load_all_data(
                 // SCLP blobs can be larger than ggml_nbytes (n_size) — the blob includes a header
                 // plus an outlier sidecar. get_alloc_size reserves enough GPU space for disk_size,
                 // and the kernel parses the full blob; we must upload exactly disk_size bytes.
-                const bool is_sclp_buf = cur->type == GGML_TYPE_SCLP || cur->type == GGML_TYPE_SCLP4 || cur->type == GGML_TYPE_SCLP6;
+                const bool is_sclp_buf = cur->type == GGML_TYPE_SCLP8 || cur->type == GGML_TYPE_SCLP4 || cur->type == GGML_TYPE_SCLP6;
                 const size_t upload_size = is_sclp_buf ? disk_size : n_size;
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
                 if (upload_backend) {

@@ -809,7 +809,13 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
         : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
-    if (tensor->type == GGML_TYPE_SCLP  ||
+    // TQ4_1S → q8_0 load-time conversion: allocate q8_0-sized space if opted in
+    if (ggml_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S) {
+        // q8_0 block: 34 bytes per 32 elements. TQ4_1S block: 20 bytes per 32 elements.
+        const int64_t n_blocks = ggml_nelements(tensor) / QK_TQ4_1S;
+        size = n_blocks * sizeof(block_q8_0);
+    }
+    if (tensor->type == GGML_TYPE_SCLP8  ||
         tensor->type == GGML_TYPE_SCLP4 ||
         tensor->type == GGML_TYPE_SCLP6) {
         // Prefer an exact per-tensor hint stashed by the model loader (op_params[13..15]
@@ -2539,7 +2545,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    if (src0->type == GGML_TYPE_SCLP) return false;
+    if (src0->type == GGML_TYPE_SCLP8) return false;
     if (src0->type == GGML_TYPE_SCLP4) return false;
     if (src0->type == GGML_TYPE_SCLP6) return false;
 
@@ -2577,8 +2583,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Max shared memory for fused GEMV kernels (RDNA3 LDS limit = 64 KB).
+    constexpr size_t SCLP_MAX_SMEM = 65536;
+
     // SCLP: fused decode-GEMV for M=1 (single-token inference), two-pass otherwise.
-    if (src0->type == GGML_TYPE_SCLP) {
+    if (src0->type == GGML_TYPE_SCLP8) {
         cudaStream_t stream = ctx.stream();
 
         // src0 shape: [K, N] (ne[0]=K, ne[1]=N) — weight matrix
@@ -2587,7 +2596,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t N = src0->ne[1];
         const int64_t M = src1->ne[1];  // batch / sequence dimension
 
-        if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        // Fused GEMV broadcasts activations into shared memory (1024 + K*4 bytes).
+        // Skip when K exceeds LDS limit (e.g. ffn_down on Gemma4-31B, K=21504).
+        if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+                && (1024 + (size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
             llama_sclp_fused_gemv(
                 src0->data,
                 (const float*)src1->data,
@@ -2639,7 +2651,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t N = src0->ne[1];
         const int64_t M = src1->ne[1];
 
-        if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+                && (64 + (size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
             llama_sclp4_fused_gemv(
                 src0->data,
                 (const float*)src1->data,
@@ -2675,7 +2688,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t N = src0->ne[1];
         const int64_t M = src1->ne[1];
 
-        if (M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        // SCLP6 fused GEMV disabled: kernel produces numerical errors on Gemma4-31B
+        // dense attention tensors. Two-pass (decode→BF16→rocBLAS) is correct.
+        // TODO: debug sclp6_fused_gemv_kernel accumulation/decode logic.
+        if (false && M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+                && (264 + (size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
             llama_sclp6_fused_gemv(
                 src0->data,
                 (const float*)src1->data,
@@ -3410,7 +3427,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     // SCLP MoE: fused decode+GEMV for M=1 (token generation).
-    if (src0->type == GGML_TYPE_SCLP) {
+    if (src0->type == GGML_TYPE_SCLP8) {
         // src0: [K, N, n_experts],  src1: [K, 1, n_tokens] (broadcast across experts),
         // ids:  [n_expert_used, n_tokens],  dst: [N, n_expert_used, n_tokens]
         const int64_t K         = src0->ne[0];
@@ -5987,7 +6004,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
-                    case GGML_TYPE_SCLP:
+                    case GGML_TYPE_TQ4_1S:
+                    case GGML_TYPE_TQ3_1S:
+                    case GGML_TYPE_SCLP8:
                     case GGML_TYPE_SCLP4:
                     case GGML_TYPE_SCLP6:
                         return true;

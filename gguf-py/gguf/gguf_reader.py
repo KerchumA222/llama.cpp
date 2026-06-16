@@ -364,7 +364,7 @@ class GGUFReader:
             elif ggml_type == GGMLQuantizationType.I64:
                 item_count = n_elems
                 item_type = np.int64
-            elif ggml_type in (GGMLQuantizationType.SCLP,
+            elif ggml_type in (GGMLQuantizationType.SCLP8,
                                GGMLQuantizationType.SCLP4,
                                GGMLQuantizationType.SCLP6) and disk_size != n_bytes:
                 # Compact SCLP/SCLP4/SCLP6 blob: read as flat uint8, no reshape.

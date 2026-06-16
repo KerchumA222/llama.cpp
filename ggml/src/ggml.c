@@ -674,8 +674,8 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q1_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q1_0_ref,
     },
-    [GGML_TYPE_SCLP] = {
-        .type_name                = "sclp",
+    [GGML_TYPE_SCLP8] = {
+        .type_name                = "sclp8",
         .blck_size                = 1,
         .type_size                = 1,
         .is_quantized             = true,
