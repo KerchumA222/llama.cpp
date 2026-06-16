@@ -809,12 +809,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
         : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
-    // TQ4_1S → q8_0 load-time conversion: allocate q8_0-sized space if opted in
-    if (ggml_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S) {
-        // q8_0 block: 34 bytes per 32 elements. TQ4_1S block: 20 bytes per 32 elements.
-        const int64_t n_blocks = ggml_nelements(tensor) / QK_TQ4_1S;
-        size = n_blocks * sizeof(block_q8_0);
-    }
+    GGML_UNUSED(ne0);
     if (tensor->type == GGML_TYPE_SCLP8  ||
         tensor->type == GGML_TYPE_SCLP4 ||
         tensor->type == GGML_TYPE_SCLP5 ||

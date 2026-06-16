@@ -784,7 +784,7 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
                 ti.t.type == GGML_TYPE_SCLP4 ||
                 ti.t.type == GGML_TYPE_SCLP5 ||
                 ti.t.type == GGML_TYPE_SCLP6 ||
-                ti.t.type == GGML_TYPE_SCLP;
+                ti.t.type == GGML_TYPE_SCLP8;
             size_t actual_size = GGML_PAD(ggml_nbytes(&ti.t), ctx->alignment);
             if (is_compact_eligible && i + 1 < ctx->info.size()) {
                 size_t next_off = ctx->info[i + 1].offset;
