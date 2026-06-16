@@ -66,6 +66,9 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q5_K_M",   LLAMA_FTYPE_MOSTLY_Q5_K_M,   " 5.33G, +0.0569 ppl @ Llama-3-8B",  },
     { "Q6_K",     LLAMA_FTYPE_MOSTLY_Q6_K,     " 6.14G, +0.0217 ppl @ Llama-3-8B",  },
     { "Q8_0",     LLAMA_FTYPE_MOSTLY_Q8_0,     " 7.96G, +0.0026 ppl @ Llama-3-8B",  },
+    { "SCLP",     LLAMA_FTYPE_MOSTLY_SCLP,     " 8-bit SCLP (2.0x, lossless-first)",},
+    { "SCLP4",    LLAMA_FTYPE_MOSTLY_SCLP4,    " 4-bit SCLP (4.0x, lossless-first)",},
+    { "SCLP6",    LLAMA_FTYPE_MOSTLY_SCLP6,    " 6-bit SCLP (2.7x, lossless-first)",},
     { "F16",      LLAMA_FTYPE_MOSTLY_F16,      "14.00G, +0.0020 ppl @ Mistral-7B",  },
     { "BF16",     LLAMA_FTYPE_MOSTLY_BF16,     "14.00G, -0.0050 ppl @ Mistral-7B",  },
     { "F32",      LLAMA_FTYPE_ALL_F32,         "26.00G              @ 7B",          },
@@ -152,6 +155,8 @@ static void usage(const char * executable) {
     printf("                                      this is an advanced option to selectively quantize tensors. may be specified multiple times.\n");
     printf("                                      example: --tensor-type attn_q=q8_0\n");
     printf("  --tensor-type-file tensor_types.txt\n");
+    printf("  --sidecar-budget regex=float          set SCLP sidecar imatrix budget per tensor pattern (default 0.01)\n");
+    printf("                                        repeat to add multiple; first match wins. Example: --sidecar-budget 'ffn_down_exps=0.05'\n");
     printf("                                      list of tensors to quantize to a specific ggml_type\n");
     printf("                                      this is an advanced option to selectively quantize a long list of tensors.\n");
     printf("                                      the file should use the same format as above, separated by spaces or newlines.\n");
@@ -415,6 +420,33 @@ static ggml_type parse_ggml_type(const char * arg) {
     return GGML_TYPE_COUNT;
 }
 
+struct sidecar_budget_option {
+    std::string pattern;
+    float       budget = 0.0f;
+};
+
+static bool parse_sidecar_budget(const char * data, std::vector<sidecar_budget_option> & out) {
+    const char * sep = strchr(data, '=');
+    if (sep == nullptr || sep == data) {
+        printf("\n%s: malformed --sidecar-budget '%s' (expected regex=float)\n\n", __func__, data);
+        return false;
+    }
+    sidecar_budget_option opt;
+    opt.pattern.assign(data, sep - data);
+    try {
+        opt.budget = std::stof(sep + 1);
+    } catch (...) {
+        printf("\n%s: invalid budget value in '%s'\n\n", __func__, data);
+        return false;
+    }
+    if (opt.budget < 0.0f || opt.budget > 1.0f) {
+        printf("\n%s: budget must be in [0, 1], got %.4f\n\n", __func__, opt.budget);
+        return false;
+    }
+    out.emplace_back(std::move(opt));
+    return true;
+}
+
 static bool parse_tensor_type(const char * data, std::vector<tensor_type_option> & tensor_type) {
     const char * sep = strchr(data, '=');
     if (sep == nullptr) {
@@ -506,6 +538,7 @@ int llama_quantize(int argc, char ** argv) {
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_type_option> tensor_type_opts;
+    std::vector<sidecar_budget_option> sidecar_budget_opts;
     std::vector<int> prune_layers;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
@@ -535,6 +568,10 @@ int llama_quantize(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--tensor-type-file") == 0) {
             if (arg_idx == argc-1 || !parse_tensor_type_file(argv[++arg_idx], tensor_type_opts)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--sidecar-budget") == 0) {
+            if (arg_idx == argc-1 || !parse_sidecar_budget(argv[++arg_idx], sidecar_budget_opts)) {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--prune-layers") == 0) {
@@ -590,6 +627,7 @@ int llama_quantize(int argc, char ** argv) {
 
     std::vector<llama_model_imatrix_data> i_data;
     std::vector<llama_model_tensor_override> t_override;
+    std::vector<llama_model_sidecar_budget_override> sb_override;
     if (!imatrix_data.empty()) {
         i_data.reserve(imatrix_data.size() + 1);
         for (const auto & kv : imatrix_data) {
@@ -641,6 +679,14 @@ int llama_quantize(int argc, char ** argv) {
         }
         t_override.push_back({nullptr, GGML_TYPE_COUNT});  // array terminator
         params.tt_overrides = t_override.data();
+    }
+    if (!sidecar_budget_opts.empty()) {
+        sb_override.reserve(sidecar_budget_opts.size() + 1);
+        for (const auto & sb : sidecar_budget_opts) {
+            sb_override.push_back({sb.pattern.c_str(), sb.budget});
+        }
+        sb_override.push_back({nullptr, 0.0f}); // terminator
+        params.sb_overrides = sb_override.data();
     }
     if (!prune_layers.empty()) {
         prune_layers.push_back(-1);  // array terminator

@@ -100,8 +100,8 @@ __global__ void sclp_decode_blob_kernel(
 ) {
     __shared__ uint32_t s_n_experts;
     __shared__ uint32_t s_ws_start;
-    __shared__ uint8_t  s_palette_sizes[128];
-    __shared__ uint8_t  s_palettes[128][16];
+    __shared__ uint8_t  s_palette_sizes[256];
+    __shared__ uint8_t  s_palettes[256][16];
     __shared__ uint32_t s_expert_nw;
 
     if (threadIdx.x == 0) {
@@ -109,7 +109,7 @@ __global__ void sclp_decode_blob_kernel(
         __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
         s_n_experts = ne;
         const uint8_t* p = blob + 8;
-        for (uint32_t e = 0; e < ne && e < 128; e++) {
+        for (uint32_t e = 0; e < ne && e < 256; e++) {
             s_palette_sizes[e] = p[0];
             for (int i = 0; i < (int)s_palette_sizes[e]; i++) s_palettes[e][i] = p[1 + i];
             p += 1 + p[0];
@@ -865,8 +865,8 @@ __global__ void sclp4_decode_blob_kernel(
 ) {
     __shared__ uint32_t s_n_experts;
     __shared__ uint32_t s_ws_start;
-    __shared__ uint8_t  s_palette_sizes[128];
-    __shared__ uint8_t  s_palettes[128][4];
+    __shared__ uint8_t  s_palette_sizes[256];
+    __shared__ uint8_t  s_palettes[256][4];
     __shared__ uint32_t s_expert_nw;
     __shared__ uint32_t s_expert_nibble_bytes;
 
@@ -875,7 +875,7 @@ __global__ void sclp4_decode_blob_kernel(
         __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
         s_n_experts = ne;
         const uint8_t* p = blob + 8;
-        for (uint32_t e = 0; e < ne && e < 128; e++) {
+        for (uint32_t e = 0; e < ne && e < 256; e++) {
             s_palette_sizes[e] = p[0];
             for (int i = 0; i < (int)s_palette_sizes[e]; i++) s_palettes[e][i] = p[1 + i];
             p += 1 + p[0];
@@ -2104,8 +2104,8 @@ __global__ void sclp6_decode_blob_kernel(
     // Parse header on device (thread 0 only)
     __shared__ uint32_t s_n_experts;
     __shared__ uint32_t s_ws_start;
-    __shared__ uint8_t  s_palette_sizes[128];
-    __shared__ uint8_t  s_palettes[128][8];
+    __shared__ uint8_t  s_palette_sizes[256];
+    __shared__ uint8_t  s_palettes[256][8];
     __shared__ uint32_t s_expert_groups;
 
     if (threadIdx.x == 0) {
@@ -2113,7 +2113,7 @@ __global__ void sclp6_decode_blob_kernel(
         __builtin_memcpy(&ne, blob + 4, sizeof(uint32_t));
         s_n_experts = ne;
         const uint8_t* p = blob + 8;
-        for (uint32_t e = 0; e < ne && e < 128; e++) {
+        for (uint32_t e = 0; e < ne && e < 256; e++) {
             s_palette_sizes[e] = p[0];
             for (int i = 0; i < (int)s_palette_sizes[e]; i++) s_palettes[e][i] = p[1 + i];
             p += 1 + p[0];

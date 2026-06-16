@@ -775,18 +775,25 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
                 gguf_free(ctx);
                 return nullptr;
             }
-            // For variable-size types: derive disk_size from consecutive offsets.
-            size_t actual_size;
-            if (i + 1 < ctx->info.size()) {
+            // For compact SCLP storage, on-disk size can differ from ggml_nbytes —
+            // derive disk_size from consecutive offsets in that case only. For other
+            // types we never write compact, so trust ggml_nbytes. (Important: tensor
+            // info isn't always offset-sorted, so an unconditional next_off - this_off
+            // can underflow.)
+            const bool is_compact_eligible =
+                ti.t.type == GGML_TYPE_SCLP4 ||
+                ti.t.type == GGML_TYPE_SCLP6 ||
+                ti.t.type == GGML_TYPE_SCLP;
+            size_t actual_size = GGML_PAD(ggml_nbytes(&ti.t), ctx->alignment);
+            if (is_compact_eligible && i + 1 < ctx->info.size()) {
                 size_t next_off = ctx->info[i + 1].offset;
-                size_t inferred = next_off - ti.offset; // includes alignment padding
-                if (inferred != ggml_nbytes(&ti.t)) {
-                    // on-disk size differs from ggml_nbytes — record it
-                    ti.disk_size = inferred;
+                if (next_off >= ti.offset) {
+                    size_t inferred = next_off - ti.offset; // includes alignment padding
+                    if (inferred != ggml_nbytes(&ti.t)) {
+                        ti.disk_size = inferred;
+                    }
+                    actual_size = inferred;
                 }
-                actual_size = inferred;
-            } else {
-                actual_size = GGML_PAD(gguf_ti_nbytes(ti), ctx->alignment);
             }
             if (SIZE_MAX - ctx->size < actual_size) {
                 GGML_LOG_ERROR("%s: tensor '%s' size overflow, cannot accumulate size %zu + %zu\n",
@@ -1206,7 +1213,7 @@ enum ggml_type gguf_get_tensor_type(const struct gguf_context * ctx, int64_t ten
 
 size_t gguf_get_tensor_size(const struct gguf_context * ctx, int64_t tensor_id) {
     GGML_ASSERT(tensor_id >= 0 && tensor_id < gguf_get_n_tensors(ctx));
-    return ggml_nbytes(&ctx->info[tensor_id].t);
+    return gguf_ti_nbytes(ctx->info[tensor_id]);
 }
 
 int64_t gguf_remove_key(struct gguf_context * ctx, const char * key) {

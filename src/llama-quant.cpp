@@ -2,6 +2,7 @@
 #include "llama-model.h"
 #include "llama-model-loader.h"
 #include "llama-ext.h"
+#include "llama-sclp.h"
 
 #include <algorithm>
 #include <cmath>
@@ -182,6 +183,8 @@ struct quantize_state_impl {
 
     // tensor type override patterns (compiled once, used twice)
     std::vector<std::pair<std::regex, ggml_type>> tensor_type_patterns;
+    // sidecar budget override patterns (compiled once)
+    std::vector<std::pair<std::regex, float>> sidecar_budget_patterns;
 
     quantize_state_impl(const llama_model & model, const llama_model_quantize_params * params):
         model(model), params(params)
@@ -192,6 +195,19 @@ struct quantize_state_impl {
                 tensor_type_patterns.emplace_back(std::regex(p->pattern), p->type);
             }
         }
+        if (params->sb_overrides) {
+            for (const auto * p = params->sb_overrides; p->pattern != nullptr; p++) {
+                sidecar_budget_patterns.emplace_back(std::regex(p->pattern), p->budget);
+            }
+        }
+    }
+
+    // Returns the override budget if the tensor name matches a pattern, else -1.0f (use caller default).
+    float sidecar_budget_for(const std::string & name) const {
+        for (const auto & [re, b] : sidecar_budget_patterns) {
+            if (std::regex_search(name, re)) return b;
+        }
+        return -1.0f;
     }
 };
 
@@ -797,6 +813,9 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q5_0: return GGML_TYPE_Q5_0;
         case LLAMA_FTYPE_MOSTLY_Q5_1: return GGML_TYPE_Q5_1;
         case LLAMA_FTYPE_MOSTLY_Q8_0: return GGML_TYPE_Q8_0;
+        case LLAMA_FTYPE_MOSTLY_SCLP:  return GGML_TYPE_SCLP;
+        case LLAMA_FTYPE_MOSTLY_SCLP4: return GGML_TYPE_SCLP4;
+        case LLAMA_FTYPE_MOSTLY_SCLP6: return GGML_TYPE_SCLP6;
         case LLAMA_FTYPE_MOSTLY_F16:  return GGML_TYPE_F16;
         case LLAMA_FTYPE_MOSTLY_BF16: return GGML_TYPE_BF16;
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
@@ -1223,30 +1242,42 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
                 fflush(stdout);
 
-                if (work.size() < (size_t)nelements * 4) {
-                    work.resize(nelements * 4); // upper bound on size
+                if (new_type == GGML_TYPE_SCLP || new_type == GGML_TYPE_SCLP4 || new_type == GGML_TYPE_SCLP6) {
+                    // Upper bound: SCLP blob can exceed F32 in worst case (all weights sidecarred)
+                    if (work.size() < (size_t)nelements * 8 + 65536) {
+                        work.resize(nelements * 8 + 65536);
+                    }
+                    // Per-tensor sidecar budget override (--sidecar-budget). -1 means "use default".
+                    float sb = qs.sidecar_budget_for(tensor->name);
+                    if (sb < 0.0f) sb = 0.01f;
+                    new_size = llama_tensor_quantize_sclp(new_type, f32_data, work.data(), nelements, tensor->ne[2], tensor->ne[0], imatrix, /*clip_threshold=*/0, /*sidecar_imatrix_budget=*/sb);
+                } else {
+                    if (work.size() < (size_t)nelements * 4) {
+                        work.resize(nelements * 4); // upper bound on size
+                    }
+                    new_data = work.data();
+
+                    const int64_t n_per_row = tensor->ne[0];
+                    const int64_t nrows = tensor->ne[1];
+
+                    static const int64_t min_chunk_size = 32 * 512;
+                    const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
+
+                    const int64_t nelements_matrix = tensor->ne[0] * tensor->ne[1];
+                    const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
+                    const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
+
+                    // quantize each expert separately since they have different importance matrices
+                    new_size = 0;
+                    for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
+                        const float * f32_data_03 = f32_data + i03 * nelements_matrix;
+                        void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
+                        const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
+
+                        new_size += llama_tensor_quantize_impl(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
+                    }
                 }
                 new_data = work.data();
-
-                const int64_t n_per_row = tensor->ne[0];
-                const int64_t nrows = tensor->ne[1];
-
-                static const int64_t min_chunk_size = 32 * 512;
-                const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
-
-                const int64_t nelements_matrix = tensor->ne[0] * tensor->ne[1];
-                const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
-                const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
-
-                // quantize each expert separately since they have different importance matrices
-                new_size = 0;
-                for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
-                    const float * f32_data_03 = f32_data + i03 * nelements_matrix;
-                    void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
-                    const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
-
-                    new_size += llama_tensor_quantize_impl(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
-                }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
             }
             total_size_org += tensor_size;
@@ -1254,6 +1285,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
             // update the gguf meta data as we go
             gguf_set_tensor_type(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_type);
+            if (new_type == GGML_TYPE_SCLP || new_type == GGML_TYPE_SCLP4 || new_type == GGML_TYPE_SCLP6) {
+                gguf_set_tensor_disk_size(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_size);
+            }
             GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), metadata[i].name.c_str())) == new_size);
             gguf_set_tensor_data(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_data);
 
@@ -1301,6 +1335,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
+        /*.sb_overrides                =*/ nullptr,
         /*.prune_layers                =*/ nullptr
     };
 
