@@ -817,6 +817,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     }
     if (tensor->type == GGML_TYPE_SCLP8  ||
         tensor->type == GGML_TYPE_SCLP4 ||
+        tensor->type == GGML_TYPE_SCLP5 ||
         tensor->type == GGML_TYPE_SCLP6) {
         // Prefer an exact per-tensor hint stashed by the model loader (op_params[13..15]
         // — see llama_model_loader::create_tensor). Falls back to a conservative heuristic
@@ -831,6 +832,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
         // attn_q; SCLP6 max ~1.05×; SCLP max ~1.05×. Use 3× for SCLP4 and 1.25× for the
         // others to keep headroom across all models we've tested.
         if (tensor->type == GGML_TYPE_SCLP4) return 3 * size + 65536;
+        if (tensor->type == GGML_TYPE_SCLP5) return 2 * size + 65536;
         return size + size / 4 + 65536;
     }
 
@@ -2547,6 +2549,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     if (src0->type == GGML_TYPE_SCLP8) return false;
     if (src0->type == GGML_TYPE_SCLP4) return false;
+    if (src0->type == GGML_TYPE_SCLP5) return false;
     if (src0->type == GGML_TYPE_SCLP6) return false;
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
@@ -2680,6 +2683,39 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // SCLP5: fused decode-GEMV for M=1, two-pass decode otherwise.
+    if (src0->type == GGML_TYPE_SCLP5) {
+        cudaStream_t stream = ctx.stream();
+        const int64_t K = src0->ne[0];
+        const int64_t N = src0->ne[1];
+        const int64_t M = src1->ne[1];
+        // Fused decode-GEMV with folded sidecar correction (sorted-sidecar binary search,
+        // warp-per-row, smem x — no atomics). Correct AND ~2x faster than two-pass.
+        // SCLP5_NO_FUSED=1 forces the two-pass fallback.
+        static const bool sclp5_no_fused = getenv("SCLP5_NO_FUSED") != nullptr;
+        if (!sclp5_no_fused && M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+                && (K % 8 == 0)
+                && ((size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
+            llama_sclp5_fused_gemv(
+                src0->data, (const float*)src1->data, (float*)dst->data,
+                (uint32_t)N, (uint32_t)K, stream);
+            return;
+        }
+        const int64_t num_weights = ggml_nelements(src0);
+        ggml_cuda_pool_alloc<uint16_t> decoded(ctx.pool(), (size_t)num_weights);
+        llama_sclp5_dispatch(src0->data, decoded.get(), (uint32_t)num_weights, stream);
+
+        ggml_tensor src0_bf16 = *src0;
+        src0_bf16.type  = GGML_TYPE_BF16;
+        src0_bf16.data  = decoded.get();
+        src0_bf16.nb[0] = sizeof(ggml_bf16_t);
+        for (int i = 1; i < GGML_MAX_DIMS; i++) {
+            src0_bf16.nb[i] = src0_bf16.nb[i-1] * src0_bf16.ne[i-1];
+        }
+        ggml_cuda_mul_mat(ctx, &src0_bf16, src1, dst);
+        return;
+    }
+
     // SCLP6: fused decode-GEMV for M=1, two-pass otherwise.
     if (src0->type == GGML_TYPE_SCLP6) {
         cudaStream_t stream = ctx.stream();
@@ -2688,11 +2724,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t N = src0->ne[1];
         const int64_t M = src1->ne[1];
 
-        // SCLP6 fused GEMV disabled: kernel produces numerical errors on Gemma4-31B
-        // dense attention tensors. Two-pass (decode→BF16→rocBLAS) is correct.
-        // TODO: debug sclp6_fused_gemv_kernel accumulation/decode logic.
-        if (false && M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-                && (264 + (size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
+        // SCLP6 fused GEMV re-enabled: the earlier "numerical errors" were sidecar
+        // omission (8-entry palette → large outlier population), now folded in via the
+        // sorted-sidecar binary-search correction. SCLP6_NO_FUSED=1 forces two-pass.
+        static const bool sclp6_no_fused = getenv("SCLP6_NO_FUSED") != nullptr;
+        if (!sclp6_no_fused && M == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+                && (272 + (size_t)K * sizeof(float)) <= SCLP_MAX_SMEM) {
             llama_sclp6_fused_gemv(
                 src0->data,
                 (const float*)src1->data,
@@ -4089,8 +4126,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 #endif
         }
 
-        // SCLP6/SCLP4 two-pass decode uses pool alloc (hipMalloc) which is illegal during capture.
+        // SCLP6/SCLP4/SCLP5 two-pass decode uses pool alloc (hipMalloc) which is illegal during capture.
         if (node->src[0] && (node->src[0]->type == GGML_TYPE_SCLP6 ||
+                              node->src[0]->type == GGML_TYPE_SCLP5 ||
                               node->src[0]->type == GGML_TYPE_SCLP4)) {
             use_cuda_graph = false;
         }
@@ -6008,6 +6046,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_TQ3_1S:
                     case GGML_TYPE_SCLP8:
                     case GGML_TYPE_SCLP4:
+                    case GGML_TYPE_SCLP5:
                     case GGML_TYPE_SCLP6:
                         return true;
                     default:

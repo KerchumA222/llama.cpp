@@ -269,16 +269,21 @@ static sclp_expert_encoded encode_sclp_expert(
         sm_bits = 4; p_max = 16;
     } else if (type == GGML_TYPE_SCLP4) {
         sm_bits = 2; p_max = 4;
+    } else if (type == GGML_TYPE_SCLP5) {
+        sm_bits = 3; p_max = 4;  // idx2 | sign1 | mant2, 4-entry per-block palette
     } else {
         sm_bits = 3; p_max = 8;
     }
+    const bool per_block_palette = (type == GGML_TYPE_SCLP4 || type == GGML_TYPE_SCLP5);
+    const int  mant_bits = sm_bits - 1;                  // SCLP4:1, SCLP5:2, SCLP6:2, SCLP8:3
+    const int  mant_shift = 7 - mant_bits;               // bit position of kept mantissa top bits
 
     const int qk = qk_for_type(type);
     int64_t n_blocks = (n + qk - 1) / qk;
     std::vector<float> scaled_data(n);
 
-    if (type == GGML_TYPE_SCLP4) {
-        // SCLP4: per-block palette mode — no PBS normalization
+    if (per_block_palette) {
+        // SCLP4/SCLP5: per-block palette mode — no PBS normalization
         for (int64_t i = 0; i < n; i++) scaled_data[i] = data[i];
     } else {
         enc.scales.resize(n_blocks);
@@ -321,9 +326,7 @@ static sclp_expert_encoded encode_sclp_expert(
         static const char * env = std::getenv("SCLP_STOCHASTIC_ROUND");
         const bool enabled = !(env && env[0] == '0');
         if (enabled) {
-            int drop_bits = (type == GGML_TYPE_SCLP4) ? 6
-                          : (type == GGML_TYPE_SCLP6) ? 5
-                          : 4; // SCLP8
+            int drop_bits = mant_shift;  // drop bits below the kept mantissa top bits
             stochastic_mantissa_round(bf16_weights.data(), n, drop_bits);
         }
     }
@@ -333,8 +336,11 @@ static sclp_expert_encoded encode_sclp_expert(
     bool has_imatrix = (imatrix != nullptr) && (sidecar_imatrix_budget > 0.0f) && (K > 0);
     std::vector<float> priority(n, 0.0f);
 
-    if (type == GGML_TYPE_SCLP4) {
-        // Per-block palette: each QK_SCLP4-weight block gets its own 4-entry k-means palette
+    if (per_block_palette) {
+        // Per-block palette: each QK_SCLP4-weight block gets its own 4-entry k-means palette.
+        // SCLP4 keeps 1 mantissa bit; SCLP5 keeps 2 (mant_bits / mant_shift).
+        const int mant_levels = 1 << mant_bits;
+        const uint8_t mant_mask = (uint8_t)(mant_levels - 1);
         enc.palette_size = 0;
         enc.block_palettes.resize(n_blocks * 4);
 
@@ -379,16 +385,16 @@ static sclp_expert_encoded encode_sclp_expert(
                 // Pure encoder change — wire format and decoders are unchanged.
                 float orig = data[i];
                 float best_err = FLT_MAX;
-                uint8_t best_idx = bexp_to_idx[exp], best_mant = (w >> 6) & 0x1;
+                uint8_t best_idx = bexp_to_idx[exp], best_mant = (uint8_t)((w >> mant_shift) & mant_mask);
                 for (int j = 0; j < 4; j++) {
-                    for (int m = 0; m < 2; m++) {
-                        uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)bpal[j] << 7) | ((uint16_t)m << 6);
+                    for (int m = 0; m < mant_levels; m++) {
+                        uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)bpal[j] << 7) | ((uint16_t)m << mant_shift);
                         float err = std::fabs(bf16_to_float(bits) - orig);
                         if (err < best_err) { best_err = err; best_idx = (uint8_t)j; best_mant = (uint8_t)m; }
                     }
                 }
                 indices[i] = best_idx;
-                sm_nibbles[i] = (sign << 1) | best_mant;
+                sm_nibbles[i] = (sign << mant_bits) | best_mant;
 
                 if (!bin_pal[exp]) {
                     if (bexp_distance[exp] > 1) {
@@ -484,6 +490,23 @@ static sclp_expert_encoded encode_sclp_expert(
         }
     }
 
+    // Sort sidecar by index. Mandatory entries are already in index order but the
+    // discretionary imatrix entries were appended by priority. A sorted sidecar lets the
+    // fused-GEMV sidecar correction find each row's entries as one contiguous range
+    // (gidx = row*K + col), enabling a warp-per-row, atomic-free correction. The two-pass
+    // fixup and CPU decode scatter by index, so order is irrelevant to them.
+    if (enc.sc_indices.size() > 1) {
+        std::vector<uint32_t> order(enc.sc_indices.size());
+        for (size_t i = 0; i < order.size(); i++) order[i] = (uint32_t)i;
+        std::sort(order.begin(), order.end(),
+            [&](uint32_t a, uint32_t b) { return enc.sc_indices[a] < enc.sc_indices[b]; });
+        std::vector<uint32_t> si(enc.sc_indices.size());
+        std::vector<uint16_t> sv(enc.sc_values.size());
+        for (size_t i = 0; i < order.size(); i++) { si[i] = enc.sc_indices[order[i]]; sv[i] = enc.sc_values[order[i]]; }
+        enc.sc_indices.swap(si);
+        enc.sc_values.swap(sv);
+    }
+
     if (type == GGML_TYPE_SCLP8) {
         enc.ws_stream.resize(n);
         for (int64_t i = 0; i < n; i++) {
@@ -497,6 +520,24 @@ static sclp_expert_encoded encode_sclp_expert(
                 b |= (indices[i+1] << 2) | sm_nibbles[i+1];
             }
             enc.ws_stream[i/2] = b;
+        }
+    } else if (type == GGML_TYPE_SCLP5) {
+        // 8 weights -> 5 bytes: eight 5-bit codes (idx2|sign1|mant2) MSB-first in 40 bits.
+        enc.ws_stream.resize((n + 7) / 8 * 5);
+        for (int64_t i = 0; i < n; i += 8) {
+            uint64_t val = 0;
+            for (int j = 0; j < 8; j++) {
+                uint8_t idx = (i + j < n) ? indices[i + j] : 0;
+                uint8_t sm  = (i + j < n) ? sm_nibbles[i + j] : 0;  // 3-bit: sign(2)|mant(1:0)
+                uint8_t code = (uint8_t)(((idx & 0x3) << 3) | (sm & 0x7));
+                val |= (uint64_t)code << (5 * (7 - j));
+            }
+            int64_t out = (i / 8) * 5;
+            enc.ws_stream[out + 0] = (uint8_t)((val >> 32) & 0xFF);
+            enc.ws_stream[out + 1] = (uint8_t)((val >> 24) & 0xFF);
+            enc.ws_stream[out + 2] = (uint8_t)((val >> 16) & 0xFF);
+            enc.ws_stream[out + 3] = (uint8_t)((val >> 8)  & 0xFF);
+            enc.ws_stream[out + 4] = (uint8_t)( val        & 0xFF);
         }
     } else {
         enc.ws_stream.resize((n + 3) / 4 * 3);
@@ -569,7 +610,7 @@ size_t llama_tensor_quantize_sclp(
         p += experts[e].palette_size;
     }
 
-    if (type == GGML_TYPE_SCLP4) {
+    if (type == GGML_TYPE_SCLP4 || type == GGML_TYPE_SCLP5) {
         // Per-block palettes: 4 bytes per block per expert
         for (uint32_t e = 0; e < ne; e++) {
             std::memcpy(p, experts[e].block_palettes.data(), experts[e].block_palettes.size());
@@ -633,7 +674,7 @@ void llama_tensor_dequantize_sclp(
 
     const uint8_t * block_palettes_base = nullptr;
     const uint16_t * scales = nullptr;
-    if (type == GGML_TYPE_SCLP4) {
+    if (type == GGML_TYPE_SCLP4 || type == GGML_TYPE_SCLP5) {
         // Per-block palette: 4 bytes per block
         block_palettes_base = p;
         p += (uint64_t)ne * bpe * 4;
@@ -660,6 +701,18 @@ void llama_tensor_dequantize_sclp(
             uint8_t nibble = (i % 2 == 0) ? (b >> 4) : (b & 0xF);
             exp = bpal[nibble >> 2];
             smn = nibble & 0x3;
+        } else if (type == GGML_TYPE_SCLP5) {
+            int64_t block_idx = e * bpe + (local_idx / qk);
+            const uint8_t * bpal = block_palettes_base + block_idx * 4;
+            int64_t expert_ws_bytes = (weights_per_expert + 7) / 8 * 5;
+            int64_t group = local_idx / 8;
+            int64_t sub   = local_idx % 8;
+            const uint8_t * g = ws + (uint64_t)e * expert_ws_bytes + group * 5;
+            uint64_t val = ((uint64_t)g[0] << 32) | ((uint64_t)g[1] << 24) |
+                           ((uint64_t)g[2] << 16) | ((uint64_t)g[3] << 8) | (uint64_t)g[4];
+            uint8_t code = (uint8_t)((val >> (5 * (7 - sub))) & 0x1F);
+            exp = bpal[code >> 3];
+            smn = code & 0x7;
         } else if (type == GGML_TYPE_SCLP8) {
             int64_t scale_idx = e * bpe + (local_idx / qk);
             scale = bf16_to_float(scales[scale_idx]);
@@ -683,13 +736,18 @@ void llama_tensor_dequantize_sclp(
         uint8_t sign = (smn >> (sm_bits - 1)) & 1;
         uint8_t mant = smn & ((1 << (sm_bits - 1)) - 1);
 
-        int shift = (type == GGML_TYPE_SCLP8 ? 4 : type == GGML_TYPE_SCLP4 ? 6 : 5);
+        int shift = (type == GGML_TYPE_SCLP8 ? 4 : type == GGML_TYPE_SCLP4 ? 6 : 5);  // SCLP5/SCLP6 = 5
         uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)exp << 7) | ((uint16_t)mant << shift);
         f32_data[i] = bf16_to_float(bits) * scale;
     }
 
     // Sidecar fixup
-    p = ws + (uint64_t)ne * (type == GGML_TYPE_SCLP8 ? weights_per_expert : type == GGML_TYPE_SCLP4 ? (weights_per_expert + 1) / 2 : (weights_per_expert + 3) / 4 * 3);
+    int64_t ws_bytes_per_expert =
+        (type == GGML_TYPE_SCLP8) ? weights_per_expert :
+        (type == GGML_TYPE_SCLP4) ? (weights_per_expert + 1) / 2 :
+        (type == GGML_TYPE_SCLP5) ? (weights_per_expert + 7) / 8 * 5 :
+                                    (weights_per_expert + 3) / 4 * 3;
+    p = ws + (uint64_t)ne * ws_bytes_per_expert;
     uint32_t sc_count;
     std::memcpy(&sc_count, p, 4);
     p += 4;
